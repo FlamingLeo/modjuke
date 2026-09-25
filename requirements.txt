@@ -1,0 +1,4 @@
+# Install libopenmpt separately through the OS or MODJUKE_LIBOPENMPT.
+numpy>=1.20
+sounddevice>=0.4
+soundcard>=0.4
