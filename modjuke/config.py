@@ -73,6 +73,7 @@ class Settings:
     folder_picker: str = "built-in"   # built-in (dark browser) | system (desktop picker)
 
     ui_fps: int = 60
+    smooth_tracker_scrolling: bool = False
 
     window_title: str = "track"
     queue_mode: str = "by directory"
@@ -94,7 +95,8 @@ class Settings:
     backend: str = "auto"            # auto | sounddevice | soundcard | null
     samplerate: int = 0              # 0 == device default
     buffer_ms: int = 220
-    latency_ms: int = 120
+    latency_ms: int = 20
+    latency_revision: int = 1
     interpolation: str = "sinc"
     # safety / robustness
     stall_timeout: float = 45.0      # seconds of "no progress" before a warning
@@ -109,6 +111,7 @@ class Settings:
     theme: str = theme.DEFAULT_THEME
     remember_position: bool = True
     cache_analysis: bool = True
+    track_listening_stats: bool = True
     last_path: str = ""
     last_position: float = 0.0
 
@@ -148,6 +151,9 @@ class Settings:
                     clean[key] = type(default)(value) if isinstance(default, (int, float, str)) else value
                 except Exception:
                     continue
+        # Upgrade the old default once; subsequent user latency choices stay untouched.
+        if "latency_revision" not in raw and clean.get("latency_ms") == 120:
+            clean["latency_ms"] = 20
         return cls(**clean)
 
     def save(self, path: str | None = None) -> None:

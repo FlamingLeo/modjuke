@@ -100,7 +100,6 @@ class _Worker(threading.Thread):
         self._load_started = 0.0
         self.level = np.zeros(2, dtype=np.float32)
         self._vu_channels = 0
-        self._fade_out_pending = False
 
     def publish(self, **fields) -> None:
         with self._state_lock:
@@ -152,9 +151,6 @@ class _Worker(threading.Thread):
                 state = self.snapshot()
                 if state.failed:
                     self._idle(0.05)
-                    continue
-                if self._fade_out_pending:
-                    self._do_fade_out()
                     continue
                 if state.paused:
                     self._idle(0.02)
@@ -220,14 +216,13 @@ class _Worker(threading.Thread):
             self.publish(play_id=kwargs["play_id"], audio_seconds=0.0)
         elif name == "pause":
             if kwargs.get("paused"):
-                if not self.snapshot().paused:
-                    self._fade_out_pending = True
+                self.engine._pause_output()
+                self.publish(paused=True, playing=False, vu=(), level=(0.0, 0.0))
             else:
-                self.publish(paused=False)
-                self.engine.ring.clear()
-                self._fade_frames = int(self.engine.samplerate * 0.012)
-                self._gain = 0.0
-                self.publish(playing=True)
+                self._gain = self.engine.effective_gain()
+                self.engine._resume_output()
+                self.publish(paused=False, playing=not self.snapshot().ended,
+                             progress_time=time.monotonic())
         elif name == "seek":
             self._do_seek(float(kwargs["position"]))
         elif name == "loop":
@@ -334,6 +329,10 @@ class _Worker(threading.Thread):
             text = f"{exc!r}"
             self.publish(loading=False, loaded=True, playing=False, failed=text)
             self._emit(MSG_ERROR, f"module failed after load: {text}")
+        if start_paused:
+            self.engine.ring.pause()
+        else:
+            self.engine._resume_output()
         self._load_started = time.monotonic()
 
     def _apply_interpolation(self, mode: str, *, announce: bool = True) -> bool:
@@ -408,19 +407,9 @@ class _Worker(threading.Thread):
         except Exception as exc:
             self._emit(MSG_WARN, f"seek failed: {exc}")
 
-    def _do_fade_out(self) -> None:
-        """Fade the already buffered audio out, then stop rendering."""
-        if self._fade_out_pending:
-            self._fade_out_pending = False
-            fade = min(self.engine.ring.available(),
-                       int(self.engine.samplerate * 0.25))
-            self.engine.ring.fade_out(fade)
-            self.publish(paused=True, playing=False, vu=(), level=(0.0, 0.0))
-            self._gain = 0.0
-
     def _wait_for_drain(self) -> None:
         """Song is over: wait until the buffered tail has been played."""
-        if (self.engine.ring.available() <= 0) and (not self._finished_reported):
+        if self.engine.ring.drained() and not self._finished_reported:
             self._finished_reported = True
             self.publish(finished=True, playing=False, paused=False, vu=(),
                          level=(0.0, 0.0))
@@ -456,6 +445,7 @@ class _Worker(threading.Thread):
             f = min(self._fade_frames, n)
             data[:f] *= np.linspace(0.0, 1.0, f, endpoint=False, dtype=np.float32)[:, None]
             self._fade_frames -= f
+        unscaled = data.copy()
         if abs(target_gain - self._gain) < 1e-4:
             if abs(target_gain - 1.0) > 1e-6:
                 data *= target_gain
@@ -474,7 +464,9 @@ class _Worker(threading.Thread):
         order = module.current_order()
         pattern = module.current_pattern()
         row = module.current_row()
-        ring.write(data, before=before, after=(identity, order, pattern, row))
+        position = module.position_seconds()
+        ring.write(data, before=before, after=(identity, order, pattern, row),
+                   position_before=state.position, position_after=position, unscaled=unscaled)
         speed = module.current_speed()
         tempo = module.current_tempo()
         key = (order, pattern, row, speed, tempo)
@@ -488,7 +480,6 @@ class _Worker(threading.Thread):
         else:
             self._silent_frames = 0
 
-        position = module.position_seconds()
         duration = self.snapshot().duration
         loop = self.snapshot().loop
         loop_index = int(position // duration) if (loop and math.isfinite(duration) and duration > 0) else 0
@@ -592,7 +583,7 @@ class PlaybackEngine:
         self._supervisor.start()
 
     def _open_output(self, ring: Optional[StereoRing]) -> None:
-        latency = float(getattr(self.settings, "latency_ms", 120))
+        latency = float(getattr(self.settings, "latency_ms", 20))
         out, r = create_output(
             prefer=self.backend_name,
             ring=ring,
@@ -615,7 +606,7 @@ class PlaybackEngine:
             except Exception:
                 pass
             try:
-                new_ring = StereoRing(max(self.samplerate, 44100))
+                new_ring = old_ring if old_ring.paused else StereoRing(5 * max(self.samplerate, 44100))
                 self._open_output(ring=new_ring)
                 self._message(MSG_WARN, f"audio device reopened ({self.output.name})")
             except AudioError as exc:
@@ -624,6 +615,20 @@ class PlaybackEngine:
                     self.ring = old_ring
                 except Exception:
                     pass
+
+    def _pause_output(self) -> None:
+        with self._lock:
+            try:
+                self.output.pause()
+            except Exception as exc:
+                self._message(MSG_WARN, f"audio pause: {exc}")
+
+    def _resume_output(self) -> None:
+        with self._lock:
+            try:
+                self.output.resume()
+            except Exception as exc:
+                self._message(MSG_WARN, f"audio resume: {exc}")
 
     def restart_output(self, backend: Optional[str] = None) -> None:
         """Public: switch backend / recover from a dead sound card."""
@@ -672,9 +677,11 @@ class PlaybackEngine:
 
     def set_volume(self, value: float) -> None:
         self._volume = max(0.0, min(1.0, float(value)))
+        self.ring.set_paused_gain(self.effective_gain())
 
     def set_muted(self, muted: bool) -> None:
         self._muted = bool(muted)
+        self.ring.set_paused_gain(self.effective_gain())
 
     @property
     def muted(self) -> bool:
@@ -718,7 +725,7 @@ class PlaybackEngine:
         worker = self._current()
         if worker is None:
             return
-        st = worker.snapshot()
+        st = self.snapshot()
         now = time.monotonic()
 
         if not worker.is_alive():
@@ -764,7 +771,17 @@ class PlaybackEngine:
         if worker is None:
             return Snapshot(loop=bool(self.settings.loop_track))
         snap = worker.snapshot()
-        snap.buffer_seconds = self.ring.available() / max(1, self.samplerate)
+        if self.ring.paused and snap.loaded:
+            snap.paused, snap.playing = True, False
+            snap.vu, snap.level = (), (0.0, 0.0)
+            identity = (snap.generation, snap.play_id, snap.path, snap.subsong)
+            position = self.ring.paused_position()
+            if position is not None and position[0] == identity:
+                snap.position = position[1]
+            mark = self.ring.playback_mark()
+            if mark is not None and mark[0] == identity:
+                snap.order, snap.pattern, snap.row = mark[1:]
+        snap.buffer_seconds = self.ring.pending() / max(1, self.samplerate)
         snap.restarts = self._restarts.get(snap.path, 0)
         snap.loop = self.settings.loop_track
         return snap
@@ -808,8 +825,8 @@ class PlaybackEngine:
         worker = self._current()
         if worker is None:
             return
-        st = worker.snapshot()
-        if st.ended or st.finished:
+        st = self.snapshot()
+        if st.finished or (st.ended and not st.paused):
             # the song is over: pressing play replays it from the top
             with self._lock:
                 self._play_serial += 1
@@ -822,9 +839,11 @@ class PlaybackEngine:
             worker.post("pause", paused=False)
 
     def pause(self) -> None:
-        worker = self._current()
-        if worker is not None:
-            worker.post("pause", paused=True)
+        with self._lock:
+            worker = self._current()
+            if worker is not None:
+                worker.post("pause", paused=True)
+                self._pause_output()
 
     def toggle_pause(self) -> None:
         st = self.snapshot()

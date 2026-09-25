@@ -11,7 +11,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Optional
 
 from . import library, reveal
@@ -22,6 +22,7 @@ from .config import (APP_NAME, APP_TITLE, MAX_SHUFFLE_PATHS, UI_FPS_DEFAULT,
                      SAMPLE_RATE_VALUES, normalise_sample_rate)
 from .folderdialog import enable_select_all, pick_directory, show_path_tail, \
     system_picker_available  # noqa: F401  (show_path_tail is used by the toolbar)
+from .filedialog import pick_files
 from .engine import MSG_DEBUG, MSG_ERROR, MSG_INFO, MSG_WARN, PlaybackEngine
 from .filters import (QueueFilter, filter_from_settings, formats_in,
                       normalise_formats, unknown_duration_count)
@@ -1092,13 +1093,15 @@ class PlaylistsDialog(tk.Toplevel):
         name = self._selected_name()
         if not name:
             return
-        self.app.export_playlist(name)
+        self.app.export_playlist(name, parent=self)
         self.refresh()
 
     def import_m3u(self) -> None:
         try:
-            path = filedialog.askopenfilename(
-                parent=self.app.root, title="Import an M3U playlist",
+            path = pick_files(
+                parent=self, title="Import an M3U playlist",
+                initialdir=self.app._directory or self.app.settings.last_picker_dir,
+                prefer=self.app.settings.folder_picker, extra_places=self.app._extra_places(),
                 filetypes=[("M3U playlists", "*.m3u *.m3u8"), ("All files", "*")])
         except tk.TclError:
             return
@@ -1185,7 +1188,7 @@ class SettingsDialog(tk.Toplevel):
         self.interp_hint.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=3)
 
         self.picker = tk.StringVar(value=s.folder_picker)
-        row(frm, 12, "Folder picker", ttk.Combobox(
+        row(frm, 12, "File / folder picker", ttk.Combobox(
             frm, textvariable=self.picker, state="readonly", width=14,
             values=("built-in", "system")),
             "built-in themed browser or default OS browser")
@@ -1235,17 +1238,25 @@ class SettingsDialog(tk.Toplevel):
             ttk.Checkbutton(frm, variable=self.keep_info),
             "lengths, formats and channels are read once, not every start")
 
-        ttk.Separator(frm, orient="horizontal").grid(row=24, column=0, columnspan=3,
+        self.keep_stats = tk.BooleanVar(value=s.track_listening_stats)
+        row(frm, 24, "Keep listening stats", ttk.Checkbutton(frm, variable=self.keep_stats),
+            "off stops recording, existing history is kept")
+
+        ttk.Separator(frm, orient="horizontal").grid(row=25, column=0, columnspan=3,
                                                      sticky="ew", pady=10)
-        ttk.Label(frm, text="Appearance", style="Head.TLabel").grid(row=25, column=0, sticky="w")
+        ttk.Label(frm, text="Appearance", style="Head.TLabel").grid(row=26, column=0, sticky="w")
         self.theme = tk.StringVar(value=theme.label(s.theme))
-        row(frm, 26, "Colour scheme", ttk.Combobox(
+        row(frm, 27, "Colour scheme", ttk.Combobox(
             frm, textvariable=self.theme, state="readonly", width=16,
             values=tuple(theme.THEME_LABELS[name] for name in theme.THEME_NAMES)),
             "applies when you press Save")
 
+        self.smooth_scroll = tk.BooleanVar(value=s.smooth_tracker_scrolling)
+        row(frm, 28, "Smooth tracker scrolling", ttk.Checkbutton(frm, variable=self.smooth_scroll),
+            "glide the current row while following")
+
         buttons = ttk.Frame(frm)
-        buttons.grid(row=27, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        buttons.grid(row=29, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="Save", style="Accent.TButton",
                    command=self.save).pack(side="right")
@@ -1337,6 +1348,9 @@ class SettingsDialog(tk.Toplevel):
         s.remember_position = bool(self.remember.get())
         s.cache_analysis = bool(self.keep_info.get())
         s.theme = self.app.apply_theme_name(self.theme_name())
+        s.smooth_tracker_scrolling = bool(self.smooth_scroll.get())
+        self.app._tracker.set_smooth_scrolling(s.smooth_tracker_scrolling)
+        self.app.apply_listening_stats(self.keep_stats.get())
         self.app._save_settings()
         self.app.sync_setting_toggles()
         engine = self.app.engine
@@ -1402,7 +1416,8 @@ class PlayerApp:
         self._queue_menu: Optional[tk.Menu] = None
         self._menu_focus_check = None
         self._playlists = PlaylistStore(playlists_path(self.config_file))
-        self._listening = ListeningCounter(StatsStore(stats_path(self.config_file)))
+        self._listening = ListeningCounter(StatsStore(stats_path(self.config_file)),
+                                           enabled=self.settings.track_listening_stats)
         self._stats_window: Optional[StatsWindow] = None
         self._stats_warning = ""
         self._active_playlist = str(self.settings.active_playlist or "")
@@ -1534,9 +1549,6 @@ class PlayerApp:
 
         self.count_label = ttk.Label(bar, text="", style="Dim.TLabel", background=BG)
         self.count_label.pack(side="right", padx=10)
-        self.settings_button = ttk.Button(bar, text="Settings",
-                                          command=lambda: SettingsDialog(self))
-        self.settings_button.pack(side="right")
         self.path_var = tk.StringVar(value="")
         self.dir_entry = ttk.Entry(bar, textvariable=self.path_var, state="readonly",
                                    style="Path.TEntry", width=10)
@@ -1607,8 +1619,11 @@ class PlayerApp:
                       "Player: choose the song and view song information")
         self.add_hint(self.tab_buttons["tracker"],
                       "Tracker: the pattern view")
+        self.settings_button = ttk.Button(bar, text="Settings",
+                                          command=lambda: SettingsDialog(self))
+        self.settings_button.pack(side="right")
         self.stats_btn = ttk.Button(bar, text="Listening stats", command=self.open_stats)
-        self.stats_btn.pack(side="right")
+        self.stats_btn.pack(side="right", padx=(0, 6))
         self.add_hint(self.stats_btn, "Listening stats (Ctrl+H): local play counts, time and most-played modules")
         self._pages.pack(side="top", fill="both", expand=True)
         self._page_player.pack(fill="both", expand=True)
@@ -1625,7 +1640,7 @@ class PlayerApp:
         self._tab = name
         for key, button in self.tab_buttons.items():
             button.configure(style="TabActive.TButton" if key == name else "Tab.TButton")
-        self._tracker.visible = name == "tracker"
+        self._tracker.set_visible(name == "tracker")
         if name == "tracker":
             self._tracker_seen = True
             self._sync_tracker_song()
@@ -1739,7 +1754,8 @@ class PlayerApp:
     def _build_tracker_page(self) -> None:
         """The pattern view (the "Tracker" tab)."""
         self._tracker = TrackerView(self._page_tracker,
-                                    request_pattern=self._request_pattern)
+                                    request_pattern=self._request_pattern,
+                                    smooth_scrolling=self.settings.smooth_tracker_scrolling)
         self._tracker.pack(fill="both", expand=True, padx=10, pady=(4, 6))
         self._tracker_seen = False          # pattern data is fetched on demand
         self._song_token = 0
@@ -1793,7 +1809,9 @@ class PlayerApp:
             return
         self._sync_tracker_song()
         audible = self.engine.tracker_snapshot(snap)
-        self._tracker.set_position(audible.order, audible.row, audible.playing)
+        running = ((audible.playing or audible.ended)
+                   and not (audible.paused or audible.finished or audible.failed))
+        self._tracker.set_position(audible.order, audible.row, running)
 
     def _build_info_panel(self, parent: ttk.Frame) -> None:
         self.title_label = ttk.Label(parent, text="Nothing playing", style="Title.TLabel",
@@ -2405,8 +2423,6 @@ class PlayerApp:
             return False
         position = max(0.0, float(self.settings.last_position or 0.0))
         self._play_index(index, paused=True, position=position)
-        track = self.queue[index]
-        where = format_time(position) if position > 0.5 else "the start"
         self.log(MSG_INFO, f"session: {os.path.basename(path)} at {position:.1f}s (paused)")
         return True
 
@@ -2476,7 +2492,16 @@ class PlayerApp:
             return
         self._stats_window = StatsWindow(self)
 
+    def apply_listening_stats(self, enabled: bool) -> None:
+        self._listening.set_enabled(enabled, self.engine.snapshot(), self.engine)
+        self.settings.track_listening_stats = bool(enabled)
+        self._listening.store.save(force=True)
+        window = self._stats_window
+        if window is not None and window.winfo_exists():
+            window.refresh(force=True)
+
     def _record_listening(self, snap) -> None:
+        changed = self._listening.set_enabled(self.settings.track_listening_stats, snap, self.engine)
         self._listening.observe(snap, self.engine)
         store = self._listening.store
         store.save()
@@ -2486,7 +2511,7 @@ class PlayerApp:
                 self.log(MSG_WARN, store.error)
         window = self._stats_window
         if window is not None and window.winfo_exists():
-            window.refresh()
+            window.refresh(force=changed)
 
     def open_song_info(self) -> None:
         """Open or raise the single song-info window."""
@@ -3039,8 +3064,10 @@ class PlayerApp:
             return False
         self._dismiss_playlist_menu()
         extensions = sorted(library.supported_extensions())
-        paths = filedialog.askopenfilenames(
-            parent=parent or self.root, title=f"Add songs to {name}",
+        paths = pick_files(
+            parent=parent or self.root, title=f"Add songs to {name}", multiple=True,
+            initialdir=self._directory or self.settings.last_picker_dir,
+            prefer=self.settings.folder_picker, extra_places=self._extra_places(),
             filetypes=[("Tracker modules", " ".join("*." + e.lstrip(".") for e in extensions)),
                        ("All files", "*")])
         if not paths:
@@ -3310,14 +3337,16 @@ class PlayerApp:
         self.status(f"playlist '{name}' deleted")
         self.rebuild_queue(keep_playing=True)
 
-    def export_playlist(self, name: str) -> bool:
+    def export_playlist(self, name: str, parent=None) -> bool:
         playlist = self._playlists.get(name)
         if playlist is None or not playlist.paths:
             self.status("that playlist has no tracks to export")
             return False
         try:
-            path = filedialog.asksaveasfilename(
-                parent=self.root, title="Export playlist as M3U",
+            path = pick_files(
+                parent=parent or self.root, title="Export playlist as M3U", save=True,
+                initialdir=self._directory or self.settings.last_picker_dir,
+                prefer=self.settings.folder_picker, extra_places=self._extra_places(),
                 defaultextension=".m3u", initialfile=playlist.name + ".m3u",
                 filetypes=[("M3U playlists", "*.m3u"), ("All files", "*")])
         except tk.TclError:
@@ -3325,6 +3354,9 @@ class PlayerApp:
         if not path:
             return False
         count = write_m3u(playlist.paths, path)
+        if not count:
+            self.status(f"Could not export playlist to {path}")
+            return False
         self.status(f"exported {count} tracks to {path}")
         return True
 

@@ -330,6 +330,12 @@ def fit_crumbs(targets: list[tuple[str, str]], available: int,
 class FolderDialog(tk.Toplevel):
     """Themed folder browser with keyboard navigation and cancellable background counts."""
 
+    listing_label = "Folders here"
+    hidden_label = "Show hidden folders"
+    selection_hint = "the chosen folder is scanned recursively"
+    accept_label = "Use this folder"
+    selection_mode = "browse"
+
     def __init__(self, parent: Optional[tk.Misc], start_dir: str = "",
                  title: str = "Open folder",
                  extra_places: Iterable[tuple[str, str]] = ()):
@@ -418,9 +424,9 @@ class FolderDialog(tk.Toplevel):
         dirs_box.grid(row=0, column=1, sticky="nsew")
         dirs_box.rowconfigure(1, weight=1)
         dirs_box.columnconfigure(0, weight=1)
-        ttk.Label(dirs_box, text="Folders here", style="DlgDim.TLabel").grid(row=0, column=0,
+        ttk.Label(dirs_box, text=self.listing_label, style="DlgDim.TLabel").grid(row=0, column=0,
                                                                              sticky="w")
-        self.dirs_tree = ttk.Treeview(dirs_box, show="tree", selectmode="browse",
+        self.dirs_tree = ttk.Treeview(dirs_box, show="tree", selectmode=self.selection_mode,
                                       style="Dlg.Treeview")
         self.dirs_tree.grid(row=1, column=0, sticky="nsew")
         self.dirs_tree.column("#0", width=420, minwidth=200)
@@ -432,8 +438,10 @@ class FolderDialog(tk.Toplevel):
         self.dirs_tree.configure(yscrollcommand=dirs_scroll.set)
         dirs_scroll.grid(row=1, column=1, sticky="ns")
 
+        self._build_selection(outer)
+
         footer = ttk.Frame(outer)
-        footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        footer.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         footer.columnconfigure(0, weight=1)
         self.preview = ttk.Label(footer, textvariable=self._status, style="DlgDim.TLabel",
                                  background=self._bg)
@@ -442,20 +450,23 @@ class FolderDialog(tk.Toplevel):
             ttk.Button(footer, text="System dialog…",
                        command=self.use_system_dialog).grid(row=0, column=1, padx=(8, 0))
         ttk.Button(footer, text="Cancel", command=self.cancel).grid(row=0, column=2, padx=(8, 0))
-        self.ok_button = ttk.Button(footer, text="Use this folder", style="Accent.TButton",
+        self.ok_button = ttk.Button(footer, text=self.accept_label, style="Accent.TButton",
                                     command=self.accept)
         self.ok_button.grid(row=0, column=3, padx=(8, 0))
 
         checks = ttk.Frame(outer)
-        checks.grid(row=4, column=0, sticky="ew", pady=(6, 0))
-        ttk.Checkbutton(checks, text="Show hidden folders", variable=self._show_hidden,
+        checks.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        ttk.Checkbutton(checks, text=self.hidden_label, variable=self._show_hidden,
                         style="Dlg.TCheckbutton", command=self.refresh).pack(side="left")
-        ttk.Label(checks, text="the chosen folder is scanned recursively",
+        ttk.Label(checks, text=self.selection_hint,
                   style="DlgDim.TLabel", background=self._bg).pack(side="right")
 
         self.geometry("880x560")
         self.minsize(640, 400)
         self.after(150, self._focus_path)
+
+    def _build_selection(self, outer) -> None:
+        """File browsers add their filename and filter controls here."""
 
     def _crumb_space(self) -> int:
         """Measure space from the dialog width, not the breadcrumb content, to avoid resize loops."""

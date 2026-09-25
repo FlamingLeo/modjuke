@@ -21,6 +21,8 @@ class StereoRing:
     def __init__(self, capacity_frames: int):
         self.capacity = int(capacity_frames)
         self._buf = np.zeros((self.capacity, 2), dtype=np.float32)
+        self._unscaled = np.zeros_like(self._buf)
+        self._paused_gain = None
         self._w = 0
         self._r = 0
         self._count = 0
@@ -31,14 +33,22 @@ class StereoRing:
         self._written = 0
         self._marks = deque(maxlen=8192)
         self._playback = deque(maxlen=8192)
+        self._positions = deque(maxlen=8192)
+        self._cleared_at = 0
+        self._paused = False
+        self._attack_frames = 0
+        self._attack_left = 0
 
-    def write(self, data: np.ndarray, *, before=None, after=None) -> int:
+    def write(self, data: np.ndarray, *, before=None, after=None,
+              position_before=None, position_after=None, unscaled=None) -> int:
         n = len(data)
         if n <= 0:
             return 0
         with self._lock:
             if n > self.capacity:
                 self.overflow_frames += n - self.capacity
+                if unscaled is not None:
+                    unscaled = unscaled[n - self.capacity:]
                 data = data[n - self.capacity:]
                 n = self.capacity
             free = self.capacity - self._count
@@ -49,14 +59,22 @@ class StereoRing:
                 self._count -= drop
             if before is not None and not self._marks:
                 self._marks.append((self._written, before))
+            source = data if unscaled is None else unscaled
+            if self._paused_gain is not None:
+                data = source * self._paused_gain
             first = min(n, self.capacity - self._w)
+            self._unscaled[self._w : self._w + first] = source[:first]
             self._buf[self._w : self._w + first] = data[:first]
             rest = n - first
             if rest:
                 self._buf[:rest] = data[first:]
+                self._unscaled[:rest] = source[first:]
             self._w = (self._w + n) % self.capacity
             self._count += n
             self._written += n
+            if before is not None and position_before is not None and position_after is not None:
+                self._positions.append((self._written - n, self._written, before[0],
+                                        position_before, position_after))
             if after is not None and (not self._marks or self._marks[-1][1] != after):
                 # Attach each row change to the end of its rendered block.
                 self._marks.append((self._written, after))
@@ -67,6 +85,9 @@ class StereoRing:
         """Fill out (shape (n, 2)); zero-fills whatever is not available."""
         want = len(out) if frames is None else int(min(frames, len(out)))
         with self._lock:
+            if self._paused:
+                out[:want] = 0.0
+                return 0
             have = min(want, self._count)
             if have and playback_time is not None and samplerate > 0:
                 self._playback.append((playback_time, self._written - self._count,
@@ -79,6 +100,12 @@ class StereoRing:
                     out[first : first + rest] = self._buf[:rest]
                 self._r = (self._r + have) % self.capacity
                 self._count -= have
+                if self._attack_left:
+                    n = min(have, self._attack_left)
+                    start = self._attack_frames - self._attack_left
+                    ramp = np.arange(start, start + n, dtype=np.float32) / self._attack_frames
+                    out[:n] *= ramp[:, None]
+                    self._attack_left -= n
             if have < want:
                 out[have:want] = 0.0
                 self.underflow_frames += want - have
@@ -88,29 +115,88 @@ class StereoRing:
         with self._lock:
             self._r = self._w
             self._count = 0
-            # Clear old timing on seek, load, or resume; do not reuse frame indices.
+            # Clear old timing on seek or load; do not reuse frame indices.
             self._marks.clear()
             self._playback.clear()
+            self._positions.clear()
+            self._cleared_at = self._written
+            self._paused_gain = None
+            self._attack_left = 0
+
+    def _playback_frame(self, now):
+        if self._paused or not self._playback:
+            return self._written - self._count
+        while len(self._playback) > 1 and self._playback[1][0] <= now:
+            self._playback.popleft()
+        start, frame, count, rate = self._playback[0]
+        return frame + min(count, max(0.0, (now - start) * rate))
 
     def playback_mark(self, now: Optional[float] = None):
-        """Return the row reaching the output now. Hold position through silence; do not predict
-        past submitted audio."""
+        """Return the output-timed row; hold it while paused or through silence."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if not self._marks:
                 return None
-            if not self._playback:
+            if not self._playback and not self._paused:
                 return self._marks[0][1]
-            while len(self._playback) > 1 and self._playback[1][0] <= now:
-                self._playback.popleft()
-            start, frame, count, rate = self._playback[0]
-            frame += min(count, max(0.0, (now - start) * rate))
+            frame = self._playback_frame(now)
             while len(self._marks) > 1 and self._marks[1][0] <= frame:
                 self._marks.popleft()
             return self._marks[0][1]
 
+    def pause(self, *, rewind=False, now=None) -> None:
+        """Hold PCM unchanged; reclaim submitted frames only when the device discards them."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if self._paused:
+                return
+            frame = int(self._playback_frame(now)) if rewind else self._written - self._count
+            frame = max(self._cleared_at, self._written - self.capacity, frame)
+            self._count = min(self.capacity, max(0, self._written - frame))
+            self._r = (self._w - self._count) % self.capacity
+            self._paused = True
+            self._playback.clear()
+            while len(self._marks) > 1 and self._marks[1][0] <= frame:
+                self._marks.popleft()
+
+    def set_paused_gain(self, gain: float) -> None:
+        """Apply volume changes to held PCM, including unmuting previously silent audio."""
+        with self._lock:
+            if not self._paused:
+                return
+            self._paused_gain = gain
+            first = min(self._count, self.capacity - self._r)
+            self._buf[self._r:self._r + first] = self._unscaled[self._r:self._r + first] * gain
+            rest = self._count - first
+            if rest:
+                self._buf[:rest] = self._unscaled[:rest] * gain
+
+    def resume(self, ramp_frames: int = 0) -> None:
+        with self._lock:
+            if self._paused:
+                self._attack_frames = max(0, int(ramp_frames))
+                self._attack_left = self._attack_frames
+            self._paused = False
+            self._paused_gain = None
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def paused_position(self):
+        with self._lock:
+            if not self._paused:
+                return None
+            frame = self._written - self._count
+            for start, end, identity, before, after in reversed(self._positions):
+                if start <= frame <= end:
+                    fraction = (frame - start) / max(1, end - start)
+                    return identity, before + (after - before) * fraction
+        return None
+
     def fade_out(self, frames: int) -> None:
-        """Fade the last buffered frames to silence when pausing."""
+        """Fade the last buffered frames to silence."""
         n = int(min(frames, self._count))
         if n <= 0:
             return
@@ -124,6 +210,14 @@ class StereoRing:
                 self._buf[:rest] *= ramp[first:]
 
     def available(self) -> int:
+        with self._lock:
+            return 0 if self._paused else self._count
+
+    def drained(self) -> bool:
+        with self._lock:
+            return self._count == 0 and self._playback_frame(time.monotonic()) >= self._written
+
+    def pending(self) -> int:
         with self._lock:
             return self._count
 
@@ -143,7 +237,7 @@ class OutputDevice:
         ring: StereoRing,
         samplerate: int,
         blocksize: int = 1024,
-        latency_ms: float = 120.0,
+        latency_ms: float = 20.0,
         device=None,
         speed: float = 1.0,
     ):
@@ -165,6 +259,13 @@ class OutputDevice:
 
     def is_running(self) -> bool:
         return self._running
+
+    def pause(self) -> None:
+        self.ring.pause()
+
+    def resume(self) -> None:
+        # Ease into the held waveform over 2 ms, without inserting silence or skipping frames.
+        self.ring.resume(ramp_frames=max(1, round(self.samplerate * 0.002)))
 
     def buffered_seconds(self) -> float:
         return self.ring.available() / float(self.samplerate)
@@ -201,6 +302,9 @@ class NullOutput(OutputDevice):
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+
+    def pause(self) -> None:
+        self.ring.pause(rewind=True)
 
     def _loop(self) -> None:
         period = self.blocksize / float(self.samplerate) / max(self.speed, 1e-9)
@@ -263,7 +367,8 @@ class SoundDeviceOutput(OutputDevice):
 
         def callback(outdata, frames, _time_info, status):
             playback_time = time.monotonic() + self._playback_delay(_time_info)
-            if status:
+            if (status.input_underflow or status.input_overflow
+                    or status.output_underflow or status.output_overflow):
                 text = str(status)
                 self._status_counts[text] = self._status_counts.get(text, 0) + 1
                 self.xruns += 1
@@ -280,6 +385,7 @@ class SoundDeviceOutput(OutputDevice):
                 device=self.device,
                 latency=max(self.latency_ms, 20.0) / 1000.0,
                 callback=callback,
+                prime_output_buffers_using_stream_callback=True,
             )
             self._stream.start()
             self._running = True
@@ -287,6 +393,16 @@ class SoundDeviceOutput(OutputDevice):
             self.samplerate = int(round(self._stream.samplerate))
         except Exception as exc:
             raise AudioError(f"sounddevice: {exc}") from exc
+
+    def pause(self) -> None:
+        if self.ring.paused:
+            return
+        self.ring.pause(rewind=True)
+        stream = getattr(self, "_stream", None)
+        if stream is not None:
+            stream.abort()  # discard queued music without draining it
+            # Keep the output clock running on silence so Resume needs no device restart.
+            stream.start()
 
     def stop(self) -> None:
         self._running = False
@@ -305,7 +421,7 @@ class SoundDeviceOutput(OutputDevice):
     def is_running(self) -> bool:
         stream = getattr(self, "_stream", None)
         try:
-            return bool(stream is not None and stream.active)
+            return bool(stream is not None and not stream.closed and stream.active)
         except Exception:
             return False
 
@@ -404,7 +520,7 @@ def create_output(
     ring: Optional[StereoRing] = None,
     samplerate: Optional[int] = None,
     blocksize: int = 1024,
-    latency_ms: float = 120.0,
+    latency_ms: float = 20.0,
     device=None,
     speed: float = 1.0,
     log: Optional[Callable[[str], None]] = None,
@@ -423,7 +539,7 @@ def create_output(
         try:
             r = ring
             if r is None:
-                cap = int(max(rate * 1.0, blocksize * 8))  # 1 s of headroom
+                cap = int(max(rate * 5.0, blocksize * 8))  # retain recent PCM for device-buffer rollback
                 r = StereoRing(cap)
             out = _instantiate(name, r, rate, blocksize, latency_ms, device, speed)
             out.start()

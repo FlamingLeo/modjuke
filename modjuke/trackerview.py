@@ -3,6 +3,9 @@ from the render worker."""
 
 from __future__ import annotations
 
+from math import ceil
+from time import monotonic
+
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
@@ -110,7 +113,7 @@ class TrackerView(ttk.Frame):
     """The pattern grid (canvas-drawn, only the visible lines are built)."""
 
     def __init__(self, master, request_pattern: Optional[Callable[[int], None]] = None,
-                 **kw):
+                 smooth_scrolling: bool = False, **kw):
         super().__init__(master, **kw)
         self.request_pattern = request_pattern
         self.mono = tkfont.Font(font=("TkFixedFont",))
@@ -136,8 +139,14 @@ class TrackerView(ttk.Frame):
         self.playing = False
 
         self.follow = True
+        self.smooth_scrolling = bool(smooth_scrolling)
         self.visible = True                    # the tracker tab may be hidden
-        self.top = 0                           # first visible line
+        self.top = 0                           # whole-row follow / manual scroll target
+        self._view_top = 0.0                    # fractional line currently drawn
+        self._target_top = 0
+        self._glide = None
+        self._row_time = None
+        self._last_tick = None
         self.channel_offset = 0
         self.lines: list[tuple] = []           # ("row", order, row) / ("empty", order, 0)
         self.block_start: dict[int, int] = {}  # order -> line index of its first row line
@@ -204,6 +213,7 @@ class TrackerView(ttk.Frame):
         self.follow = True
         self._rebuild_lines()
         self.top = 0
+        self._snap_scroll()
         if self.follow:
             self._scroll_to_playing(force=True)
         self.redraw()
@@ -218,8 +228,9 @@ class TrackerView(ttk.Frame):
         else:
             self.patterns.pop(pattern, None)
             self.patterns[pattern] = list(cells) if cells else []
+        old_line = self._line_of_playback()
         self._rebuild_lines()
-        if self.follow:
+        if self.follow and old_line != self._line_of_playback():
             self._scroll_to_playing(force=True)
         self.redraw()
 
@@ -239,25 +250,69 @@ class TrackerView(ttk.Frame):
         self.lines = []
         self.block_start = {}
         self.top = 0
+        self._snap_scroll()
         self.channel_offset = 0
         self._rebuild_lines()
         self.redraw()
 
     def set_position(self, order: int, row: int, playing: bool = False) -> None:
-        """Where playback is (called from the UI tick)."""
+        """Highlight the audible row immediately; glide only the viewport between updates."""
+        now = monotonic()
+        timely = self._last_tick is not None and 0 <= now - self._last_tick <= 0.5
+        self._last_tick = now
         order = int(order or 0)
         row = int(row or 0)
         playing = bool(playing)
+        old_line = self._line_of_playback()
+        was_playing = self.playing
         moved = (order, row) != (self.current_order, self.current_row)
+        if (self.follow and self.visible and playing and was_playing
+                and old_line is not None and order in self.block_start):
+            self._advance_scroll(now)
+        else:
+            self._glide = None
+            self._row_time = None
         self.current_order = order
         self.current_row = row
         self.playing = playing
         if moved:
             line = self._line_of_playback()
             if self.follow and line is not None:
-                self._follow_scroll(line)
-            self._redraw_playing_lines()
+                interval = now - self._row_time if self._row_time is not None else 0.12
+                adjacent = old_line is not None and 0 < line - old_line <= 4
+                animate = (playing and was_playing and self.visible and adjacent and timely
+                           and self._row_time is not None and interval > 0)
+                self._follow_scroll(line, animate=animate, now=now,
+                                    duration=max(0.025, interval))
+            self._row_time = now if playing and self.visible and self.follow else None
+            if self.visible:
+                self._redraw_playing_lines()
+        elif playing and self._row_time is None and self.visible and self.follow:
+            self._row_time = now
         self._request_neighbours()
+
+    def set_smooth_scrolling(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self.smooth_scrolling:
+            return
+        self.smooth_scrolling = enabled
+        self._glide = None
+        self._row_time = None
+        if not enabled and self.follow:
+            if self.visible:
+                self._move_view(float(self.top))
+            else:
+                self._snap_scroll()
+
+    def set_visible(self, visible: bool) -> None:
+        """Hidden tabs do no animation work; returning catches up without a queued glide."""
+        self.visible = bool(visible)
+        self._glide = None
+        self._row_time = None
+        if self.visible:
+            if self.follow:
+                self._scroll_to_playing(force=True)
+            self.redraw()
 
     def _rebuild_lines(self) -> None:
         """Flatten the order list into the lines the canvas draws."""
@@ -353,10 +408,6 @@ class TrackerView(ttk.Frame):
         if self.errors:
             bad = ", ".join(f"{pattern:02d}" for pattern in sorted(self.errors))
             where += f", pattern {bad} could not be read"
-        if self.layout_name != "full":
-            extras = {"shared": "notes + volume/effect", "no-sample": "notes + volume + effect",
-                      "notes": "notes only"}[self.layout_name]
-            # where += f", {extras}"
         if not self.follow:
             where += ", scrolled"
         self.state_label.configure(text=where)
@@ -373,21 +424,24 @@ class TrackerView(ttk.Frame):
             return None
         return start + self.current_row
 
+    def _visible_range(self):
+        first = max(0, int(self._view_top))
+        height = max(1, self.canvas.winfo_height()) / self.line_h
+        return range(first, min(len(self.lines), ceil(self._view_top + height)))
+
     def _draw_lines(self) -> None:
         canvas = self.canvas
         canvas.delete("all")
         self._line_items = {}
-        visible = self._visible_lines()
-        first = max(0, min(self.top, max(0, len(self.lines) - 1)))
-        self.top = first
-        for offset in range(visible):
-            index = first + offset
-            if index >= len(self.lines):
-                break
-            self._line_items[index] = self._draw_line(index, offset)
+        self.top = max(0, min(self.top, self._max_top()))
+        if self.top != self._target_top:
+            self._snap_scroll()
+        self._view_top = max(0.0, min(self._view_top, float(self._max_top())))
+        for index in self._visible_range():
+            self._line_items[index] = self._draw_line(index, index - self._view_top)
         self._playing_line = self._line_of_playback()
 
-    def _draw_line(self, index: int, offset: int) -> list[int]:
+    def _draw_line(self, index: int, offset: float) -> list[int]:
         """Draw a row and return all its canvas items, including its background."""
         line = self.lines[index]
         items: list[int] = []
@@ -482,6 +536,7 @@ class TrackerView(ttk.Frame):
                 self.top = center_top(line, self._visible_lines(), len(self.lines))
             self.follow = False
         self.top = max(0, min(self.top + int(lines), self._max_top()))
+        self._snap_scroll()
         self._draw_lines()
         self._update_labels()
         return "break"
@@ -499,33 +554,63 @@ class TrackerView(ttk.Frame):
     def _jump_to_start(self) -> str:
         self.follow = False
         self.top = 0
+        self._snap_scroll()
         self._draw_lines()
         self._update_labels()
         return "break"
 
-    def _follow_scroll(self, line: Optional[int]) -> None:
-        """Center playback by moving existing canvas rows and drawing only newly exposed rows."""
-        if line is None:              # that pattern is not read yet: do not move
+    def _snap_scroll(self) -> None:
+        self._glide = None
+        self._row_time = None
+        self._target_top = self.top
+        self._view_top = float(self.top)
+
+    def _move_view(self, top: float) -> None:
+        top = max(0.0, min(top, float(self._max_top())))
+        delta = top - self._view_top
+        if abs(delta) < 1e-9:
+            return
+        self._view_top = top
+        self.canvas.move("all", 0, -delta * self.line_h)
+        wanted = self._visible_range()
+        for index in list(self._line_items):
+            if index not in wanted:
+                for item in self._line_items.pop(index):
+                    self.canvas.delete(item)
+        for index in wanted:
+            if index not in self._line_items:
+                self._line_items[index] = self._draw_line(index, index - top)
+
+    def _advance_scroll(self, now: float) -> None:
+        if self._glide is None:
+            return
+        origin, target, started, duration = self._glide
+        fraction = max(0.0, min(1.0, (now - started) / duration))
+        self._move_view(origin + (target - origin) * fraction)
+        if fraction >= 1.0:
+            self._glide = None
+
+    def _follow_scroll(self, line: Optional[int], *, animate: bool = False,
+                       now: float = 0.0, duration: float = 0.12) -> None:
+        """Move cached canvas rows in pixels, adding only newly exposed rows."""
+        if line is None:
             return
         visible = self._visible_lines()
         want = center_top(line, visible, len(self.lines))
-        delta = want - self.top
-        if delta == 0:
+        self.top = self._target_top = want
+        if not self.visible:
+            self._snap_scroll()
             return
-        if abs(delta) > visible:              # a jump: a seek, or a new module
-            self.top = want
-            self._draw_lines()
-            return
-        self.top = want
-        self.canvas.move("all", 0, -delta * self.line_h)
-        last = min(len(self.lines), want + visible)
-        for index in list(self._line_items):
-            if not (want <= index < last):    # scrolled out of the window
-                for item in self._line_items.pop(index):
-                    self.canvas.delete(item)
-        for index in range(want, last):
-            if index not in self._line_items:
-                self._line_items[index] = self._draw_line(index, index - want)
+        delta = want - self._view_top
+        if self.smooth_scrolling and animate and visible >= 4 and 0 < delta < visible / 2:
+            self._glide = (self._view_top, float(want), now, duration)
+        else:
+            self._glide = None
+            if abs(delta) > visible:  # seek / loop: never animate through unplayed rows
+                self._snap_scroll()
+                self._draw_lines()
+            else:
+                self._move_view(float(want))
 
     def _scroll_to_playing(self, force: bool = False) -> None:
         """Centre the playing row (on Follow, on new data, on a tab switch)."""
@@ -535,6 +620,7 @@ class TrackerView(ttk.Frame):
         if line is None:
             return        # that pattern is not read yet - do not scroll to the top
         self.top = center_top(line, self._visible_lines(), len(self.lines))
+        self._snap_scroll()
         self._draw_lines()
 
     def _redraw_playing_lines(self) -> None:
@@ -546,7 +632,7 @@ class TrackerView(ttk.Frame):
             if index in self._line_items:
                 for item in self._line_items.pop(index, []):
                     self.canvas.delete(item)
-                self._line_items[index] = self._draw_line(index, index - self.top)
+                self._line_items[index] = self._draw_line(index, index - self._view_top)
         self._playing_line = line
         self._update_labels()
 
@@ -554,6 +640,9 @@ class TrackerView(ttk.Frame):
         self.follow = not self.follow
         if self.follow:
             self._scroll_to_playing(force=True)
+        else:
+            self._glide = None
+            self._row_time = None
         self.redraw()
 
     def _on_wheel(self, event) -> str:
@@ -565,14 +654,16 @@ class TrackerView(ttk.Frame):
 
     def _on_resize(self) -> None:
         self.line_h = max(10, self.mono.metrics("linespace") + 1)
+        if self.follow:
+            self._scroll_to_playing(force=True)
         self.redraw()
 
     def wanted_patterns(self) -> list[int]:
         """Patterns the visible lines need (so scrolling fills in as it goes)."""
         if not self.orders:
             return []
-        first = self.top
-        last = self.top + self._visible_lines()
+        first = int(self._view_top)
+        last = ceil(self._view_top) + self._visible_lines()
         wanted: list[int] = []
         for index in range(max(0, first - 1), min(len(self.lines), last + 1)):
             order = self.lines[index][1]

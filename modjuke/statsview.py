@@ -138,12 +138,17 @@ class StatsWindow(tk.Toplevel):
                 self.tree.selection_set(item)
         self.tree.yview_moveto(y)
         self.show_path()
-        shown = ("No listening recorded yet. Start a module to begin." if not modules else
+        enabled = self.app.settings.track_listening_stats
+        shown = (("No listening recorded yet. Start a module to begin." if enabled else
+                  "No listening recorded.") if not modules else
                  f"{min(len(rows), MAX_ROWS):,} of {len(rows):,} matching modules shown.")
+        recording = ("Stats are saved every 30 seconds and on exit."
+                     if enabled else "Recording is off. Enable Keep listening stats in Settings to record again. "
+                     "Existing history is kept, disabled listening is not added later.")
         self.note.configure(text=f"{shown}\nLocal history since {local_date(store.since)}. "
                             "Note that pauses, seeks, track loops and audio restarts do not add plays. "
                             "Time measures running playback. "
-                            "Stats are saved every 30 seconds and on exit.")
+                            + recording)
 
     def show_path(self, _event=None) -> None:
         selected = self.tree.selection()
@@ -153,7 +158,9 @@ class StatsWindow(tk.Toplevel):
         if not messagebox.askyesno("Reset listening stats?",
                                    "Permanently clear all listening time and play counts?\n\n"
                                    "Your music files, playlists and playback will not be changed.\n"
-                                   "A playing song will start a fresh stats entry.", parent=self):
+                                   + ("A playing song will start a fresh stats entry."
+                                      if self.app.settings.track_listening_stats else
+                                      "Recording will remain off."), parent=self):
             return
         if self.app._listening.store.reset():
             self.app._listening.reset()

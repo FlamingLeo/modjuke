@@ -86,7 +86,7 @@ class StatsStore:
         path = path_key(path)
         if path not in self.records:
             if len(self.records) >= MAX_MODULES:
-                self.error = "Listening stats limit reached; existing history is kept."
+                self.error = "Listening stats limit reached, existing history is kept."
                 return False
             self.records[path] = ModuleStats(path)
         row = self.records[path]
@@ -160,8 +160,10 @@ class StatsStore:
 
 class ListeningCounter:
     """Observe engine snapshots; never use song position as elapsed listening time."""
-    def __init__(self, store: StatsStore):
+    def __init__(self, store: StatsStore, enabled: bool = True):
         self.store = store
+        self.enabled = bool(enabled)
+        self._require_audio = not self.enabled
         self._identity = None
         self._generation = None
         self._audio = 0.0
@@ -170,6 +172,18 @@ class ListeningCounter:
         self._active = False
         self._counted = False
         self._continue = None
+
+    def set_enabled(self, enabled, snap, source, now=None, when=None) -> bool:
+        enabled = bool(enabled)
+        if enabled == self.enabled:
+            return False
+        # Settle the old mode, then discard elapsed time and queued audio at the boundary.
+        self.observe(snap, source, now=now, when=when)
+        self.enabled = enabled
+        self._budget = 0.0
+        self._time = None
+        self._active = False
+        return True
 
     def continue_output(self, path, play_id=None) -> None:
         """The UI replaced the audio engine, not the user's playback session."""
@@ -207,6 +221,7 @@ class ListeningCounter:
         fresh = identity != self._identity
         generation_changed = snap.generation != self._generation
         if fresh:
+            self._require_audio = False
             self._identity = identity
             self._counted = bool(self._continue and self._continue[0] == path and self._continue[1])
             self._continue = None
@@ -218,6 +233,11 @@ class ListeningCounter:
         self._generation = snap.generation
         delta_audio = max(0.0, audio - self._audio)
         self._audio = audio
+        if not self.enabled:
+            self._budget = 0.0
+            self._active = False
+            self._require_audio = True
+            return
         # EOF may still have queued audio; finished means the ring has drained.
         active = bool((snap.playing or snap.ended) and not snap.paused and not snap.finished)
         elapsed = now - previous_time if previous_time is not None else 0.0
@@ -233,11 +253,13 @@ class ListeningCounter:
             self._budget = 0.0  # do not guess over suspend / a blocked UI
         self._budget -= seconds
         play = (not self._counted and audio > 0 and not snap.paused
+                and (not self._require_audio or delta_audio > 0)
                 and (snap.playing or snap.ended or snap.finished))
         if play or seconds > 0:
             title = getattr(snap.info, "title", "") if snap.info else ""
             if self.store.record(path, seconds, play, title, when):
                 self._counted = True
         if not active:
-            self._budget = 0.0
+            # Paused PCM is retained for resume; seeks and loads discard that queue.
+            self._budget = min(self._budget, max(0.0, snap.buffer_seconds)) if snap.paused else 0.0
         self._active = active
