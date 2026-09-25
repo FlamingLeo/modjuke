@@ -1123,11 +1123,11 @@ class SettingsDialog(tk.Toplevel):
         s = app.settings
 
         def row(parent, r, label, widget, hint=""):
-            ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=3)
-            widget.grid(row=r, column=1, sticky="ew", pady=3)
+            ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=(0, 12), pady=2)
+            widget.grid(row=r, column=1, sticky="ew", pady=2)
             if hint:
                 ttk.Label(parent, text=hint, style="Dim.TLabel", background=BG).grid(
-                    row=r, column=2, sticky="w", padx=(8, 0), pady=3)
+                    row=r, column=2, sticky="w", padx=(8, 0), pady=2)
             return widget
 
         frm = ttk.Frame(self, padding=14)
@@ -1238,25 +1238,29 @@ class SettingsDialog(tk.Toplevel):
             ttk.Checkbutton(frm, variable=self.keep_info),
             "lengths, formats and channels are read once, not every start")
 
-        self.keep_stats = tk.BooleanVar(value=s.track_listening_stats)
-        row(frm, 24, "Keep listening stats", ttk.Checkbutton(frm, variable=self.keep_stats),
-            "off stops recording, existing history is kept")
+        self.auto_analyze = tk.BooleanVar(value=s.auto_analyze)
+        row(frm, 24, "Analyze files automatically", ttk.Checkbutton(frm, variable=self.auto_analyze),
+            "read new or changed files in the background; reuse known details")
 
-        ttk.Separator(frm, orient="horizontal").grid(row=25, column=0, columnspan=3,
+        self.keep_stats = tk.BooleanVar(value=s.track_listening_stats)
+        row(frm, 25, "Keep listening stats", ttk.Checkbutton(frm, variable=self.keep_stats),
+            "off stops recording; existing history is kept")
+
+        ttk.Separator(frm, orient="horizontal").grid(row=26, column=0, columnspan=3,
                                                      sticky="ew", pady=10)
-        ttk.Label(frm, text="Appearance", style="Head.TLabel").grid(row=26, column=0, sticky="w")
+        ttk.Label(frm, text="Appearance", style="Head.TLabel").grid(row=27, column=0, sticky="w")
         self.theme = tk.StringVar(value=theme.label(s.theme))
-        row(frm, 27, "Colour scheme", ttk.Combobox(
+        row(frm, 28, "Colour scheme", ttk.Combobox(
             frm, textvariable=self.theme, state="readonly", width=16,
             values=tuple(theme.THEME_LABELS[name] for name in theme.THEME_NAMES)),
             "applies when you press Save")
 
         self.smooth_scroll = tk.BooleanVar(value=s.smooth_tracker_scrolling)
-        row(frm, 28, "Smooth tracker scrolling", ttk.Checkbutton(frm, variable=self.smooth_scroll),
-            "glide the current row while following")
+        row(frm, 29, "Smooth tracker scrolling", ttk.Checkbutton(frm, variable=self.smooth_scroll),
+            "glide while Following; off moves one row at a time")
 
         buttons = ttk.Frame(frm)
-        buttons.grid(row=29, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        buttons.grid(row=30, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="Save", style="Accent.TButton",
                    command=self.save).pack(side="right")
@@ -1351,6 +1355,7 @@ class SettingsDialog(tk.Toplevel):
         s.smooth_tracker_scrolling = bool(self.smooth_scroll.get())
         self.app._tracker.set_smooth_scrolling(s.smooth_tracker_scrolling)
         self.app.apply_listening_stats(self.keep_stats.get())
+        self.app.apply_auto_analysis(self.auto_analyze.get())
         self.app._save_settings()
         self.app.sync_setting_toggles()
         engine = self.app.engine
@@ -1389,6 +1394,10 @@ class PlayerApp:
         self._scan_thread: Optional[threading.Thread] = None
         self._scan_cancel = threading.Event()
         self._analyzer: Optional[Analyzer] = None
+        self._analysis_running = False
+        self._analysis_automatic = False
+        self._analysis_after = None
+        self._analysis_refresh_pending = False
         self.analysis_cache: Optional[AnalysisCache] = None
         if self.settings.cache_analysis:
             self.analysis_cache = AnalysisCache(self._cache_file())
@@ -2335,6 +2344,8 @@ class PlayerApp:
         if self._scan_thread and self._scan_thread.is_alive():
             self._scan_cancel.set()
         self._scan_cancel = threading.Event()
+        if self._analysis_running:
+            self._analyzer.cancel.set()
         root_changed = bool(self._directory) and os.path.abspath(path) != self._directory
         if root_changed:
             self._shuffle_paths = []
@@ -2359,14 +2370,17 @@ class PlayerApp:
                     progress=lambda count, where: self.queue_ui.put(("progress", (count, where))),
                     cancel=cancel,
                 )
-                self.queue_ui.put(("scanned", (result, autoplay)))
+                self.queue_ui.put(("scanned", (result, autoplay, cancel)))
             except Exception as exc:  # pragma: no cover
                 self.queue_ui.put(("error", (f"scan failed: {exc}",)))
 
         self._scan_thread = threading.Thread(target=work, name="scan", daemon=True)
         self._scan_thread.start()
 
-    def _on_scanned(self, result: library.ScanResult, autoplay: bool) -> None:
+    def _on_scanned(self, result: library.ScanResult, autoplay: bool,
+                    cancel: Optional[threading.Event] = None) -> None:
+        if result.cancelled or (cancel is not None and cancel is not self._scan_cancel):
+            return
         self.tracks = result.tracks
         for track in self.tracks:
             track.broken = None
@@ -2374,9 +2388,6 @@ class PlayerApp:
             text=f"{len(self.tracks)} tracks, {result.dirs} folders" +
                  (f", {result.skipped} skipped" if result.skipped else ""))
         self._refresh_min_size()
-        if result.cancelled:
-            self.status("scan cancelled")
-            return
         for err in result.errors[:5]:
             self.log(MSG_WARN, err)
         self.status(f"found {len(self.tracks)} module files in {result.dirs} folders")
@@ -2682,6 +2693,7 @@ class PlayerApp:
             self.filter_label.configure(text="")
         self._save_settings()
         self._update_queue_label()
+        self._schedule_auto_analysis()
 
     def _populate_tree(self) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -2772,25 +2784,74 @@ class PlayerApp:
         else:
             self.queue_label.configure(text=f"-/{len(self.queue)}")
 
+    def _analysis_tracks(self) -> list[Track]:
+        # Include newly added playlist files even when another collection is displayed.
+        tracks = dict(self._playlists._external_tracks)
+        tracks.update((t.path, t) for t in self.tracks)
+        tracks.update((t.path, t) for t in self._queue_source_tracks())
+        return list(tracks.values())
+
+    def apply_auto_analysis(self, enabled: bool) -> None:
+        self.settings.auto_analyze = bool(enabled)
+        if not enabled:
+            if self._analysis_after is not None:
+                self.root.after_cancel(self._analysis_after)
+                self._analysis_after = None
+            if self._analysis_running and self._analysis_automatic:
+                self._analyzer.cancel.set()
+        else:
+            self._schedule_auto_analysis()
+
+    def _schedule_auto_analysis(self) -> None:
+        if self.settings.auto_analyze and not self._closing and self._analysis_after is None:
+            self._analysis_after = self.root.after_idle(self._auto_analyze)
+
+    def _auto_analyze(self) -> None:
+        self._analysis_after = None
+        if self._closing or not self.settings.auto_analyze or self._analysis_running:
+            return
+        if self._scan_thread and self._scan_thread.is_alive():
+            self._analysis_after = self.root.after(50, self._auto_analyze)
+            return
+        tracks = self._analysis_tracks()
+        cache = self.analysis_cache
+        if cache is not None and not self._cache_loaded:
+            cache.load()
+            self._cache_loaded = True
+        hits = sum(1 for t in tracks if not t.analyzed and cache is not None and cache.apply(t))
+        if hits:
+            self._refresh_analysis_view()
+        self._start_analysis([t for t in tracks if not t.analyzed], automatic=True)
+
     def analyze_library(self) -> None:
-        if not self._queue_source_tracks():
+        tracks = self._queue_source_tracks()
+        if not tracks:
             self.status("nothing to analyze - open a folder first")
             return
-        if self._analyzer and self._analyzer.is_alive():
+        if self._analysis_running:
             self.status("analysis already running")
             return
-        todo = [t for t in self._queue_source_tracks() if not t.analyzed]
+        todo = [t for t in tracks if not t.analyzed]
         if not todo:
             self.status("everything is already analyzed")
             return
+        self._start_analysis(todo, automatic=False)
+
+    def _start_analysis(self, todo: list[Track], *, automatic: bool) -> None:
+        if not todo or self._analysis_running:
+            return
         self.status(f"analyzing {len(todo)} modules in the background …")
+        # A rescan may replace Track objects while this batch is still reading them.
+        stamps = {t.path: (t.size, t.mtime) for t in todo}
 
         def on_result(track: Track, info, error):
-            self.queue_ui.put(("analyzed", (track.path, info, error)))
+            self.queue_ui.put(("analyzed", (track.path, info, error, stamps[track.path])))
 
         def on_done(done, failed):
             self.queue_ui.put(("analyzed_done", (done, failed)))
 
+        self._analysis_running = True
+        self._analysis_automatic = automatic
         self._analyzer = Analyzer(todo, on_result, on_done)
         self._analyzer.start()
 
@@ -2977,9 +3038,11 @@ class PlayerApp:
         self.play_selected()
         return None
 
-    def _on_analyzed(self, path: str, info, error: Optional[str]) -> None:
-        track = next((t for t in self.tracks + self._queue_source_tracks() if t.path == path), None)
-        if track is None:
+    def _on_analyzed(self, path: str, info, error: Optional[str], stamp=None, targets=None) -> None:
+        if targets is None:
+            targets = {t.path: t for t in self._analysis_tracks()}
+        track = targets.get(path)
+        if track is None or (stamp is not None and (track.size, track.mtime) != stamp):
             return
         if error:
             track.broken = error
@@ -2992,12 +3055,30 @@ class PlayerApp:
             track.subsongs = info.num_subsongs
             track.title = info.title
         row = self._row_of_path.get(path)
-        if row and self.tree.exists(row):
+        if self._drag_row:
+            self._analysis_refresh_pending = True
+        elif row and self.tree.exists(row):
             self.tree.item(row, values=(track.rel_dir or ".", track.duration_text(),
                                         track.fmt.upper(), track.channels or ""))
             self._apply_tags(row)
         if self.analysis_cache is not None:
             self.analysis_cache.remember(track)
+
+    def _refresh_analysis_view(self) -> None:
+        # Do not replace tree rows under an active drag or click.
+        if self._drag_row:
+            self._analysis_refresh_pending = True
+            return
+        self._analysis_refresh_pending = False
+        if self.search_var.get().strip() or self._queue_filter().active:
+            self.rebuild_queue(keep_playing=True)
+        else:
+            for track in self.queue:
+                row = self._row_of_path.get(track.path)
+                if row and self.tree.exists(row):
+                    self.tree.item(row, values=(track.rel_dir or ".", track.duration_text(),
+                                               track.fmt.upper(), track.channels or ""))
+                    self._apply_tags(row)
 
     def selected_song_paths(self) -> list[str]:
         """Songs only, in queue order; selecting a folder never adds its children."""
@@ -3021,6 +3102,8 @@ class PlayerApp:
         except PlaylistError as exc:
             messagebox.showerror("Playlists", str(exc), parent=self.root)
             return None
+        self._playlists.resolve(playlist.name, self.tracks)
+        self._schedule_auto_analysis()
         self.status(f"Created '{playlist.name}' with {len(playlist.paths)} songs")
         return playlist.name
 
@@ -3054,6 +3137,8 @@ class PlayerApp:
             self._playlist_dirty = False
             if self.order_var.get() == library.ORDER_PLAYLIST:
                 self.rebuild_queue(keep_playing=True)
+        self._playlists.resolve(playlist.name, self.tracks)
+        self._schedule_auto_analysis()
         count = len(after) - len(before)
         self.status(f"Added {count} song{'s' if count != 1 else ''} to '{playlist.name}'"
                     + (" (already present songs were skipped)" if count < len(paths) else ""))
@@ -3789,7 +3874,11 @@ class PlayerApp:
         self.apply_update_rate(delay_ms=25)
 
     def _drain_thread_queue(self) -> None:
-        while True:
+        if self._analysis_refresh_pending and not self._drag_row:
+            self._refresh_analysis_view()
+        analysis_targets = None
+        # Large metadata batches must leave time for playback drawing and input.
+        for _ in range(200):
             try:
                 kind, payload = self.queue_ui.get_nowait()
             except queue.Empty:
@@ -3799,20 +3888,27 @@ class PlayerApp:
                 self.status(f"scanning… {count} modules found ({os.path.basename(where)})")
             elif kind == "scanned":
                 self._on_scanned(*payload)
+                analysis_targets = None
             elif kind == "analyzed":
-                self._on_analyzed(*payload)
+                if analysis_targets is None:
+                    analysis_targets = {t.path: t for t in self._analysis_tracks()}
+                self._on_analyzed(*payload, targets=analysis_targets)
             elif kind == "reveal":
                 ok, message = payload
                 self._reveal_pending = False
                 self.log(MSG_INFO if ok else MSG_WARN, message)
                 self.status(message)
             elif kind == "analyzed_done":
+                analysis_targets = None
+                self._analysis_running = False
                 done, failed = payload
                 self.status(f"analysis finished: {done} modules"
                             + (f", {failed} unreadable" if failed else ""))
                 self.log(MSG_INFO, f"analyzed {done} modules ({failed} failed)")
                 if self.analysis_cache is not None:
                     self.analysis_cache.save()      # keep the work, even if we crash
+                self._refresh_analysis_view()
+                self._schedule_auto_analysis()
             elif kind == "cache_loaded":
                 entries, = payload
                 if entries:
@@ -4195,6 +4291,9 @@ class PlayerApp:
             messagebox.showwarning("Listening stats not saved", store.error, parent=self.root)
         self._dismiss_playlist_menu()
         self._closing = True
+        if self._analysis_after is not None:
+            self.root.after_cancel(self._analysis_after)
+            self._analysis_after = None
         if self._tick_id is not None:
             try:
                 self.root.after_cancel(self._tick_id)

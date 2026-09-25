@@ -86,7 +86,7 @@ class StatsStore:
         path = path_key(path)
         if path not in self.records:
             if len(self.records) >= MAX_MODULES:
-                self.error = "Listening stats limit reached, existing history is kept."
+                self.error = "Listening stats limit reached; existing history is kept."
                 return False
             self.records[path] = ModuleStats(path)
         row = self.records[path]

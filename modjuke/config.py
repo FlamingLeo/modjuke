@@ -111,6 +111,7 @@ class Settings:
     theme: str = theme.DEFAULT_THEME
     remember_position: bool = True
     cache_analysis: bool = True
+    auto_analyze: bool = True
     track_listening_stats: bool = True
     last_path: str = ""
     last_position: float = 0.0

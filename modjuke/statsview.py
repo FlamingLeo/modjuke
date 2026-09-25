@@ -144,7 +144,7 @@ class StatsWindow(tk.Toplevel):
                  f"{min(len(rows), MAX_ROWS):,} of {len(rows):,} matching modules shown.")
         recording = ("Stats are saved every 30 seconds and on exit."
                      if enabled else "Recording is off. Enable Keep listening stats in Settings to record again. "
-                     "Existing history is kept, disabled listening is not added later.")
+                     "Existing history is kept; disabled listening is not added later.")
         self.note.configure(text=f"{shown}\nLocal history since {local_date(store.since)}. "
                             "Note that pauses, seeks, track loops and audio restarts do not add plays. "
                             "Time measures running playback. "
