@@ -121,7 +121,7 @@ for _family in FAMILIES:
 
 
 def family_of(format_name: str) -> str:
-    """Choose the effect format family; use MOD for unknown formats."""
+    """Choose the effect format family, use MOD for unknown formats."""
     text = str(format_name or "").strip().lower()
     if text in FAMILIES:
         return text

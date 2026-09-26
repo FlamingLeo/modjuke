@@ -16,7 +16,7 @@ from .library import natural_key
 def pick_files_system(parent=None, *, initialdir="", title="Open files", multiple=False,
                       save=False, initialfile="", defaultextension="", filetypes=(),
                       timeout=600):
-    """None means unavailable/failed; an empty result means cancellation."""
+    """None means unavailable/failed, an empty result means cancellation."""
     multiple = multiple and not save
     picker = system_picker_available()
     if not picker:
@@ -281,6 +281,9 @@ class FileDialog(FolderDialog):
             return
         if self.save:
             path = paths[0]
+            if "\0" in path:
+                self._flash_error("File names cannot contain a null character")
+                return
             if self.defaultextension and not os.path.splitext(os.path.basename(path))[1]:
                 path += self.defaultextension
             if os.path.isdir(path) or not os.path.isdir(os.path.dirname(path)):
@@ -308,7 +311,7 @@ class FileDialog(FolderDialog):
                                    initialfile=self.name_var.get() if self.save else "",
                                    defaultextension=self.defaultextension, filetypes=self.filetypes)
         if chosen is None:
-            self._status.set("System dialog unavailable; use this browser instead")
+            self._status.set("System dialog unavailable, use this browser instead")
             return
         self.result = chosen
         self.destroy()

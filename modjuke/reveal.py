@@ -96,8 +96,8 @@ def reveal(path: str, *, runner: Optional[Runner] = None, which: Which = shutil.
             name = os.path.basename(path)
             folder = os.path.dirname(path)
             if selects:
-                return True, f"showed {name} in {folder}"
-            return True, f"opened {folder} (no file manager here can select the module)"
+                return True, f"Showed {name} in {folder}"
+            return True, f"Opened {folder} (no file manager here can select the module)"
     names = ", ".join(dict.fromkeys(tried))
-    return False, f"could not open a file manager (tried {names})" if names else \
-        "no file manager found on this system"
+    return False, f"Could not open a file manager (tried {names})" if names else \
+        "No file manager found on this system"

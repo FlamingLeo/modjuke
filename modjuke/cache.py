@@ -4,6 +4,7 @@ match."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from typing import TYPE_CHECKING, Any, Optional
@@ -35,7 +36,7 @@ class AnalysisCache:
         self.misses = 0
 
     def load(self) -> int:
-        """Read the file; returns how many records it holds (0 if unusable)."""
+        """Read the file, returns how many records it holds (0 if unusable)."""
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
@@ -54,13 +55,26 @@ class AnalysisCache:
         if not entry or not self._matches(entry, track):
             self.misses += 1
             return False
+        try:
+            duration = self._duration(entry.get("dur"))
+            if duration is not None and (math.isnan(duration) or duration < 0):
+                raise ValueError("Invalid cached duration")
+            for key in ("ch", "sub"):
+                value = entry.get(key)
+                if isinstance(value, (int, float)) and (value < 0 or value != int(value)):
+                    raise ValueError("Invalid cached count")
+            channels = entry.get("ch")
+            channels = int(channels) if isinstance(channels, (int, float)) else None
+            subsongs = entry.get("sub")
+            subsongs = int(subsongs) if isinstance(subsongs, (int, float)) else 1
+        except (ValueError, OverflowError):
+            self.misses += 1
+            return False
         track.analyzed = True
-        track.duration = self._duration(entry.get("dur"))
+        track.duration = duration
         track.fmt = str(entry.get("fmt") or "")
-        channels = entry.get("ch")
-        track.channels = int(channels) if isinstance(channels, (int, float)) else None
-        subsongs = entry.get("sub")
-        track.subsongs = int(subsongs) if isinstance(subsongs, (int, float)) else 1
+        track.channels = channels
+        track.subsongs = subsongs
         track.title = str(entry.get("title") or "")
         broken = entry.get("broken")
         track.broken = str(broken) if broken else None
@@ -128,7 +142,7 @@ class AnalysisCache:
             if int(entry.get("size", -1)) != int(track.size or 0):
                 return False
             return abs(float(entry.get("mtime", -1.0)) - float(track.mtime or 0.0)) < 1e-6
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
 
     @staticmethod

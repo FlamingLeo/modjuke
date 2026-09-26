@@ -12,13 +12,24 @@ modjuke entry point.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
 from . import __version__
-from .config import APP_TITLE
+from .config import APP_TITLE, Settings
 from .theme import THEME_NAMES
 from .openmpt import INTERPOLATION_FILTERS
+
+
+def positive_speed(value: str) -> float:
+    try:
+        speed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("speed must be a finite number greater than zero") from exc
+    if not math.isfinite(speed) or speed <= 0:
+        raise argparse.ArgumentTypeError("speed must be a finite number greater than zero")
+    return speed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,15 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--backend", choices=("auto", "sounddevice", "soundcard", "null"),
                         default=None, help="audio output backend (default: from the settings)")
     parser.add_argument("--volume", type=int, default=None, metavar="0..100")
-    parser.add_argument("--speed", type=float, default=1.0, metavar="N",
+    parser.add_argument("--speed", type=positive_speed, default=1.0, metavar="N",
                         help="play N times faster than real time (testing/feature-demo)")
     parser.add_argument("--interpolation", choices=tuple(INTERPOLATION_FILTERS), default=None,
                         help="libopenmpt mixer resampling filter: off (no interpolation), "
                              "linear, cubic or sinc (default: from the settings)")
     parser.add_argument("--autoplay", action="store_true", help="start playing right away")
-    parser.add_argument("--theme", choices=THEME_NAMES, default=None, metavar="NAME",
+    custom = Settings.load().custom_themes
+    theme_names = THEME_NAMES + tuple(custom) + tuple(entry["name"] for entry in custom.values())
+    parser.add_argument("--theme", choices=theme_names, default=None, metavar="NAME",
                         help="colour scheme: " + ", ".join(THEME_NAMES)
-                             + " (default: from the settings)")
+                             + ", or a saved custom theme name (default: from the settings)")
     parser.add_argument("--scan", metavar="DIR", default="",
                         help="headless: scan DIR and print the queue, then exit")
     parser.add_argument("--order", choices=("alphabetical", "by directory", "shuffle"),
@@ -73,7 +86,12 @@ def scan_and_report(directory: str, order: str = "by directory", analyze: bool =
         print(exc, file=sys.stderr)
         return 2
     print(f"libopenmpt {lib.version_string}")
+    from .ignored import IgnoreStore
+    ignored = IgnoreStore()
+    if ignored.error:
+        print(ignored.error, file=sys.stderr)
     result = scan_library(directory)
+    result.tracks = [t for t in result.tracks if not ignored.contains(t.path)]
     print(f"{result.root}: {len(result.tracks)} modules in {result.dirs} folders"
           + (f", {len(result.errors)} warnings" if result.errors else ""))
     for warning in result.errors[:10]:
@@ -136,6 +154,13 @@ def main(argv: list[str] | None = None) -> int:
         return check_backends()
     if args.scan:
         return scan_and_report(args.scan, args.order, args.analyze)
+
+    if args.track:
+        from .ignored import IgnoreStore
+        ignored = IgnoreStore()
+        if ignored.contains(args.track):
+            print("This song is ignored - restore it in Settings → Ignored songs", file=sys.stderr)
+            return 2
 
     if not _tk_available():
         print("Tkinter is not available - install python3-tk (or run with --scan).",

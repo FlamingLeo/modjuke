@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import font as tkfont
 from tkinter import messagebox, ttk
 from typing import Optional
@@ -26,8 +27,10 @@ from .filedialog import pick_files
 from .engine import MSG_DEBUG, MSG_ERROR, MSG_INFO, MSG_WARN, PlaybackEngine
 from .filters import (QueueFilter, filter_from_settings, formats_in,
                       normalise_formats, unknown_duration_count)
-from .playlists import (PlaylistError, PlaylistStore, normalise_name, playlists_path,
+from .playlists import (FAVORITES_NAME, PlaylistError, PlaylistStore, normalise_name, playlists_path,
                         read_m3u, write_m3u)
+from .ignored import IgnoreError, IgnoreStore, ignored_path
+from .ignoreview import IgnoreDialog
 from .songinfo import SongInfoWindow
 from .stats import ListeningCounter, StatsStore, stats_path
 from .statsview import StatsWindow
@@ -37,6 +40,7 @@ from .openmpt import (DEFAULT_INTERPOLATION, get_lib, interpolation_length,
                       interpolation_name)
 
 from . import theme
+from .assets import set_window_icon
 from .theme import (ACCENT, ACCENT_DIM, AMBER, BG, BG_ALT, BG_INPUT, BG_PANEL, BG_STRIPE,
                     BUTTON_OFF_BG, FG, FG_DIM, FG_FAINT, GREEN, ON_ACCENT, RED,
                     SEEK_FILL_OFF, SEEK_KNOB, SEEK_MARKER, SEEK_TRACK, SEEK_TRACK_OFF,
@@ -239,6 +243,7 @@ class VuMeter(tk.Canvas):
         self._levels = (0.0, 0.0)
         self._channels = 0
         self._built_for = 0                 # the width the bars are laid out for
+        self._drawn_bars: dict[int, tuple] = {}
         self.bind("<Configure>", self._on_configure)
 
     def apply_theme(self) -> None:
@@ -276,6 +281,7 @@ class VuMeter(tk.Canvas):
         width = self._built_for = self._meter_width()
         count = max(1, self._channels)
         self.delete("all")
+        self._drawn_bars.clear()
         self._bars, self._fills = [], []
         self._level_bars, self._level_fills = [], []
         bar_w = max(3, min(11, (width - 10) // count))
@@ -309,6 +315,14 @@ class VuMeter(tk.Canvas):
             return len(old or ()) != len(new or ())
         return moved(self._values, values) or moved(self._levels, levels)
 
+    def _draw_bar(self, item: int, coords: tuple, colour: str) -> None:
+        previous = self._drawn_bars.get(item)
+        if previous is None or previous[0] != coords:
+            self.coords(item, *coords)
+        if previous is None or previous[1] != colour:
+            self.itemconfigure(item, fill=colour)
+        self._drawn_bars[item] = (coords, colour)
+
     def redraw(self) -> None:
         if not self._fills:
             return
@@ -321,21 +335,19 @@ class VuMeter(tk.Canvas):
             frac = min(1.0, max(0.0, v) ** 0.6)
             x0 = x_base + i * bar_w
             if frac <= 0.001:                 # silence: the trough shows through
-                self.coords(item, x0, self.BASELINE + 1, x0 + bar_w - self.GAP,
-                            self.BASELINE + 1)
-                self.itemconfigure(item, fill=BG_ALT)
+                self._draw_bar(item, (x0, self.BASELINE + 1, x0 + bar_w - self.GAP,
+                                      self.BASELINE + 1), BG_ALT)
                 continue
             top = self.BASELINE + 1 + (1.0 - frac) * (self.BOTTOM - self.BASELINE - 1)
-            self.coords(item, x0, top, x0 + bar_w - self.GAP, self.BOTTOM)
             colour = GREEN if frac < 0.75 else (AMBER if frac < 0.92 else RED)
-            self.itemconfigure(item, fill=colour)
+            self._draw_bar(item, (x0, top, x0 + bar_w - self.GAP, self.BOTTOM), colour)
         for i, item in enumerate(self._level_fills):
             v = self._levels[i] if i < len(self._levels) else 0.0
             frac = min(1.0, max(0.0, v) ** 0.5)
             top = 6 + i * self.RAIL_STEP
-            self.coords(item, 4, top, 4 + max(1, frac * (width - 8)), top + self.RAIL_H)
             colour = GREEN if frac < 0.75 else (AMBER if frac < 0.92 else RED)
-            self.itemconfigure(item, fill=colour if frac > 0.002 else BG_ALT)
+            self._draw_bar(item, (4, top, 4 + max(1, frac * (width - 8)), top + self.RAIL_H),
+                           colour if frac > 0.002 else BG_ALT)
 
 
 class SeekBar(tk.Canvas):
@@ -558,7 +570,7 @@ def spin_number(variable) -> Optional[float]:
     """Read a spinbox number, or return None for empty or invalid input."""
     try:
         value = float(variable.get())
-    except (tk.TclError, TypeError, ValueError):
+    except (tk.TclError, TypeError, ValueError, OverflowError):
         return None
     return value if math.isfinite(value) else None
 
@@ -618,11 +630,11 @@ class FilterDialog(tk.Toplevel):
                             command=self.update_preview).grid(
                 row=index // 3, column=index % 3, sticky="w", padx=(0, 16))
         if not known:
-            ttk.Label(box, text="no module with a known format yet - press Analyze",
+            ttk.Label(box, text="No module with a known format yet - press Analyze",
                       style="Dim.TLabel", background=BG).grid(row=0, column=0, sticky="w")
         elif unnamed:
             ttk.Label(box, text=f"{unnamed} module(s) have no known format "
-                                f"(Analyze reads them; 'hide modules that cannot be "
+                                f"(Analyze reads them, 'hide modules that cannot be "
                                 f"played' leaves them out)",
                       style="Dim.TLabel", background=BG).grid(
                 row=len(known) // 3 + 1, column=0, columnspan=3, sticky="w", pady=(4, 0))
@@ -724,7 +736,7 @@ class FilterDialog(tk.Toplevel):
 
 
 class NewPlaylistDialog(tk.Toplevel):
-    """Theme-aware name prompt; invalid names and save errors stay in the dialog."""
+    """Theme-aware name prompt, invalid names and save errors stay in the dialog."""
 
     def __init__(self, app: "PlayerApp", paths=()):
         app._dismiss_playlist_menu()
@@ -792,7 +804,8 @@ class NewPlaylistDialog(tk.Toplevel):
             self.name_entry.focus_set()
             return "break"
         self.result = playlist.name
-        self.app.status(f"Created '{playlist.name}' with {len(playlist.paths)} songs")
+        self.app._refresh_queue_controls()
+        self.app.status(f"Created '{playlist.name}' with {len(playlist.paths)} songs (Ctrl+P to manage)")
         self.close()
         return "break"
 
@@ -823,7 +836,7 @@ class NewPlaylistDialog(tk.Toplevel):
 
 
 class PlaylistsDialog(tk.Toplevel):
-    """Manage named playlists; selection actions also live beside the songs."""
+    """Manage named playlists, selection actions also live beside the songs."""
 
     def __init__(self, app: "PlayerApp"):
         app._dismiss_playlist_menu()
@@ -952,7 +965,7 @@ class PlaylistsDialog(tk.Toplevel):
         self._row_of_name.clear()
         for playlist in app._playlists.playlists.values():
             found, missing = app._playlists.resolve(playlist.name, app.tracks)
-            count = str(len(found)) + (f" of {len(playlist.paths)}" if missing else "")
+            count = str(len(found)) + (f" of {len(app._eligible_paths(playlist.paths))}" if missing else "")
             row = self.tree.insert("", "end", text=playlist.name, values=(count,))
             self._row_of_name[playlist.name] = row
             if playlist.name == select_name:
@@ -980,8 +993,14 @@ class PlaylistsDialog(tk.Toplevel):
         self.add_selection_btn.state(["!disabled"] if selected and self.app.selected_song_paths()
                                       else ["disabled"])
         state = ["!disabled"] if selected else ["disabled"]
-        for widget in (self.load_btn, self.rename_btn, self.delete_btn, self.export_btn):
+        for widget in (self.load_btn, self.export_btn):
             widget.state(state)
+        favorite = self.app._playlists.is_favorites(name)
+        self.rename_btn.state(["!disabled"] if selected and not favorite else ["disabled"])
+        self.delete_btn.configure(text="Clear Favorites" if favorite else "Delete")
+        playlist = self.app._playlists.get(name)
+        self.delete_btn.state(["!disabled"] if selected and (not favorite or playlist.paths)
+                              else ["disabled"])
         in_playlist = self.app.order_var.get() == library.ORDER_PLAYLIST
         self.save_btn.state(["!disabled"]
                             if (selected and in_playlist
@@ -995,13 +1014,19 @@ class PlaylistsDialog(tk.Toplevel):
                                      f"name, then press 'Rename to\u2026' (Esc cancels)")
             return
         active = app._active_playlist
+        if app._playlists.is_favorites(self._selected_name()):
+            self.note.configure(text="Favorites is permanent. Add songs with the star or queue menu. "
+                                     "Clear Favorites removes entries, never music files.")
+            return
         if not active:
             self.note.configure(text="Choose a playlist above to add songs or files.")
             return
         playlist = app._playlists.get(active)
-        total = len(playlist.paths) if playlist else 0
+        total = len(app._eligible_paths(playlist.paths)) if playlist else 0
         found, missing = app._playlists.resolve(active, app.tracks)
-        bits = [f"'{active}' is the loaded queue ({len(found)} of {total} tracks)"]
+        bits = [f"'{active}' is the selected source ({len(found)} of {total} tracks)"]
+        if app.order_var.get() != library.ORDER_PLAYLIST:
+            bits.append("choose Saved order to drag/reorder, sorting and shuffle never overwrite it")
         if missing:
             bits.append(f"{len(missing)} missing on disk")
         if app._playlist_dirty:
@@ -1067,7 +1092,7 @@ class PlaylistsDialog(tk.Toplevel):
 
     def start_rename(self) -> None:
         name = self._selected_name()
-        if not name:
+        if not name or self.app._playlists.is_favorites(name):
             return
         self._renaming_from = name
         self.name_var.set(name)
@@ -1086,8 +1111,12 @@ class PlaylistsDialog(tk.Toplevel):
         name = self._selected_name()
         if not name:
             return
-        self.app.delete_playlist(name)
-        self.refresh()
+        if self.app._playlists.is_favorites(name):
+            self.app.clear_favorites(parent=self)
+            self.refresh(name)
+        else:
+            self.app.delete_playlist(name)
+            self.refresh()
 
     def export_selected(self) -> None:
         name = self._selected_name()
@@ -1109,6 +1138,68 @@ class PlaylistsDialog(tk.Toplevel):
             return
         if self.app.import_playlist(path) is not None:
             self.close()
+
+
+ABOUT_TEXT = "Made by FlamingLeo, 2026,\nusing libopenmpt and Tkinter.\n"
+GITHUB_URL = "https://github.com/FlamingLeo/modjuke"
+
+class AboutWindow(tk.Toplevel):
+    """Small, non-modal About window."""
+
+    def __init__(self, app):
+        super().__init__(app.root)
+        self.app = app
+        self.withdraw()
+        self.title(f"About {APP_NAME}")
+        self.transient(app.root)
+        self.resizable(False, False)
+        self.configure(bg=BG)
+
+        body = ttk.Frame(self, padding=20)
+        body.pack(fill="both", expand=True)
+
+        self.text_label = ttk.Label(
+            body, text=ABOUT_TEXT, wraplength=320, justify="left"
+        )
+        self.text_label.pack(anchor="w", pady=(10, 4))
+
+        self.link_label = ttk.Label(
+            body,
+            text=GITHUB_URL,
+            cursor="hand2",
+            font=("", 9, "underline"),
+        )
+        self.link_label.pack(anchor="w", pady=(0, 18))
+        self.link_label.bind("<Button-1>", self._open_github)
+
+        self.close_btn = ttk.Button(body, text="Close", command=self.close)
+        self.close_btn.pack(anchor="e")
+
+        self.bind("<Escape>", lambda _e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_idletasks()
+
+        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = app.root.winfo_rootx() + (app.root.winfo_width() - width) // 2
+        y = app.root.winfo_rooty() + (app.root.winfo_height() - height) // 2
+        x = max(0, min(x, self.winfo_screenwidth() - width))
+        y = max(0, min(y, self.winfo_screenheight() - height))
+        self.geometry(f"+{x}+{y}")
+        self.deiconify()
+        self.close_btn.focus_set()
+
+    def _open_github(self, _event=None) -> None:
+        webbrowser.open(GITHUB_URL)
+
+    def close(self) -> str:
+        self.destroy()
+        self.app.root.focus_set()
+        return "break"
+
+    def destroy(self) -> None:
+        if self.app._about_window is self:
+            self.app._about_window = None
+        super().destroy()
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1173,7 +1264,7 @@ class SettingsDialog(tk.Toplevel):
         self.restarts = tk.IntVar(value=s.max_restarts)
         row(frm, 10, "Restart budget", ttk.Spinbox(frm, from_=0, to=20, textvariable=self.restarts,
                                                    width=8),
-            "per track, before it is marked unplayable")
+            "per track, 0 disables retries")
 
         self.interp = tk.StringVar(
             value=INTERPOLATION_LABELS.get(s.interpolation,
@@ -1240,27 +1331,42 @@ class SettingsDialog(tk.Toplevel):
 
         self.auto_analyze = tk.BooleanVar(value=s.auto_analyze)
         row(frm, 24, "Analyze files automatically", ttk.Checkbutton(frm, variable=self.auto_analyze),
-            "read new or changed files in the background; reuse known details")
+            "read new or changed files in the background, reuse known details")
 
         self.keep_stats = tk.BooleanVar(value=s.track_listening_stats)
         row(frm, 25, "Keep listening stats", ttk.Checkbutton(frm, variable=self.keep_stats),
-            "off stops recording; existing history is kept")
+            "off stops recording, existing history is kept")
 
         ttk.Separator(frm, orient="horizontal").grid(row=26, column=0, columnspan=3,
                                                      sticky="ew", pady=10)
         ttk.Label(frm, text="Appearance", style="Head.TLabel").grid(row=27, column=0, sticky="w")
+        self._theme_drafts = theme.clean_custom_themes(s.custom_themes)
+        self._theme_originals = theme.clean_custom_themes(s.custom_themes)
+        self._theme_editor = None
         self.theme = tk.StringVar(value=theme.label(s.theme))
-        row(frm, 28, "Colour scheme", ttk.Combobox(
-            frm, textvariable=self.theme, state="readonly", width=16,
-            values=tuple(theme.THEME_LABELS[name] for name in theme.THEME_NAMES)),
-            "applies when you press Save")
+        self.theme_combo = ttk.Combobox(frm, textvariable=self.theme, state="readonly", width=22)
+        row(frm, 28, "Colour scheme", self.theme_combo)
+        theme_buttons = ttk.Frame(frm)
+        theme_buttons.grid(row=28, column=2, sticky="w", padx=(8, 0))
+        self.new_theme_btn = ttk.Button(theme_buttons, text="New theme…", command=self.new_theme)
+        self.new_theme_btn.pack(side="left")
+        self.edit_theme_btn = ttk.Button(theme_buttons, text="Edit…", command=self.edit_theme)
+        self.edit_theme_btn.pack(side="left", padx=6)
+        self.delete_theme_btn = ttk.Button(theme_buttons, text="Delete", command=self.delete_theme)
+        self.delete_theme_btn.pack(side="left")
+        self.theme_combo.bind("<<ComboboxSelected>>", lambda _e: self._theme_buttons())
+        self._refresh_themes(s.theme)
 
         self.smooth_scroll = tk.BooleanVar(value=s.smooth_tracker_scrolling)
         row(frm, 29, "Smooth tracker scrolling", ttk.Checkbutton(frm, variable=self.smooth_scroll),
-            "glide while Following; off moves one row at a time")
+            "glide while Following, off moves one row at a time")
+
+        self.ignored_btn = ttk.Button(frm, text="Manage ignored songs…",
+                                      command=lambda: self.app.open_ignore_dialog(parent=self))
+        row(frm, 30, "Ignored songs", self.ignored_btn, "changes apply immediately")
 
         buttons = ttk.Frame(frm)
-        buttons.grid(row=30, column=0, columnspan=3, sticky="e", pady=(14, 0))
+        buttons.grid(row=31, column=0, columnspan=3, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="Save", style="Accent.TButton",
                    command=self.save).pack(side="right")
@@ -1276,6 +1382,12 @@ class SettingsDialog(tk.Toplevel):
         self.sample_rate_combo = None
         self.interp_combo = None
         self.interp_hint = None
+        self._theme_editor = None
+        self.theme_combo = None
+        self.new_theme_btn = self.edit_theme_btn = self.delete_theme_btn = self.ignored_btn = None
+        for name, value in list(vars(self).items()):
+            if isinstance(value, tk.Variable):
+                setattr(self, name, None)
 
     def interpolation_mode(self) -> str:
         """The resampling filter the row currently shows."""
@@ -1300,16 +1412,83 @@ class SettingsDialog(tk.Toplevel):
         """The user-visible choices of the "Window title" row."""
         return tuple(TITLE_MODE_LABELS.values())
 
+    def _refresh_themes(self, selected: str) -> None:
+        self._theme_choices = {theme.THEME_LABELS[key]: key for key in theme.THEME_NAMES}
+        self._theme_choices.update((entry["name"] + " (custom)", key)
+                                   for key, entry in sorted(self._theme_drafts.items(),
+                                                            key=lambda item: item[1]["name"].casefold()))
+        self.theme_combo.configure(values=tuple(self._theme_choices))
+        self.theme.set(next((label for label, key in self._theme_choices.items() if key == selected),
+                            theme.THEME_LABELS[theme.DEFAULT_THEME]))
+        self._theme_buttons()
+
+    def _theme_buttons(self) -> None:
+        state = "!disabled" if self.theme_name() in self._theme_drafts else "disabled"
+        self.edit_theme_btn.state([state])
+        self.delete_theme_btn.state([state])
+
     def theme_name(self) -> str:
-        """The palette key the Colour scheme row currently shows."""
-        shown = self.theme.get()
-        for key in theme.THEME_NAMES:
-            if theme.THEME_LABELS[key] == shown:
-                return key
-        return self.app.settings.theme
+        return self._theme_choices.get(self.theme.get(), self.app.settings.theme)
+
+    def new_theme(self) -> None:
+        import uuid
+        if len(self._theme_drafts) >= theme.MAX_CUSTOM_THEMES:
+            messagebox.showerror("Themes", "Delete a custom theme before adding another (limit 100).", parent=self)
+            return
+        selected = self.theme_name()
+        colours = (self._theme_drafts[selected]["colours"] if selected in self._theme_drafts
+                   else theme.palette(selected))
+        self._open_theme_editor("custom:" + uuid.uuid4().hex, "My theme", colours)
+
+    def edit_theme(self) -> None:
+        key = self.theme_name()
+        if key in self._theme_drafts:
+            entry = self._theme_drafts[key]
+            self._open_theme_editor(key, entry["name"], entry["colours"])
+
+    def _open_theme_editor(self, key, name, colours) -> None:
+        from .themeeditor import ThemeEditor
+        if self._theme_editor is not None and self._theme_editor.winfo_exists():
+            self._theme_editor.lift()
+            return
+
+        def accept(name, colours):
+            proposed = dict(self._theme_drafts)
+            proposed[key] = {"name": name, "colours": colours}
+            clean = theme.clean_custom_themes(proposed)
+            if key not in clean or len(clean) != len(proposed):
+                return "Use a unique name (1-60 characters), different from the built-in themes."
+            self._theme_drafts = clean
+            self._refresh_themes(key)
+            return ""
+
+        self._theme_editor = ThemeEditor(self, name, colours, accept)
+
+    def delete_theme(self) -> None:
+        key = self.theme_name()
+        if key in self._theme_drafts and messagebox.askyesno(
+                "Delete theme?", "Remove this custom theme when you save Settings?", parent=self):
+            del self._theme_drafts[key]
+            self._refresh_themes(theme.DEFAULT_THEME)
+
+    def _merged_themes(self):
+        proposed = theme.clean_custom_themes(self.app.settings.custom_themes)
+        for key in self._theme_originals.keys() - self._theme_drafts.keys():
+            proposed.pop(key, None)
+        for key, entry in self._theme_drafts.items():
+            if entry != self._theme_originals.get(key):
+                proposed[key] = entry
+        clean = theme.clean_custom_themes(proposed)
+        return clean if len(clean) == len(proposed) else None
 
     def save(self) -> None:
         s = self.app.settings
+        custom_themes = self._merged_themes()
+        if custom_themes is None:
+            messagebox.showerror("Themes", "The theme library changed while Settings was open. "
+                                 "Use a unique name and keep at most 100 custom themes, or reopen Settings.",
+                                 parent=self)
+            return
         old_audio = (s.backend, s.samplerate, s.buffer_ms, s.latency_ms)
         kept: list[str] = []
 
@@ -1332,12 +1511,12 @@ class SettingsDialog(tk.Toplevel):
             self.sample_rate.set(SAMPLE_RATE_LABELS[normalise_sample_rate(s.samplerate)])
             self.buffer.set(s.buffer_ms)
             self.latency.set(s.latency_ms)
-            return  # keep the dialog open; no failed audio preference is saved
+            return  # keep the dialog open, no failed audio preference is saved
         s.stall_timeout = number(self.stall, "Stall warning", s.stall_timeout)
         s.silence_stall_timeout = number(self.silence, "Silent stall",
                                          s.silence_stall_timeout)
         s.hang_timeout = number(self.hang, "Audio hang", s.hang_timeout)
-        s.max_restarts = int(number(self.restarts, "Restart budget", s.max_restarts))
+        s.max_restarts = max(0, int(number(self.restarts, "Restart budget", s.max_restarts)))
         s.folder_picker = self.picker.get()
         s.window_title = TITLE_MODE_VALUES.get(self.title_mode.get(), "track")
         rate_changed = self.rate_value() != s.ui_fps
@@ -1351,21 +1530,25 @@ class SettingsDialog(tk.Toplevel):
         s.loop_queue = bool(self.loop_queue.get())
         s.remember_position = bool(self.remember.get())
         s.cache_analysis = bool(self.keep_info.get())
+        s.custom_themes = custom_themes
+        theme.set_custom_themes(s.custom_themes)
         s.theme = self.app.apply_theme_name(self.theme_name())
         s.smooth_tracker_scrolling = bool(self.smooth_scroll.get())
         self.app._tracker.set_smooth_scrolling(s.smooth_tracker_scrolling)
         self.app.apply_listening_stats(self.keep_stats.get())
         self.app.apply_auto_analysis(self.auto_analyze.get())
-        self.app._save_settings()
+        saved = self.app._save_settings()
         self.app.sync_setting_toggles()
         engine = self.app.engine
         engine.settings = s
         engine.buffer_ms = s.buffer_ms
-        if kept:
-            self.app.status(f"settings saved, kept the old value for "
+        if saved is False:
+            self.app.status("Settings applied for this session, but could not save preferences")
+        elif kept:
+            self.app.status(f"Settings saved, kept the old value for "
                             f"{', '.join(kept)} (not a number)")
         else:
-            self.app.status("settings saved")
+            self.app.status("Settings saved")
         self.destroy()
 
 
@@ -1373,7 +1556,7 @@ class PlayerApp:
     def __init__(self, root: tk.Tk, settings: Optional[Settings] = None,
                  directory: str = "", backend: Optional[str] = None,
                  speed: float = 1.0, autoplay: bool = False,
-                 config_file: Optional[str] = None):
+                 config_file: Optional[str] = None, start_track: str = ""):
         self.root = root
         self.settings = settings or Settings.load(config_file)
         self.config_file = config_file          # None -> the standard location
@@ -1402,6 +1585,7 @@ class PlayerApp:
         if self.settings.cache_analysis:
             self.analysis_cache = AnalysisCache(self._cache_file())
         self._cache_loaded = False           # the file is read by the scan thread
+        self._startup_track = os.path.abspath(os.path.expanduser(start_track)) if start_track else ""
         self._session_restored = False       # restore the last song once per run
         self._session_state: tuple = ("", 0.0)
         self._session_saved_at = 0.0
@@ -1425,11 +1609,31 @@ class PlayerApp:
         self._queue_menu: Optional[tk.Menu] = None
         self._menu_focus_check = None
         self._playlists = PlaylistStore(playlists_path(self.config_file))
+        self._ignored = IgnoreStore(ignored_path(self.config_file))
+        self._playlists.excluded = self._ignored.contains if self._ignored else None
+        self._ignore_dialog = None
+        self._ignore_button_state = None
+        self._favorites_revision = -1
+        self._favorite_paths: set[str] = set()
+        self._favorite_button_state = None
+        self._favorite_hint = "Load a song to add it to Favorites"
         self._listening = ListeningCounter(StatsStore(stats_path(self.config_file)),
                                            enabled=self.settings.track_listening_stats)
         self._stats_window: Optional[StatsWindow] = None
+        self._about_window: Optional[AboutWindow] = None
         self._stats_warning = ""
-        self._active_playlist = str(self.settings.active_playlist or "")
+        source = self.settings.queue_source
+        if source not in ("library", "playlist"):
+            source = "playlist" if self.settings.queue_mode == library.ORDER_PLAYLIST else "library"
+        playlist = self._playlists.get(str(self.settings.active_playlist or ""))
+        self._active_playlist = playlist.name if source == "playlist" and playlist else ""
+        if source == "playlist" and not playlist:
+            self.settings.shuffle_paths = []
+        self.settings.active_playlist = self._active_playlist
+        self.settings.queue_source = "playlist" if self._active_playlist else "library"
+        if (self.settings.queue_mode not in library.ORDER_MODES + (library.ORDER_PLAYLIST,)
+                or self.settings.queue_mode == library.ORDER_PLAYLIST and not self._active_playlist):
+            self.settings.queue_mode = library.ORDER_DIRECTORY
         self._playlist_paths: list[str] = []     # the loaded playlist's order (editable)
         self._playlist_dirty = False             # ...changed since it was last saved
         self._drag_row = ""                      # the queue row a drag has grabbed
@@ -1438,7 +1642,10 @@ class PlayerApp:
         self._closing = False
         self._directory = ""
 
+        self.settings.custom_themes = theme.clean_custom_themes(self.settings.custom_themes)
+        theme.set_custom_themes(self.settings.custom_themes)
         self.settings.theme = theme.activate(self.settings.theme)
+        self._icon = set_window_icon(root)
         apply_theme(root)
         enable_select_all(root)
         root.title(APP_TITLE)
@@ -1469,17 +1676,21 @@ class PlayerApp:
         self.engine: PlaybackEngine
         self._create_engine(backend=backend or self.settings.backend, speed=speed)
 
+        if self._ignored.error:
+            self.log(MSG_WARN, self._ignored.error)
         start_dir = directory or self.settings.last_directory
         if start_dir and os.path.isdir(start_dir):
             self.root.after(80, lambda: self.load_directory(start_dir, autoplay=autoplay))
-        elif self.settings.queue_mode == library.ORDER_PLAYLIST:
+        elif self._active_playlist:
             self.rebuild_queue()
-            if autoplay and self.queue:
+            if self._play_startup_track():
+                pass
+            elif autoplay and self.queue:
                 self._play_index(0)
             elif not self._restore_session():
-                self.status("Playlist ready - select a song and press Play, or add files via Playlists")
-        else:
-            self.status("choose a folder, or open Playlists to add files")
+                self.status("Playlist ready - select a song and press Play (Space/Enter), or add files via Playlists (Ctrl+P)")
+        elif not self._play_startup_track():
+            self.status("Choose a folder (Ctrl+O), or open Playlists (Ctrl+P) to add files")
 
         self.root.after(60, self._tick)
 
@@ -1489,13 +1700,14 @@ class PlayerApp:
         except AudioError as exc:
             messagebox.showerror("No audio output", str(exc))
             self.engine = PlaybackEngine(self.settings, backend="null", speed=speed)
+        self.engine.excluded = self._ignored.contains
         self.log(MSG_INFO, f"libopenmpt {get_lib().version_string}, "
                            f"output {self.engine.output.name} @ {self.engine.samplerate} Hz")
         if self.engine.output.name == "null":
-            self.log(MSG_WARN, "no sound card available: running with silent output")
+            self.log(MSG_WARN, "No sound card available: running with silent output")
 
     def restart_audio(self, previous_audio=None) -> bool:
-        """Recreate the output clock while preserving playback state; restore old preferences if
+        """Recreate the output clock while preserving playback state, restore old preferences if
         the change fails."""
         old = self.engine
         snap = old.snapshot()
@@ -1522,12 +1734,13 @@ class PlayerApp:
             except AudioError as restore_error:
                 candidate = PlaybackEngine(s, backend="null", **kwargs)
                 error += f"\nThe previous device also failed: {restore_error}. Running silently."
+        candidate.excluded = self._ignored.contains
         self.engine = candidate
         self._last_snapshot = None
         self._song_key = None
         self._song_token += 1
         self._finished_countdown = None
-        if snap.path and (snap.loaded or snap.loading):
+        if snap.path and (snap.loaded or snap.loading) and not self._ignored.contains(snap.path):
             position = max(0.0, snap.position)
             if snap.loop and snap.duration_valid and snap.duration > 0:
                 position %= snap.duration  # a seek addresses one pass, not the loop counter
@@ -1535,11 +1748,11 @@ class PlayerApp:
                                 paused=not snap.playing, loop=s.loop_track, subsong=snap.subsong)
         if error:
             self.log(MSG_ERROR, "Audio settings not applied: " + error)
-            self.status("Audio settings were not applied; previous preferences kept")
+            self.status("Audio settings were not applied, previous preferences kept (Settings → Audio backend)")
             messagebox.showerror("Audio settings not applied", error +
                                  "\n\nPrevious audio preferences have been restored.", parent=self.root)
             return False
-        self.log(MSG_INFO, f"audio output: {candidate.output.name} @ {candidate.samplerate} Hz")
+        self.log(MSG_INFO, f"Audio output: {candidate.output.name} @ {candidate.samplerate} Hz")
         return True
 
     def _build_toolbar(self) -> None:
@@ -1566,24 +1779,31 @@ class PlayerApp:
         self.dir_entry.bind("<Button-2>", self._path_menu)
         self.dir_entry.bind("<Control-c>", self.copy_path)
         self.dir_entry.bind("<Enter>", lambda _e: self.status(
-            f"library: {self.path_var.get()} (Ctrl+A: select, Ctrl+C: copy, right-click: more)"), add="+")
+            f"Library: {self.path_var.get()} (Ctrl+A: select, Ctrl+C: copy, right-click: more)"), add="+")
         show_path_tail(self.dir_entry)      # keep the folder name in view
         self.add_hint(self.dir_entry,
-                      "current library (Ctrl+A: select, Ctrl+C: copy, "
+                      "Current library (Ctrl+A: select, Ctrl+C: copy, "
                       "right-click: Copy path / Change folder...)")
 
         bar2 = ttk.Frame(self._page_player, padding=(10, 0, 10, 6))
         bar2.pack(side="top", fill="x")
         self._queue_bar = bar2
-        ttk.Label(bar2, text="Queue:").pack(side="left")
+        ttk.Label(bar2, text="Source:").pack(side="left")
+        self.source_var = tk.StringVar()
+        self.source_combo = ttk.Combobox(bar2, textvariable=self.source_var, state="readonly",
+                                         width=21, postcommand=self._refresh_queue_controls)
+        self.source_combo.pack(side="left", padx=(6, 0))
+        self.source_combo.bind("<<ComboboxSelected>>", self.on_source_changed)
+        ttk.Label(bar2, text="Order:").pack(side="left", padx=(10, 4))
         self.order_var = tk.StringVar(value=self.settings.queue_mode)
-        self.order_radios: dict[str, ttk.Radiobutton] = {}
-        for mode in library.ORDER_MODES + (library.ORDER_PLAYLIST,):
-            self.order_radios[mode] = ttk.Radiobutton(
-                bar2, text=mode.capitalize(), value=mode, variable=self.order_var,
-                command=self.on_order_changed)
-            self.order_radios[mode].pack(side="left", padx=(8, 0))
-        self.add_hint(self.order_radios[library.ORDER_PLAYLIST], "Queue the loaded playlist")
+        self.order_label_var = tk.StringVar()
+        self.order_combo = ttk.Combobox(bar2, textvariable=self.order_label_var,
+                                        state="readonly", width=13)
+        self.order_combo.pack(side="left")
+        self.order_combo.bind("<<ComboboxSelected>>", self._order_selected)
+        self._refresh_queue_controls()
+        self.add_hint(self.source_combo, "Choose the library or a playlist, ordering is independent")
+        self.add_hint(self.order_combo, "Sort or shuffle this source without changing its saved order")
         self.shuffle_now_btn = ttk.Button(bar2, text="Shuffle now", command=self.reshuffle)
         self.shuffle_now_btn.pack(side="left", padx=(10, 0))
         self.playlists_btn = ttk.Button(bar2, text="Playlists",
@@ -1628,6 +1848,10 @@ class PlayerApp:
                       "Player: choose the song and view song information")
         self.add_hint(self.tab_buttons["tracker"],
                       "Tracker: the pattern view")
+        self.about_button = ttk.Button(bar, text="ⓘ", width=3, style="Mini.TButton",
+                                       command=self.open_about)
+        self.about_button.pack(side="left", padx=(8, 0))
+        self.add_hint(self.about_button, "About modjuke (F1)")
         self.settings_button = ttk.Button(bar, text="Settings",
                                           command=lambda: SettingsDialog(self))
         self.settings_button.pack(side="right")
@@ -1700,7 +1924,6 @@ class PlayerApp:
         self.tree.pack(side="left", fill="both", expand=True)
         self.configure_tree_tags()
         self.tree.bind("<Double-1>", self._on_tree_double_click)
-        self.tree.bind("<Return>", lambda _e: self.play_selected())
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._selection_actions())
         self.tree.bind("<Button-3>", self._queue_context_menu)
         self.tree.bind("<Shift-F10>", self._queue_context_menu)
@@ -1719,7 +1942,7 @@ class PlayerApp:
         self._build_info_panel(right)
 
     def reset_layout(self) -> None:
-        """Reset column widths, pane split, and scrolling; keep window size and queue order."""
+        """Reset column widths, pane split, and scrolling, keep window size and queue order."""
         if self._closing:
             return
         try:
@@ -1731,7 +1954,7 @@ class PlayerApp:
             self.tree.yview_moveto(0.0)        # and the queue starts at the top again
         except tk.TclError:                    # closing
             return
-        self.status("layout reset - column widths, the pane split and scrolling are "
+        self.status("Layout reset - column widths, the pane split and scrolling are "
                     "back to how the window opened (Ctrl+0)")
 
     def _restore_pane_split(self) -> None:
@@ -1776,7 +1999,7 @@ class PlayerApp:
                                         channels=self._tracker.channels or None,
                                         token=self._song_token)
         except Exception as exc:              # engine gone: nothing to draw
-            self.log(MSG_DEBUG, f"pattern request ignored: {exc!r}")
+            self.log(MSG_DEBUG, f"Pattern request ignored: {exc!r}")
 
     def _sync_tracker_song(self) -> None:
         """Ask for the order list when the module (or the subsong) changed."""
@@ -1808,7 +2031,7 @@ class PlayerApp:
         return snap
 
     def _update_tracker(self, snap) -> None:
-        """Follow the output clock; render-ahead snapshots drive transport only."""
+        """Follow the output clock, render-ahead snapshots drive transport only."""
         if not self._tracker_seen:
             return                          # nobody opened it: no work, no requests
         if not (snap and snap.path):
@@ -1826,17 +2049,24 @@ class PlayerApp:
         self.title_label = ttk.Label(parent, text="Nothing playing", style="Title.TLabel",
                                      wraplength=320)
         self.title_label.pack(anchor="w")
-        self.subtitle_label = ttk.Label(parent, text="double-click a module to play it",
+        self.subtitle_label = ttk.Label(parent, text="Double-click a module to play it",
                                         style="Dim.TLabel", wraplength=320)
         self.subtitle_label.pack(anchor="w", pady=(2, 8))
 
         actions = ttk.Frame(parent, style="Panel.TFrame")
         actions.pack(fill="x", pady=(0, 10))
-        self.reveal_btn = ttk.Button(actions, text="Show in folder", state="disabled",
-                                     command=self.reveal_current)
-        self.reveal_btn.pack(side="left")
+        self.favorite_button = ttk.Button(actions, text="☆", width=3,
+                                          command=self.toggle_current_favorite, state="disabled")
+        self.favorite_button.pack(side="left")
+        self.favorite_button.bind("<Enter>", lambda _e: self.status(self._favorite_hint))
+        self.ignore_button = ttk.Button(actions, text="Ignore", command=self.ignore_current,
+                                        state="disabled")
+        self.ignore_button.pack(side="left", padx=(6, 0))
         self.song_info_btn = ttk.Button(actions, text="Song info", command=self.open_song_info)
         self.song_info_btn.pack(side="left", padx=(6, 0))
+        self.reveal_btn = ttk.Button(actions, text="Show in folder", state="disabled",
+                                     command=self.reveal_current)
+        self.reveal_btn.pack(side="left", padx=(6, 0))
 
         grid = ttk.Frame(parent, style="Panel.TFrame")
         grid.pack(fill="x")
@@ -1965,7 +2195,7 @@ class PlayerApp:
         self._fit_info_panel(int(event.height))
 
     def _fit_info_panel(self, height: int) -> None:
-        """Hide the log, then meters, if needed; always retain controls and song details."""
+        """Hide the log, then meters, if needed, always retain controls and song details."""
         if not self._panel_stack or not height:
             return
         self._sync_panel_need()
@@ -2019,6 +2249,7 @@ class PlayerApp:
         self.volume_scale = ttk.Scale(vol, from_=0, to=100, orient="horizontal", length=120,
                                       variable=self.volume_var, command=self.on_volume)
         self.volume_scale.pack(side="left", padx=6)
+        self.volume_scale.bind("<Button-1>", self.on_volume_press)
         self.volume_label = ttk.Label(vol, text=f"{int(round(start_volume))}%",
                                       style="BarDim.TLabel", width=5)
         self.volume_label.pack(side="left")
@@ -2041,7 +2272,7 @@ class PlayerApp:
         self.seek_bar = SeekBar(pos, on_press=self._seek_press, on_drag=self._seek_drag,
                                 on_release=self._seek_release, width=120)
         self.seek_bar.pack(side="left", fill="x", expand=True, padx=6)
-        self.seek_bar.bind("<Button-3>", lambda _e: self.engine.seek_fraction(0.0))
+        self.seek_bar.bind("<Button-3>", lambda _e: self.seek_bar.focus_set() or self.engine.seek_fraction(0.0))
 
         # one-row / two-row decision, fed by <Configure> (see _fit_transport)
         self._transport_outer = outer
@@ -2179,7 +2410,7 @@ class PlayerApp:
                       "Reset layout (Ctrl+0): column widths, the vertical bar, and queue scroll")
         self.health_label = ttk.Label(bar, text="", style="Dim.TLabel", background=BG, anchor="e")
         self.health_label.pack(side="right")
-        self.status_label = ttk.Label(bar, text="ready", style="Dim.TLabel", background=BG,
+        self.status_label = ttk.Label(bar, text="Ready", style="Dim.TLabel", background=BG,
                                       anchor="w")
         self.status_label.pack(side="left", fill="x", expand=True)
 
@@ -2191,56 +2422,135 @@ class PlayerApp:
         r.bind_all("<Map>", self._popup_window_mapped, add="+")
         r.bind("<Unmap>", lambda e: self._dismiss_playlist_menu()
                if e.widget is r else None, add="+")
-        r.bind("<space>", self._key_toggle)
-        r.bind("<Left>", lambda _e: self.seek_relative(-5))
-        r.bind("<Right>", lambda _e: self.seek_relative(5))
-        r.bind("<Control-Left>", lambda _e: self.seek_relative(-30))
-        r.bind("<Control-Right>", lambda _e: self.seek_relative(30))
-        r.bind("<Control-Up>", lambda _e: self.queue_row_move(-1))
-        r.bind("<Control-Down>", lambda _e: self.queue_row_move(1))
-        r.bind("<Up>", lambda _e: self.select_relative(-1))
-        r.bind("<Down>", lambda _e: self.select_relative(1))
-        r.bind("<Prior>", lambda _e: self.prev_track())          # PageUp
-        r.bind("<Next>", lambda _e: self.next_track())           # PageDown
-        r.bind("<l>", lambda _e: self._toggle_loop_key())
-        r.bind("<r>", lambda _e: self._toggle_queue_loop_key())
-        r.bind("<m>", self._toggle_mute_key)
-        r.bind("<plus>", lambda _e: self.bump_volume(5))
-        r.bind("<equal>", lambda _e: self.bump_volume(5))
-        r.bind("<minus>", lambda _e: self.bump_volume(-5))
-        r.bind("<Control-o>", lambda _e: self.choose_directory())
-        r.bind("<Control-t>", lambda _e: self.toggle_tracker_tab())
-        r.bind("<Control-i>", lambda _e: self.open_song_info())
-        r.bind("<Control-h>", lambda _e: self.open_stats())
-        r.bind("<Control-p>", lambda _e: self.open_playlists_dialog())
-        r.bind("<Control-f>", lambda _e: self.search_entry.focus_set())
-        r.bind("<Control-Shift-F>", lambda _e: self.open_filter_dialog())
-        r.bind("<Control-s>", lambda _e: self.reshuffle())
-        r.bind("<Control-r>", lambda _e: self.reveal_current())
-        r.bind("<Control-Key-0>", lambda _e: self.reset_layout())
-        r.bind("<Control-KP_0>", lambda _e: self.reset_layout())
-        r.bind("<F5>", lambda _e: self.load_directory(self._directory) if self._directory else None)
-        r.bind("<Escape>", lambda _e: self.search_var.set(""))
+
+        def bind(sequence, action, kind="command", shifted=False):
+            modifiers = (4 if "Control-" in sequence else 0) | (1 if "Shift-" in sequence else 0)
+            r.bind(sequence, lambda event: self._dispatch_shortcut(
+                event, action, kind, modifiers, shifted))
+
+        bind("<space>", self._key_toggle, "plain")
+        bind("<Return>", None, "activate")
+        bind("<KP_Enter>", None, "activate")
+        bind("<Left>", lambda: self.seek_relative(-5), "navigation")
+        bind("<Right>", lambda: self.seek_relative(5), "navigation")
+        bind("<Control-Left>", lambda: self.seek_relative(-30), "navigation")
+        bind("<Control-Right>", lambda: self.seek_relative(30), "navigation")
+        bind("<Control-Up>", lambda: self.queue_row_move(-1), "navigation")
+        bind("<Control-Down>", lambda: self.queue_row_move(1), "navigation")
+        bind("<Up>", lambda: self.select_relative(-1), "navigation")
+        bind("<Down>", lambda: self.select_relative(1), "navigation")
+        bind("<Prior>", self.prev_track, "navigation")
+        bind("<Next>", self.next_track, "navigation")
+        for key, action in (("l", self._toggle_loop_key), ("r", self._toggle_queue_loop_key),
+                            ("m", self._toggle_mute_key)):
+            for letter in (key, key.upper()):
+                bind(f"<{letter}>", action, "plain", shifted=True)
+        bind("<plus>", lambda: self.bump_volume(5), "plain", shifted=True)
+        bind("<equal>", lambda: self.bump_volume(5), "plain")
+        bind("<minus>", lambda: self.bump_volume(-5), "plain")
+        for key, action in (("o", self.choose_directory), ("t", self.toggle_tracker_tab),
+                            ("i", self.open_song_info), ("h", self.open_stats),
+                            ("p", self.open_playlists_dialog), ("f", self.search_entry.focus_set),
+                            ("s", self.reshuffle), ("r", self.reveal_current)):
+            for letter in (key, key.upper()):
+                bind(f"<Control-{letter}>", action)
+        bind("<Control-Shift-F>", self.open_filter_dialog)
+        bind("<Control-Shift-f>", self.open_filter_dialog)
+        bind("<Control-Key-0>", self.reset_layout)
+        bind("<Control-KP_0>", self.reset_layout)
+        bind("<F1>", self.open_about)
+        bind("<F5>", lambda: self.load_directory(self._directory) if self._directory else None)
+        bind("<Escape>", lambda: self.search_var.set(""))
+
+        # Keep widget-specific bindings first, run player shortcuts before Tk class defaults.
+        widgets = [r]
+        while widgets:
+            widget = widgets.pop()
+            if widget.winfo_toplevel() == r:
+                self._prepare_key_target(widget)
+                widgets.extend(widget.winfo_children())
+        r.bind("<Map>", lambda event: self._prepare_key_target(event.widget), add="+")
 
         for widget, hint in (
-            (self.btn_prev, "◀◀ previous track  (Page Up) or restart past 3s"),
-            (self.btn_play, "▶ / ▮▮ play-pause  (Space)"),
-            (self.btn_next, "▶▶ next track  (Page Down)"),
-            (self.btn_stop, "■ stop and rewind"),
+            (self.btn_prev, "◀◀ Previous track  (Page Up) or restart past 3s"),
+            (self.btn_play, "▶ / ▮▮ Play-pause  (Space)"),
+            (self.btn_next, "▶▶ Next track  (Page Down)"),
+            (self.btn_stop, "■ Stop and rewind"),
             (self.loop_btn, "Loop the current module (L)"),
             (self.queue_loop_btn, "Repeat queue, draw new order in shuffle (R)"),
             (self.mute_btn, "Mute / unmute  (M)"),
             (self.volume_scale, "Volume  (+ / - / scroll)"),
             (self.seek_bar, "Jump inside module (← / → 5s, Ctrl+← / Ctrl+→ 30s, right-click: go back to start)"),
             (self.reveal_btn, "Open the folder of the module that is playing (Ctrl+R)"),
+            (self.ignore_button, "Hide this song everywhere, restore it in Settings → Ignored songs"),
             (self.song_info_btn, "Module samples, instruments and comment  (Ctrl+I)"),
             (self.tree, "Double-click / Enter: play,  ↑ / ↓: move"),
         ):
             self.add_hint(widget, hint)
 
+    def _prepare_key_target(self, widget) -> None:
+        """Only reorder main-window bindtags, dialogs and popup widgets keep native handling."""
+        if not isinstance(widget, tk.Misc) or widget == self.root:
+            return
+        if not widget.winfo_exists() or widget.winfo_toplevel() != self.root:
+            return
+        tags = list(widget.bindtags())
+        top, cls = str(self.root), widget.winfo_class()
+        if top in tags and cls in tags and tags.index(top) > tags.index(cls):
+            tags.remove(top)
+            tags.insert(tags.index(cls), top)
+            widget.bindtags(tuple(tags))
+
+    def _dispatch_shortcut(self, event, action, kind: str, modifiers: int = 0,
+                           shifted: bool = False):
+        # Ignore lock-key state, but do not steal modified navigation or AltGr input.
+        mask = 0x4 | 0x8 | 0x40 | 0x80 | 0x20000 | (0 if shifted else 0x1)
+        if int(event.state) & mask != modifiers:
+            return None
+        try:
+            widget = self.root.focus_get() or event.widget
+            if not isinstance(widget, tk.Misc) or widget.winfo_toplevel() != self.root:
+                return None
+            grab = str(self.root.tk.call("grab", "current", self.root._w))
+            if grab and grab != self.root._w:
+                return None
+        except (tk.TclError, KeyError):  # native dropdowns may not have Python widget objects
+            return None
+        if kind in ("plain", "navigation") and self._typing():
+            return None
+        if kind == "navigation":
+            if isinstance(widget, (ttk.Entry, tk.Entry, ttk.Spinbox, tk.Spinbox,
+                                   tk.Text, ttk.Scale, tk.Scale, ttk.Scrollbar, tk.Scrollbar,
+                                   ttk.Radiobutton, tk.Radiobutton)):
+                return None
+            if (widget == self.tree and not modifiers and event.keysym in ("Left", "Right", "Up", "Down")
+                    and self.tree.focus() and "dir" in self.tree.item(self.tree.focus(), "tags")):
+                return None
+        if kind == "activate":
+            if isinstance(widget, (ttk.Button, ttk.Checkbutton, ttk.Radiobutton,
+                                   tk.Button, tk.Checkbutton, tk.Radiobutton)):
+                widget.invoke()
+                return "break"
+            if widget == self.tree:
+                selection = self.tree.selection()
+                row = self.tree.focus() if self.tree.focus() in selection else (selection[0] if selection else "")
+                if row in self._row_of_path.values():
+                    self.play_selected()
+                    return "break"
+            return None
+        action()
+        return "break"
+
     def _typing(self) -> bool:
-        widget = self.root.focus_get()
-        return isinstance(widget, (ttk.Entry, tk.Entry, ttk.Spinbox, tk.Spinbox))
+        try:
+            widget = self.root.focus_get()
+            if isinstance(widget, (ttk.Entry, ttk.Spinbox)):
+                return not (widget.instate(["disabled"]) or widget.instate(["readonly"]))
+            if isinstance(widget, (tk.Entry, tk.Spinbox, tk.Text)):
+                return str(widget.cget("state")) not in ("disabled", "readonly")
+        except (tk.TclError, KeyError):
+            pass
+        return False
 
     def _key_toggle(self, _event=None):
         if self._typing():
@@ -2302,8 +2612,7 @@ class PlayerApp:
             self.settings.last_picker_dir = os.path.dirname(path) or path
             self.load_directory(path)
         else:
-            self.status(f"folder selection cancelled "
-                        f"({self.picker_description()})")
+            self.status(f"Folder selection cancelled ({self.picker_description()}) - press Ctrl+O to choose again")
 
     def picker_description(self) -> str:
         if self.settings.folder_picker == "system":
@@ -2317,7 +2626,7 @@ class PlayerApp:
         if value:
             self.root.clipboard_clear()
             self.root.clipboard_append(value)
-            self.status(f"copied {value}")
+            self.status(f"Copied {value} (Ctrl+C)")
         return "break"
 
     def _path_menu(self, event=None):
@@ -2347,16 +2656,15 @@ class PlayerApp:
         if self._analysis_running:
             self._analyzer.cancel.set()
         root_changed = bool(self._directory) and os.path.abspath(path) != self._directory
-        if root_changed:
-            self._shuffle_paths = []
-            self.settings.shuffle_paths = []
+        if root_changed and not self._active_playlist:
+            self._reset_shuffle_plan()
         self._directory = path
         self.settings.last_directory = path
         self._save_settings()
         self.path_var.set(path)
         self.show_path_end()
-        self.status(f"scanning {path} …")
-        self.count_label.configure(text="scanning…")
+        self.status(f"Scanning {path} … (F5 to rescan)")
+        self.count_label.configure(text="Scanning…")
         cancel = self._scan_cancel
         if self.analysis_cache is not None and not self._cache_loaded:
             entries = self.analysis_cache.load()
@@ -2372,7 +2680,7 @@ class PlayerApp:
                 )
                 self.queue_ui.put(("scanned", (result, autoplay, cancel)))
             except Exception as exc:  # pragma: no cover
-                self.queue_ui.put(("error", (f"scan failed: {exc}",)))
+                self.queue_ui.put(("error", (f"Scan failed: {exc}",)))
 
         self._scan_thread = threading.Thread(target=work, name="scan", daemon=True)
         self._scan_thread.start()
@@ -2390,10 +2698,12 @@ class PlayerApp:
         self._refresh_min_size()
         for err in result.errors[:5]:
             self.log(MSG_WARN, err)
-        self.status(f"found {len(self.tracks)} module files in {result.dirs} folders")
-        self.log(MSG_INFO, f"library: {result.root} ({len(self.tracks)} modules)")
+        self.status(f"Found {len(self.tracks)} module files in {result.dirs} folders - press Space to play, Ctrl+F to search")
+        self.log(MSG_INFO, f"Library: {result.root} ({len(self.tracks)} modules)")
         self._apply_analysis_cache()
         self.rebuild_queue()
+        if self._play_startup_track():
+            return
         if autoplay and self.queue:
             self._play_index(0)
         else:
@@ -2413,13 +2723,13 @@ class PlayerApp:
         hits = sum(1 for track in self.tracks if self.analysis_cache.apply(track))
         if hits:
             left = len(self.tracks) - hits
-            self.log(MSG_INFO, f"restored the details of {hits} modules from the cache"
+            self.log(MSG_INFO, f"Restored the details of {hits} modules from the cache"
                                + (f" ({left} not read yet)" if left else ""))
             self.add_hint(self.analyze_button,
                           "Analyze: read metadata for queued songs")
-            self.status(f"found {len(self.tracks)} module files in "
+            self.status(f"Found {len(self.tracks)} module files in "
                         f"{len({t.rel_dir for t in self.tracks})} folders,"
-                        f"{hits} already analyzed")
+                        f"{hits} already analyzed - press Space to play, Ctrl+F to search")
 
     def _restore_session(self) -> bool:
         """Restore the last module and position paused, without starting audio automatically."""
@@ -2434,7 +2744,7 @@ class PlayerApp:
             return False
         position = max(0.0, float(self.settings.last_position or 0.0))
         self._play_index(index, paused=True, position=position)
-        self.log(MSG_INFO, f"session: {os.path.basename(path)} at {position:.1f}s (paused)")
+        self.log(MSG_INFO, f"Session: {os.path.basename(path)} at {position:.1f}s (paused)")
         return True
 
     def _save_session(self, force: bool = False) -> None:
@@ -2467,8 +2777,10 @@ class PlayerApp:
 
     def _queue_source_tracks(self) -> list[Track]:
         """Unfiltered songs in the current collection, including external files."""
-        if self.order_var.get() == library.ORDER_PLAYLIST:
+        if self._active_playlist:
             return self._playlists.resolve(self._active_playlist, self.tracks)[0]
+        if self._ignored:
+            return [t for t in self.tracks if not self._ignored.contains(t.path)]
         return self.tracks
 
     def _filtered_tracks(self) -> list[Track]:
@@ -2484,15 +2796,24 @@ class PlayerApp:
         if not announce:
             return
         if not criteria.active:
-            self.status(f"filter cleared - all {len(self._queue_source_tracks())} modules are back")
+            self.status(f"Filter cleared - all {len(self._queue_source_tracks())} modules are back (Ctrl+Shift+F to filter)")
             return
         unknown = unknown_duration_count(self._queue_source_tracks())
         note = f", {unknown} without a length yet" if unknown and (
             criteria.min_seconds or criteria.max_seconds) else ""
-        self.status(f"filter: {len(self.queue)} of {len(self._queue_source_tracks())} modules shown "
-                    f"({criteria.describe()}){note}")
+        self.status(f"Filter: {len(self.queue)} of {len(self._queue_source_tracks())} modules shown ({criteria.describe()}){note} (Ctrl+Shift+F)")
         if not self.queue:
-            self.log(MSG_WARN, f"the filter ({criteria.describe()}) hides every module")
+            self.log(MSG_WARN, f"The filter ({criteria.describe()}) hides every module")
+
+    def open_about(self) -> None:
+        self._dismiss_playlist_menu()
+        window = self._about_window
+        if window is not None and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            window.close_btn.focus_set()
+            return
+        self._about_window = AboutWindow(self)
 
     def open_stats(self) -> None:
         self._dismiss_playlist_menu()
@@ -2563,7 +2884,7 @@ class PlayerApp:
     def open_filter_dialog(self) -> None:
         """Show the filter dialog (it applies on OK)."""
         if not self._queue_source_tracks():
-            self.status("nothing to filter - open a folder or add songs to a playlist")
+            self.status("Nothing to filter - open a folder (Ctrl+O) or add songs to a playlist (Ctrl+P)")
             return
         FilterDialog(self)
 
@@ -2591,9 +2912,18 @@ class PlayerApp:
         self.settings.shuffle_seed = int(seed)
         if first is None:
             first = "" if avoid_first else self._anchor_path()
-        plan = library.shuffle_order(self._filtered_tracks(), seed=int(seed),
+        plan = library.shuffle_order(self._queue_source_tracks(), seed=int(seed),
                                     first=first or None, avoid_first=avoid_first or None)
+        if avoid_first:
+            visible = {t.path for t in self._filtered_tracks()}
+            slots = [i for i, t in enumerate(plan) if t.path in visible]
+            if len(slots) > 1 and plan[slots[0]].path == avoid_first:
+                other = random.Random(seed).choice(slots[1:])
+                plan[slots[0]], plan[other] = plan[other], plan[slots[0]]
         self._shuffle_paths = [t.path for t in plan]
+        self._remember_shuffle_plan()
+
+    def _remember_shuffle_plan(self) -> None:
         if len(self._shuffle_paths) <= MAX_SHUFFLE_PATHS:
             self.settings.shuffle_paths = list(self._shuffle_paths)
         else:                                   # keep the config small
@@ -2603,6 +2933,7 @@ class PlayerApp:
         anchor = self._anchor_path()
         if anchor:
             self._shuffle_paths = library.rotate_to_front(self._shuffle_paths, anchor)
+            self._remember_shuffle_plan()
 
     def _ensure_shuffle_plan(self) -> None:
         if self._shuffle_paths:
@@ -2614,8 +2945,50 @@ class PlayerApp:
             return
         self._draw_shuffle_plan()
 
+    def _reset_shuffle_plan(self) -> None:
+        self._shuffle_paths = []
+        self.settings.shuffle_paths = []
+
+    def _refresh_queue_controls(self) -> None:
+        self._source_names = [""] + self._playlists.names()
+        self.source_combo.configure(values=["Library"] + [f"Playlist: {n}" for n in self._source_names[1:]])
+        self.source_var.set(f"Playlist: {self._active_playlist}" if self._active_playlist else "Library")
+        self._order_choices = {"By directory": library.ORDER_DIRECTORY,
+                               "Alphabetical": library.ORDER_ALPHABETICAL,
+                               "Shuffle": library.ORDER_SHUFFLE}
+        if self._active_playlist:
+            self._order_choices = {"Saved order": library.ORDER_PLAYLIST, **self._order_choices}
+        self.order_combo.configure(values=list(self._order_choices))
+        self.order_label_var.set(next((label for label, mode in self._order_choices.items()
+                                       if mode == self.order_var.get()), "By directory"))
+
+    def on_source_changed(self, _event=None) -> None:
+        index = self.source_combo.current()
+        if index < 0:
+            return
+        name = self._source_names[index]
+        if name == self._active_playlist:
+            return
+        if name:
+            self.load_playlist(name)
+        else:
+            self._active_playlist = ""
+            self._playlist_paths = []
+            self._playlist_dirty = False
+            self._reset_shuffle_plan()
+            if self.order_var.get() == library.ORDER_PLAYLIST:
+                self.order_var.set(library.ORDER_DIRECTORY)
+            self.rebuild_queue(keep_playing=True)
+            self.status("Library selected")
+
+    def _order_selected(self, _event=None) -> None:
+        mode = self._order_choices.get(self.order_label_var.get())
+        if mode is not None:
+            self.order_var.set(mode)
+            self.on_order_changed()
+
     def on_order_changed(self) -> None:
-        """Queue-order radio buttons: switch the mode, never re-shuffle."""
+        """Change ordering within the selected source, without redrawing a saved shuffle."""
         if self.order_var.get() == library.ORDER_SHUFFLE:
             if self._shuffle_paths:
                 self._rotate_shuffle_to_anchor()
@@ -2623,12 +2996,12 @@ class PlayerApp:
                 self._draw_shuffle_plan()
         self.rebuild_queue()
         if self.order_var.get() == library.ORDER_SHUFFLE:
-            self.status("shuffle queue ready - 'Shuffle now' draws a new order")
+            self.status("Shuffle queue ready - 'Shuffle now' draws a new order (Ctrl+S)")
         elif self.order_var.get() == library.ORDER_PLAYLIST:
             if self._active_playlist:
-                self.status(f"queue follows playlist '{self._active_playlist}'")
+                self.status(f"Queue follows playlist '{self._active_playlist}'")
             else:
-                self.status("no playlist loaded yet - open the Playlists dialog (Ctrl+P)")
+                self.status("No playlist loaded yet - open the Playlists dialog (Ctrl+P)")
 
     def reshuffle(self) -> None:
         """The "Shuffle now" button: draw a brand new order, current track first."""
@@ -2636,7 +3009,7 @@ class PlayerApp:
         self._draw_shuffle_plan(new_seed=random.SystemRandom().randrange(1, 2 ** 31))
         self.rebuild_queue()
         anchor = self.queue[0].name if self.queue else None
-        self.status("new shuffle order drawn" + (f" - starting from {anchor}" if anchor else ""))
+        self.status("New shuffle order drawn (Ctrl+S)" + (f" - starting from {anchor}" if anchor else ""))
 
     def rebuild_queue(self, keep_playing: bool = True) -> None:
         """Rebuild the filtered queue without redrawing an existing shuffle order."""
@@ -2648,18 +3021,23 @@ class PlayerApp:
             current_path = self._playing_path
         needle = self.search_var.get()
         mode = self.order_var.get()
-        if mode == library.ORDER_PLAYLIST and not self._ensure_playlist():
+        if self._active_playlist and not self._ensure_playlist():
+            self._active_playlist = ""
+            self._playlist_paths = []
+            self._playlist_dirty = False
+            self._reset_shuffle_plan()
+            self.status("The selected playlist is gone - Library selected (Ctrl+P)")
+        if mode not in library.ORDER_MODES + (library.ORDER_PLAYLIST,) or (
+                mode == library.ORDER_PLAYLIST and not self._active_playlist):
             mode = library.ORDER_DIRECTORY
             self.order_var.set(mode)
-            if self._active_playlist:
-                self._active_playlist = ""
-                self.settings.active_playlist = ""
-            self.status("the loaded playlist is gone - the queue follows "
-                        "'by directory' again")
         self.settings.queue_mode = mode
+        self.settings.queue_source = "playlist" if self._active_playlist else "library"
+        self.settings.active_playlist = self._active_playlist
+        self._refresh_queue_controls()
         filtered = self._filtered_tracks()      # after any fallback to the library
         if mode == library.ORDER_PLAYLIST:
-            self.queue = self._playlist_queue()
+            self.queue = self._playlist_queue(filtered)
         elif mode == library.ORDER_SHUFFLE:
             self._ensure_shuffle_plan()
             self.queue = library.apply_path_order(filtered, self._shuffle_paths)
@@ -2720,7 +3098,7 @@ class PlayerApp:
             self._mark_playing(self.queue[self.queue_index].path)
 
     def _insert_track(self, parent: str, index: int, track: Track) -> None:
-        stripe = ("alt",) if index % 2 else ()
+        stripe = (("alt",) if index % 2 else ()) + (("broken",) if track.broken else ())
         row = self.tree.insert(
             parent, "end", text=track.name,
             values=(track.rel_dir or ".", track.duration_text(), track.fmt.upper(),
@@ -2729,7 +3107,6 @@ class PlayerApp:
         )
         self._row_of_path[track.path] = row
         self._base_tags[row] = stripe
-        self.set_row_broken(track.path, bool(track.broken))
 
     def set_row_broken(self, path: str, broken: bool) -> None:
         row = self._row_of_path.get(path)
@@ -2789,6 +3166,8 @@ class PlayerApp:
         tracks = dict(self._playlists._external_tracks)
         tracks.update((t.path, t) for t in self.tracks)
         tracks.update((t.path, t) for t in self._queue_source_tracks())
+        if self._ignored:
+            return [t for t in tracks.values() if not self._ignored.contains(t.path)]
         return list(tracks.values())
 
     def apply_auto_analysis(self, enabled: bool) -> None:
@@ -2826,21 +3205,21 @@ class PlayerApp:
     def analyze_library(self) -> None:
         tracks = self._queue_source_tracks()
         if not tracks:
-            self.status("nothing to analyze - open a folder first")
+            self.status("Nothing to analyze - open a folder first (Ctrl+O)")
             return
         if self._analysis_running:
-            self.status("analysis already running")
+            self.status("Analysis already running")
             return
         todo = [t for t in tracks if not t.analyzed]
         if not todo:
-            self.status("everything is already analyzed")
+            self.status("Everything is already analyzed")
             return
         self._start_analysis(todo, automatic=False)
 
     def _start_analysis(self, todo: list[Track], *, automatic: bool) -> None:
         if not todo or self._analysis_running:
             return
-        self.status(f"analyzing {len(todo)} modules in the background …")
+        self.status(f"Analyzing {len(todo)} modules in the background …")
         # A rescan may replace Track objects while this batch is still reading them.
         stamps = {t.path: (t.size, t.mtime) for t in todo}
 
@@ -2881,7 +3260,7 @@ class PlayerApp:
         return 0
 
     def rendered_column_edges(self) -> Optional[list[tuple[int, str]]]:
-        """Read actual column boundaries from a visible cell; return None before layout is
+        """Read actual column boundaries from a visible cell, return None before layout is
         available."""
         tree = self.tree
         columns = self._tree_columns()
@@ -3014,12 +3393,11 @@ class PlayerApp:
         tree.column(column, width=width)
         self.sync_column_layout()
         note = " (the Module column also fills the window)" if tree.column(column, "stretch") else ""
-        self.status(f"fitted '{self._column_label(column)}' to its widest visible entry "
-                    f"({width} px){note}")
+        self.status(f"Fitted '{self._column_label(column)}' to its widest visible entry ({width} px){note} - double-click divider to fit")
         return width
 
     def _on_tree_double_click(self, event) -> Optional[str]:
-        """Divider -> fit the column next to it; anywhere else -> play."""
+        """Divider -> fit the column next to it, anywhere else -> play."""
         try:
             region = self.tree.identify_region(event.x, event.y)
         except tk.TclError:
@@ -3081,14 +3459,16 @@ class PlayerApp:
                     self._apply_tags(row)
 
     def selected_song_paths(self) -> list[str]:
-        """Songs only, in queue order; selecting a folder never adds its children."""
+        """Songs only, in queue order, selecting a folder never adds its children."""
         selected = set(self.tree.selection())
+        if not selected:
+            return []
         return [t.path for t in self.queue if self._row_of_path.get(t.path) in selected]
 
     def _selection_actions(self) -> None:
         has_selection = bool(self.selected_song_paths())
         self.add_to_playlist_btn.state(["!disabled"] if has_selection else ["disabled"])
-        can_remove = has_selection and self.order_var.get() == library.ORDER_PLAYLIST
+        can_remove = has_selection and bool(self._active_playlist)
         self.remove_from_playlist_btn.state(["!disabled"] if can_remove else ["disabled"])
 
     def _select_all_songs(self, _event=None) -> str:
@@ -3104,7 +3484,8 @@ class PlayerApp:
             return None
         self._playlists.resolve(playlist.name, self.tracks)
         self._schedule_auto_analysis()
-        self.status(f"Created '{playlist.name}' with {len(playlist.paths)} songs")
+        self._refresh_queue_controls()
+        self.status(f"Created '{playlist.name}' with {len(playlist.paths)} songs (Ctrl+P to manage)")
         return playlist.name
 
     def prompt_new_playlist(self, paths=()) -> Optional[str]:
@@ -3118,6 +3499,157 @@ class PlayerApp:
         self._new_playlist_dialog = dialog
         self.root.wait_window(dialog)
         return dialog.result
+
+    def _eligible_paths(self, paths):
+        return [p for p in paths if not self._ignored.contains(p)] if self._ignored else paths
+
+    def _sync_ignore_button(self, snap=None) -> None:
+        snap = snap if snap is not None else self.engine.snapshot()
+        enabled = bool(snap.path and (snap.loaded or snap.loading)
+                       and not self._ignored.contains(snap.path))
+        if enabled != self._ignore_button_state:
+            self._ignore_button_state = enabled
+            self.ignore_button.state(["!disabled"] if enabled else ["disabled"])
+
+    def open_ignore_dialog(self, parent=None) -> None:
+        self._dismiss_playlist_menu()
+        dialog = self._ignore_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.deiconify()
+            dialog.lift()
+            dialog.tree.focus_set()
+            return
+        self._ignore_dialog = IgnoreDialog(self, parent or self.root)
+
+    def ignore_current(self) -> None:
+        snap = self.engine.snapshot()
+        if snap.path and (snap.loaded or snap.loading):
+            self.change_ignored(add=[snap.path])
+
+    def change_ignored(self, *, add=(), remove=(), parent=None) -> bool:
+        old_queue = list(self.queue)
+        snap = self.engine.snapshot()
+        try:
+            if not self._ignored.change(add=add, remove=remove):
+                return False
+        except IgnoreError as exc:
+            messagebox.showerror("Ignored songs", str(exc), parent=parent or self.root)
+            return False
+        self._playlists.excluded = self._ignored.contains if self._ignored else None
+        active = self._playing_path if self._ignored.contains(self._playing_path) else snap.path
+        skip = bool(active and self._ignored.contains(active))
+        next_path = ""
+        if skip:
+            self._record_listening(snap)
+            index = next((i for i, t in enumerate(old_queue) if t.path == active), -1)
+            candidates = old_queue[index + 1:]
+            if self.settings.loop_queue:
+                candidates += old_queue[:index + 1]
+            next_path = next((t.path for t in candidates if not self._ignored.contains(t.path)), "")
+            # Gate output now, an in-flight native read must not play the ignored song.
+            self.engine.pause()
+            self.engine.unload()
+            self._finished_countdown = None
+            self._now_playing = False
+            self._playing_path = ""
+            self.queue_index = -1
+            self._set_window_title(APP_TITLE)
+            self._set_reveal_enabled(False)
+        self.rebuild_queue()
+        if skip:
+            index = next((i for i, t in enumerate(self.queue) if t.path == next_path), None)
+            if index is not None:
+                self._play_index(index, paused=snap.paused or (not snap.playing and not snap.loading))
+            else:
+                self.title_label.configure(text="No song loaded")
+                self.subtitle_label.configure(text="Select a song to play")
+                self.status("Song ignored - no next eligible song in this queue (Settings → Ignored songs to restore)")
+        else:
+            self.status("Ignore list updated - music files and saved memberships kept (Settings → Ignored songs)")
+        self._sync_ignore_button()
+        self._sync_favorite_button()
+        if self._playlist_dialog is not None and self._playlist_dialog.winfo_exists():
+            self._playlist_dialog.refresh()
+        if self._ignore_dialog is not None and self._ignore_dialog.winfo_exists():
+            self._ignore_dialog.refresh()
+        return True
+
+    def _sync_favorite_button(self, snap=None) -> None:
+        if self._favorites_revision != self._playlists.revision:
+            favorites = self._playlists.get(FAVORITES_NAME)
+            self._favorite_paths = set(favorites.paths) if favorites else set()
+            self._favorites_revision = self._playlists.revision
+        snap = snap if snap is not None else self.engine.snapshot()
+        enabled = bool(snap.loaded and snap.path and not snap.failed
+                       and not self._ignored.contains(snap.path))
+        saved = enabled and snap.path in self._favorite_paths
+        state = (enabled, saved)
+        if state == self._favorite_button_state:
+            return
+        self._favorite_button_state = state
+        self.favorite_button.configure(text="★" if saved else "☆")
+        self.favorite_button.state(["!disabled"] if enabled else ["disabled"])
+        self._favorite_hint = ("Remove current song from Favorites" if saved else
+                               "Add current song to Favorites") if enabled else \
+            "Load a song to add it to Favorites"
+
+    def _favorites_changed(self) -> None:
+        self._sync_favorite_button()
+        dialog = self._playlist_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.refresh()
+
+    def add_to_favorites(self, paths) -> bool:
+        if self.add_songs_to_playlist(FAVORITES_NAME, paths):
+            self._favorites_changed()
+            return True
+        return False
+
+    def toggle_current_favorite(self) -> None:
+        snap = self.engine.snapshot()
+        if self._ignored.contains(snap.path):
+            return
+        if not (snap.loaded and snap.path and not snap.failed):
+            return
+        self._sync_favorite_button(snap)
+        if snap.path in self._favorite_paths:
+            self._remove_favorites({snap.path})
+        else:
+            self.add_to_favorites([snap.path])
+
+    def _remove_favorites(self, paths) -> bool:
+        favorites = self._playlists.get(FAVORITES_NAME)
+        active = self._playlists.is_favorites(self._active_playlist)
+        before = self._playlist_paths if active and self._playlist_dirty else favorites.paths
+        after = [p for p in before if p not in paths]
+        try:
+            self._playlists.replace(FAVORITES_NAME, after)
+        except PlaylistError as exc:
+            messagebox.showerror("Favorites", str(exc), parent=self.root)
+            return False
+        if active:
+            self._playlist_paths = after
+            self._playlist_dirty = False
+            self.rebuild_queue(keep_playing=True)
+        self._favorites_changed()
+        self.status(f"Removed {len(before) - len(after)} songs from Favorites - files kept (☆ to add again)")
+        return True
+
+    def clear_favorites(self, parent=None) -> bool:
+        favorites = self._playlists.get(FAVORITES_NAME)
+        paths = set(favorites.paths)
+        if self._playlists.is_favorites(self._active_playlist):
+            paths.update(self._playlist_paths)
+        if not paths:
+            return False
+        if not messagebox.askyesno("Clear Favorites?",
+                                  "Remove all songs from Favorites? Your music files will be kept.",
+                                  parent=parent or self.root):
+            return False
+        if self._remove_favorites(paths):
+            self.status("Favorites cleared - music files kept (☆ to add again, Ctrl+P)")
+            return True
+        return False
 
     def add_songs_to_playlist(self, name: str, paths) -> bool:
         paths = list(paths)
@@ -3135,13 +3667,11 @@ class PlayerApp:
         if active:
             self._playlist_paths = after
             self._playlist_dirty = False
-            if self.order_var.get() == library.ORDER_PLAYLIST:
-                self.rebuild_queue(keep_playing=True)
+            self.rebuild_queue(keep_playing=True)
         self._playlists.resolve(playlist.name, self.tracks)
         self._schedule_auto_analysis()
         count = len(after) - len(before)
-        self.status(f"Added {count} song{'s' if count != 1 else ''} to '{playlist.name}'"
-                    + (" (already present songs were skipped)" if count < len(paths) else ""))
+        self.status(f"Added {count} song{'s' if count != 1 else ''} to '{playlist.name}'" + (" (already present songs were skipped)" if count < len(paths) else "") + " (Ctrl+P to view)")
         return True
 
     def add_files_to_playlist(self, name: str, parent=None) -> bool:
@@ -3164,7 +3694,7 @@ class PlayerApp:
         return self.add_songs_to_playlist(name, valid)
 
     def remove_selected_from_playlist(self) -> None:
-        if self.order_var.get() != library.ORDER_PLAYLIST:
+        if not self._active_playlist:
             return
         paths = set(self.selected_song_paths())
         playlist = self._playlists.get(self._active_playlist)
@@ -3181,7 +3711,7 @@ class PlayerApp:
         self._playlist_dirty = False
         # Rebuilding the queue never tells the engine to stop the current song.
         self.rebuild_queue(keep_playing=True)
-        self.status(f"Removed {len(before) - len(after)} songs from '{playlist.name}' - files kept")
+        self.status(f"Removed {len(before) - len(after)} songs from '{playlist.name}' - files kept (Delete to remove)")
 
     def _playlist_menu(self, parent=None) -> tk.Menu:
         menu = tk.Menu(parent or self.root, tearoff=0, bg=BG_PANEL, fg=FG,
@@ -3259,7 +3789,7 @@ class PlayerApp:
     def show_add_to_playlist_menu(self) -> None:
         paths = self.selected_song_paths()
         if not paths:
-            self.status("Select songs first (Ctrl / Shift-click to select several)")
+            self.status("Select songs first (Ctrl/Shift-click, Ctrl+A to select all)")
             return
         button = self.add_to_playlist_btn
         self._popup_playlist_menu(self._add_playlist_menu(paths),
@@ -3277,9 +3807,11 @@ class PlayerApp:
         menu = self._playlist_menu()
         menu.add_command(label="Play", command=self.play_selected,
                          state="normal" if paths else "disabled")
+        menu.add_command(label="Add to Favorites", command=lambda: self.add_to_favorites(paths),
+                         state="normal" if paths else "disabled")
         menu.add_cascade(label="Add to playlist", menu=self._add_playlist_menu(paths, menu),
                          state="normal" if paths else "disabled")
-        if self.order_var.get() == library.ORDER_PLAYLIST:
+        if self._active_playlist:
             menu.add_separator()
             menu.add_command(label="Remove from playlist (keep files)",
                              command=self.remove_selected_from_playlist,
@@ -3299,10 +3831,11 @@ class PlayerApp:
             return
         self._playlist_dialog = PlaylistsDialog(self)
 
-    def _playlist_queue(self) -> list[Track]:
-        """The loaded playlist's tracks in its order (search + filter inside)."""
-        tracks, _missing = self._playlists.resolve(self._active_playlist, self.tracks)
-        filtered = self._queue_filter().select(library.search_filter(tracks, self.search_var.get()))
+    def _playlist_queue(self, filtered: Optional[list[Track]] = None) -> list[Track]:
+        """Apply saved order, reusing this rebuild's search and filter results."""
+        if filtered is None:
+            tracks, _missing = self._playlists.resolve(self._active_playlist, self.tracks)
+            filtered = self._queue_filter().select(library.search_filter(tracks, self.search_var.get()))
         by_path = {t.path: t for t in filtered}
         return [by_path[p] for p in self._playlist_paths if p in by_path]
 
@@ -3318,7 +3851,7 @@ class PlayerApp:
     def playlist_label(self) -> str:
         """The queue bar's read-out while a playlist is loaded ('' when none)."""
         name = self._active_playlist
-        if not name or self.order_var.get() != library.ORDER_PLAYLIST:
+        if not name:
             return ""
         playlist = self._playlists.get(name)
         if playlist is None:
@@ -3333,53 +3866,55 @@ class PlayerApp:
             text += " \u2022"
         return text
 
-    def _load_playlist_into(self, name: str) -> None:
-        """Switch the queue to playlist mode on name (no status text)."""
+    def _load_playlist_into(self, name: str, saved_order: bool = False) -> None:
+        """Select a playlist source, preserve the current ordering unless explicitly saved/imported."""
         playlist = self._playlists.get(name)
         if playlist is None:
             return
+        if self._active_playlist != playlist.name:
+            self._reset_shuffle_plan()
         self._active_playlist = playlist.name
         self.settings.active_playlist = playlist.name
         self._playlist_paths = list(playlist.paths)
         self._playlist_dirty = False
-        self.order_var.set(library.ORDER_PLAYLIST)
+        if saved_order:
+            self.order_var.set(library.ORDER_PLAYLIST)
         self.rebuild_queue(keep_playing=True)
 
     def new_playlist(self, name: str) -> Optional[str]:
         """Save the current queue as a new playlist and load it (None = refused)."""
         name = str(name or "").strip()
         if not self.queue:
-            self.status("nothing to save - the queue is empty")
+            self.status("Nothing to save - the queue is empty (add songs via Ctrl+P or drag)")
             return None
         try:
             self._playlists.add(name, [t.path for t in self.queue], self._directory)
         except PlaylistError as exc:
             messagebox.showerror("Playlists", str(exc))
             return None
-        self._load_playlist_into(name)
+        self._load_playlist_into(name, saved_order=True)
         self._save_settings()
-        self.status(f"saved {len(self.queue)} tracks as playlist '{self._active_playlist}'")
+        self.status(f"Saved {len(self.queue)} tracks as playlist '{self._active_playlist}' (Ctrl+P to manage)")
         return self._active_playlist
 
     def load_playlist(self, name: str) -> bool:
         if self._playlists.get(name) is None:
-            self.status(f"no playlist called '{name}'")
+            self.status(f"No playlist called '{name}' (Ctrl+P to view playlists)")
             return False
         self._load_playlist_into(name)
         self._save_settings()
         found, missing = self._playlists.resolve(name, self.tracks)
         note = f" - {len(missing)} of its tracks are missing on disk" if missing else ""
-        self.status(f"playlist '{name}' loaded: {len(self.queue)} tracks{note}")
+        self.status(f"Playlist '{name}' loaded: {len(self.queue)} tracks{note} - press Space to play")
         return True
 
     def save_playlist(self, name: str) -> bool:
         """Keep the current queue order in the loaded playlist."""
         if self.order_var.get() != library.ORDER_PLAYLIST:
-            self.status("queue order can only be kept while a playlist is loaded")
+            self.status("Choose Saved order to edit or save the playlist order (Order: Saved order)")
             return False
         if name != self._active_playlist:
-            self.status(f"only the loaded playlist ({self._active_playlist or 'none'}) "
-                        f"can keep a queue order")
+            self.status(f"Only the loaded playlist ({self._active_playlist or 'none'}) can keep a queue order (Ctrl+P)")
             return False
         paths = list(self._playlist_paths)
         try:
@@ -3390,7 +3925,7 @@ class PlayerApp:
         self._playlist_paths = list(paths)
         self._playlist_dirty = False
         self.rebuild_queue(keep_playing=True)   # the read-out loses its dirty mark
-        self.status(f"queue order saved to '{name}'")
+        self.status(f"Queue order saved to '{name}' (Ctrl+P, drag to reorder)")
         return True
 
     def rename_playlist(self, old: str, new: str) -> Optional[str]:
@@ -3402,8 +3937,8 @@ class PlayerApp:
         if self._active_playlist.casefold() == str(old or "").strip().casefold():
             self._active_playlist = playlist.name
             self.settings.active_playlist = playlist.name
-        self._save_settings()
-        self.status(f"playlist '{old}' is now '{playlist.name}'")
+        self.rebuild_queue(keep_playing=True)
+        self.status(f"Playlist '{old}' is now '{playlist.name}' (Ctrl+P)")
         return playlist.name
 
     def delete_playlist(self, name: str) -> None:
@@ -3417,15 +3952,18 @@ class PlayerApp:
             self.settings.active_playlist = ""
             self._playlist_paths = []
             self._playlist_dirty = False
-            self.order_var.set(library.ORDER_DIRECTORY)
+            self._reset_shuffle_plan()
+            if self.order_var.get() == library.ORDER_PLAYLIST:
+                self.order_var.set(library.ORDER_DIRECTORY)
         self._save_settings()
-        self.status(f"playlist '{name}' deleted")
+        self.status(f"Playlist '{name}' deleted (Ctrl+P)")
         self.rebuild_queue(keep_playing=True)
 
     def export_playlist(self, name: str, parent=None) -> bool:
         playlist = self._playlists.get(name)
-        if playlist is None or not playlist.paths:
-            self.status("that playlist has no tracks to export")
+        paths = self._eligible_paths(playlist.paths) if playlist else []
+        if not paths:
+            self.status("That playlist has no tracks to export (add songs first)")
             return False
         try:
             path = pick_files(
@@ -3438,11 +3976,11 @@ class PlayerApp:
             return False
         if not path:
             return False
-        count = write_m3u(playlist.paths, path)
+        count = write_m3u(paths, path)
         if not count:
-            self.status(f"Could not export playlist to {path}")
+            self.status(f"Could not export playlist to {path} (check folder permissions)")
             return False
-        self.status(f"exported {count} tracks to {path}")
+        self.status(f"Exported {count} tracks to {path} (Ctrl+P)")
         return True
 
     def import_playlist(self, m3u_path: str) -> Optional[str]:
@@ -3450,7 +3988,7 @@ class PlayerApp:
         paths, skipped = read_m3u(m3u_path)
         if not paths:
             note = f" ({skipped} entries point at missing files)" if skipped else ""
-            self.status(f"nothing importable in {os.path.basename(m3u_path)}{note}")
+            self.status(f"Nothing importable in {os.path.basename(m3u_path)}{note} (check M3U)")
             return None
         base = os.path.splitext(os.path.basename(m3u_path))[0] or "Imported"
         name, taken = base, 2
@@ -3462,10 +4000,10 @@ class PlayerApp:
         except PlaylistError as exc:
             messagebox.showerror("Playlists", str(exc))
             return None
-        self._load_playlist_into(name)
+        self._load_playlist_into(name, saved_order=True)
         self._save_settings()
         note = f" - {skipped} entries skipped (missing files)" if skipped else ""
-        self.status(f"imported '{name}': {len(paths)} tracks{note}")
+        self.status(f"Imported '{name}': {len(paths)} tracks{note} (Ctrl+P)")
         return name
 
     def queue_row_move(self, delta: int) -> None:
@@ -3605,6 +4143,7 @@ class PlayerApp:
             pos = 0
         new = visible[max(0, min(len(visible) - 1, pos + delta))]
         self.tree.selection_set(new)
+        self.tree.focus(new)
         self.tree.see(new)
 
     def _visible_rows(self) -> list[str]:
@@ -3622,11 +4161,32 @@ class PlayerApp:
     def _play_index(self, index: int, subsong: Optional[int] = None, paused: bool = False,
                     position: float = 0.0) -> None:
         """Load the queue entry at index (optionally paused, at position)."""
-        if not (0 <= index < len(self.queue)):
+        if not (0 <= index < len(self.queue)) or self._ignored.contains(self.queue[index].path):
             return
-        self._record_listening(self.engine.snapshot())
         self.queue_index = index
-        track = self.queue[index]
+        self._play_track(self.queue[index], subsong=subsong, paused=paused, position=position)
+
+    def _play_startup_track(self) -> bool:
+        path = self._startup_track
+        if not path:
+            return False
+        self._startup_track = ""
+        self._session_restored = True
+        index = next((i for i, track in enumerate(self.queue) if track.path == path), None)
+        if index is not None:
+            self._play_index(index)
+        else:
+            self.queue_index = -1
+            self._play_track(Track(path=path, name=os.path.basename(path), rel_dir=os.path.dirname(path)))
+        return True
+
+    def _play_track(self, track: Track, subsong: Optional[int] = None, paused: bool = False,
+                    position: float = 0.0) -> None:
+        if self._ignored.contains(track.path):
+            self.status("This song is ignored - restore it in Settings → Ignored songs (Manage ignored songs…)")
+            return
+        self._finished_countdown = None
+        self._record_listening(self.engine.snapshot())
         self._mark_playing(track.path)
         label = track.name
         self.title_label.configure(text=label)
@@ -3637,8 +4197,7 @@ class PlayerApp:
         self.subsong_var.set(str(self.settings.subsong))
         self.engine.play_path(track.path, position=max(0.0, position), paused=paused,
                               loop=self.settings.loop_track, subsong=self.settings.subsong)
-        self.status(f"{track.name}: paused at {format_time(position)}" if paused
-                    else f"playing {track.name}")
+        self.status(f"{track.name}: paused at {format_time(position)} (Space to resume, ←/→ to seek)" if paused else f"Playing {track.name} (Space to pause, ←/→ to seek)")
 
     def next_track(self, auto: bool = False) -> None:
         if not self.queue:
@@ -3651,15 +4210,15 @@ class PlayerApp:
                 self.engine.pause()
                 self._now_playing = False
                 self._set_window_title(APP_TITLE)
-                self.status("queue finished - enable 'Repeat queue' to start over "
-                            "(shuffle mode then draws a new order)")
+                self.status("Queue finished - enable 'Repeat queue' (R) to start over "
+                            "(shuffle then draws new order, Ctrl+S)")
             else:
-                self.status("end of the queue - enable 'Repeat queue' to start over")
+                self.status("End of the queue - enable 'Repeat queue' (R) to start over")
             return
         self.restart_queue()
 
     def restart_queue(self) -> None:
-        """Repeat the queue; for shuffle, draw a new order with a different opening track."""
+        """Repeat the queue, for shuffle, draw a new order with a different opening track."""
         finished = ""
         if 0 <= self.queue_index < len(self.queue):
             finished = self.queue[self.queue_index].path
@@ -3668,21 +4227,19 @@ class PlayerApp:
                                     avoid_first=finished)
             self.rebuild_queue()
             opening = self.queue[0].name if self.queue else "?"
-            self.status(f"queue finished - new shuffle order, starting with {opening}")
+            self.status(f"Queue finished - new shuffle order (Ctrl+S, R), starting with {opening}")
         else:
-            self.status("queue finished - starting over")
+            self.status("Queue finished - starting over (R to repeat)")
         self._play_index(0)
 
     def on_queue_loop_toggle(self) -> None:
         self.settings.loop_queue = bool(self.queue_loop_var.get())
         self._save_settings()
         if self.settings.loop_queue:
-            self.status("repeat queue on - the queue starts over when it ends"
-                        + (" (shuffle: new order each round)" if
-                           self.order_var.get() == library.ORDER_SHUFFLE else ""))
+            self.status("Repeat queue on (R) - the queue starts over when it ends" + (" (shuffle: new order each round, Ctrl+S)" if self.order_var.get() == library.ORDER_SHUFFLE else ""))
         else:
-            self.status("repeat queue off")
-        self.log(MSG_INFO, f"repeat queue {'on' if self.settings.loop_queue else 'off'}")
+            self.status("Repeat queue off (R)")
+        self.log(MSG_INFO, f"Repeat queue {'on' if self.settings.loop_queue else 'off'}")
 
     def sync_setting_toggles(self) -> None:
         """Reflect settings changed elsewhere (settings dialog) in the transport bar."""
@@ -3698,7 +4255,8 @@ class PlayerApp:
         if not self.queue:
             return
         snapshot = self.engine.snapshot()
-        if snapshot.position > 3.0 and not snapshot.finished:
+        if (snapshot.position > 3.0 and not snapshot.finished
+                and not self._ignored.contains(snapshot.path)):
             self.engine.seek(0.0)          # like every other player: restart first
             return
         if self.queue_index > 0:
@@ -3708,20 +4266,27 @@ class PlayerApp:
 
     def toggle_play(self) -> None:
         snapshot = self.engine.snapshot()
+        if self._ignored.contains(snapshot.path):
+            if self.queue:
+                self._play_index(max(0, self.queue_index))
+            return
         if not snapshot.loaded:
             if self.queue and self.queue_index < 0:
                 self._play_index(0)
             elif self.queue_index >= 0:
                 self._play_index(self.queue_index)
             return
+        if snapshot.paused or snapshot.finished:
+            self._now_playing = True
         self.engine.toggle_pause()
 
     def stop(self) -> None:
+        self._finished_countdown = None
         self.engine.pause()
         self.engine.seek(0.0)
         self._now_playing = False
         self._set_window_title(APP_TITLE)
-        self.status("stopped")
+        self.status("Stopped (Space to play)")
 
     def seek_relative(self, seconds: float) -> None:
         if not self._typing():
@@ -3731,7 +4296,15 @@ class PlayerApp:
         self.settings.loop_track = bool(self.loop_var.get())
         self.engine.set_loop(self.settings.loop_track)
         self._save_settings()
-        self.status(f"loop {'on' if self.settings.loop_track else 'off'}")
+        self.status(f"Loop {'on' if self.settings.loop_track else 'off'} (L)")
+
+    def on_volume_press(self, event):
+        """Use the scale's native jump-and-drag action instead of stepping."""
+        scale = self.volume_scale
+        if not scale.instate(["disabled"]):
+            scale.focus_set()
+            scale.tk.call("ttk::scale::Jump", scale, event.x, event.y)
+        return "break"
 
     def on_volume(self, _value=None) -> None:
         """Clamp the slider, readout, and engine volume to 0..100."""
@@ -3786,7 +4359,7 @@ class PlayerApp:
         self.mute_btn.configure(text="Unmute" if muted else "Mute")
         self.settings.muted = muted
         self._save_settings()
-        self.status("muted" if muted else "unmuted")
+        self.status("Muted (M, +/- to adjust)" if muted else "Unmuted (M, +/- to adjust)")
 
     def _on_subsong(self) -> None:
         try:
@@ -3806,6 +4379,7 @@ class PlayerApp:
 
     def _seek_press(self, event=None) -> None:
         """Click on the bar: jump to that position right away."""
+        self.seek_bar.focus_set()
         self._seeking = True
         self._press_fraction = None
         if event is not None:
@@ -3857,7 +4431,7 @@ class PlayerApp:
         if target is None:
             # unknown length: the bar acts as a relative window (see seek_fraction)
             self.engine.seek_fraction(fraction)
-            self.status("seek")
+            self.status("Seek (←/→ 5s, Ctrl+←/→ 30s)")
             return
         current = snap.position % snap.duration if (snap.loop and snap.duration) else snap.position
         span = max(self.seek_bar.winfo_width() - 2 * SeekBar.MARGIN, 1)
@@ -3865,8 +4439,7 @@ class PlayerApp:
         if snap.loaded and abs(target - current) < tolerance:
             return
         self.engine.seek(target)
-        self.status(f"seek to {format_time(target)}" +
-                    (f" of {format_time(snap.duration)}" if snap.duration_valid else ""))
+        self.status(f"Seek to {format_time(target)}" + (f" of {format_time(snap.duration)}" if snap.duration_valid else "") + " (←/→ 5s, Ctrl+←/→ 30s)")
         fresh = self.engine.snapshot()
         self._last_snapshot = fresh
         self._update_from_snapshot(fresh)
@@ -3885,7 +4458,7 @@ class PlayerApp:
                 return
             if kind == "progress":
                 count, where = payload
-                self.status(f"scanning… {count} modules found ({os.path.basename(where)})")
+                self.status(f"Scanning… {count} modules found ({os.path.basename(where)}) (F5 to rescan)")
             elif kind == "scanned":
                 self._on_scanned(*payload)
                 analysis_targets = None
@@ -3902,9 +4475,9 @@ class PlayerApp:
                 analysis_targets = None
                 self._analysis_running = False
                 done, failed = payload
-                self.status(f"analysis finished: {done} modules"
+                self.status(f"Analysis finished: {done} modules"
                             + (f", {failed} unreadable" if failed else ""))
-                self.log(MSG_INFO, f"analyzed {done} modules ({failed} failed)")
+                self.log(MSG_INFO, f"Analyzed {done} modules ({failed} failed)")
                 if self.analysis_cache is not None:
                     self.analysis_cache.save()      # keep the work, even if we crash
                 self._refresh_analysis_view()
@@ -3912,7 +4485,7 @@ class PlayerApp:
             elif kind == "cache_loaded":
                 entries, = payload
                 if entries:
-                    self.log(MSG_DEBUG, f"analysis cache: {entries} modules remembered")
+                    self.log(MSG_DEBUG, f"Analysis cache: {entries} modules remembered")
             elif kind == "error":
                 self.log(MSG_ERROR, payload)
                 self.status(payload)
@@ -3937,6 +4510,13 @@ class PlayerApp:
                                               payload.get("cells") or [],
                                               payload.get("error", ""))
                 continue
+            if not self._now_playing:  # Stop also cancels queued automatic transitions.
+                continue
+            if payload.get("play_id", self.engine.play_id) != self.engine.play_id:
+                continue
+            current = self.engine.snapshot()
+            if payload.get("generation", current.generation) != current.generation:
+                continue
             if kind == "finished":
                 self._on_track_finished(payload)
             elif kind == "load_failed":
@@ -3945,27 +4525,26 @@ class PlayerApp:
                 if track is not None:
                     track.broken = payload.get("error") or "unreadable"
                     self.set_row_broken(path, True)
-                self.status(f"cannot play {os.path.basename(path)}: "
-                            f"{payload.get('error', '')[:60]}")
+                self.status(f"Cannot play {os.path.basename(path)}: {payload.get('error', '')[:60]} (PageDown to skip)")
                 if self.settings.auto_skip_broken:
                     self._finished_countdown = time.monotonic() + 1.2
             elif kind == "stalled":
                 reason = payload.get("reason", "")
                 silent_freeze = "silent" in reason
                 if silent_freeze and self.settings.auto_skip_broken:
-                    self.status(f"module is silent and stuck ({reason}) - skipping")
+                    self.status(f"Module is silent and stuck ({reason}) - skipping (PageDown)")
                     self.log(MSG_WARN, f"{os.path.basename(payload.get('path', ''))}: {reason}")
                     self._finished_countdown = time.monotonic() + 1.0
                 else:
-                    self.status(f"warning: {reason} - press Page Down to skip "
+                    self.status(f"Warning: {reason} - press Page Down to skip "
                                 f"(or wait, it may still play on)")
                     self.log(MSG_WARN, f"{os.path.basename(payload.get('path', ''))}: {reason}")
             elif kind == "overrun":
-                self.status("module runs past its official length - skipping")
+                self.status("Module runs past its official length - skipping (PageDown)")
                 if self.settings.auto_skip_broken:
                     self._finished_countdown = time.monotonic() + 1.0
             elif kind == "restarted":
-                self.status(f"recovered playback ({payload.get('reason', '')}), "
+                self.status(f"Recovered playback ({payload.get('reason', '')}), "
                             f"attempt {payload.get('restarts', 1)}")
             elif kind == "track_broken":
                 path = payload.get("path", "")
@@ -3973,13 +4552,13 @@ class PlayerApp:
                 if track is not None:
                     track.broken = f"unplayable ({payload.get('reason', '')})"
                     self.set_row_broken(path, True)
-                self.status(f"{os.path.basename(path)} is unplayable - skipping")
+                self.status(f"{os.path.basename(path)} is unplayable - skipping (PageDown)")
                 if self.settings.auto_skip_broken:
                     self._finished_countdown = time.monotonic() + 1.0
 
     def _on_track_finished(self, payload: dict) -> None:
         """A module reached its natural end (engine event 'finished')."""
-        self.log(MSG_INFO, f"finished {os.path.basename(payload.get('path', ''))} "
+        self.log(MSG_INFO, f"Finished {os.path.basename(payload.get('path', ''))} "
                            f"({format_time(payload.get('duration'))})")
         if payload.get("loop"):
             return                      # looping track: only the user stops it
@@ -4002,6 +4581,8 @@ class PlayerApp:
         self.seek_bar.set_total(duration, snap.duration_valid)
         self.seek_bar.set_enabled(snap.loaded)
         self._sync_play_controls(snap)
+        self._sync_favorite_button(snap)
+        self._sync_ignore_button(snap)
         if not self._seeking:
             fraction = (position / duration) if duration else 0.0
             self._updating = True
@@ -4013,12 +4594,12 @@ class PlayerApp:
 
         loop_note = ""
         if snap.playing:
-            loop_note = (f"loop #{snap.loop_index + 1}"
-                         if snap.loop and snap.loop_index else ("looping" if snap.loop else ""))
+            loop_note = (f"Loop #{snap.loop_index + 1}"
+                         if snap.loop and snap.loop_index else ("Looping" if snap.loop else ""))
         elif snap.paused and snap.loaded:
-            loop_note = "paused"
+            loop_note = "Paused"
         elif snap.finished:
-            loop_note = "finished"
+            loop_note = "Finished"
         self._label_text("loop", self.loop_label, loop_note)
 
         if snap.path and self._now_playing:
@@ -4111,7 +4692,7 @@ class PlayerApp:
                 pass
 
     def _tick_ms(self) -> int:
-        """Return the UI refresh interval; this does not change audio rendering speed."""
+        """Return the UI refresh interval, this does not change audio rendering speed."""
         try:
             fps = int(self.settings.ui_fps) or 60
         except (TypeError, ValueError):
@@ -4141,12 +4722,16 @@ class PlayerApp:
             self._last_snapshot = snap
             self._update_from_snapshot(snap)
             self._update_tracker(snap)
+            try:
+                self._tracker.tick()
+            except Exception:
+                pass
             self._save_session()               # throttled: keeps the position fresh
             if self._finished_countdown is not None and time.monotonic() > self._finished_countdown:
                 self._finished_countdown = None
                 self.next_track(auto=True)
         except Exception as exc:  # never let the UI loop die
-            self.log(MSG_ERROR, f"ui tick: {exc!r}")
+            self.log(MSG_ERROR, f"UI tick: {exc!r}")
         finally:
             if not self._closing:
                 self._tick_id = self.root.after(self._tick_ms(), self._tick)
@@ -4197,25 +4782,34 @@ class PlayerApp:
         if stats is not None and stats.winfo_exists():
             stats.apply_theme()
 
+        ignored = self._ignore_dialog
+        if ignored is not None and ignored.winfo_exists():
+            ignored.apply_theme()
+
+        about = self._about_window
+        if about is not None and about.winfo_exists():
+            about.apply_theme()
+
     def apply_theme_name(self, name: str) -> str:
         """Repaint with the selected palette and return its resolved name."""
         before = theme.current()
+        colours = tuple(getattr(theme, key) for key in theme.COLOUR_NAMES)
         chosen = theme.activate(name)
         self.settings.theme = chosen
-        if chosen != before:
+        if chosen != before or colours != tuple(getattr(theme, key) for key in theme.COLOUR_NAMES):
             self.refresh_theme()
-            self.log(MSG_INFO, f"colour scheme: {theme.label(chosen)}")
+            self.log(MSG_INFO, f"Colour scheme: {theme.label(chosen)}")
         return chosen
 
-    def _save_settings(self) -> None:
-        self.settings.save(self.config_file)
+    def _save_settings(self) -> bool:
+        return self.settings.save(self.config_file)
 
     def status(self, text: str) -> None:
         self._status_text = text
         self.status_label.configure(text=text)
 
     def _label_text(self, key: str, widget, text: str) -> bool:
-        """Change a widget label only if needed; return whether it changed."""
+        """Change a widget label only if needed, return whether it changed."""
         if self._last_text.get(key) == text:
             return False
         self._last_text[key] = text
@@ -4249,7 +4843,7 @@ class PlayerApp:
         self.settings.interpolation = mode
         self.engine.set_interpolation(mode)
         label = interpolation_label(mode) or mode
-        self.status(f"resampling: {label}")
+        self.status(f"Resampling: {label} (Settings → Resampler quality)")
         row = self.info_labels.get("resample")
         if row is not None:
             row.configure(text=label)
@@ -4258,18 +4852,18 @@ class PlayerApp:
         """Ask a file manager to select the module, using a worker so the UI stays responsive."""
         path = self._playing_path or (self.engine.snapshot().path or "")
         if not path:
-            self.status("nothing is playing yet - pick a module first")
+            self.status("Nothing is playing yet - pick a module first (double-click or Space, Ctrl+O to open folder)")
             return
         if self._reveal_pending:                 # still waiting for the last one
             return
         self._reveal_pending = True
-        self.status(f"opening the folder of {os.path.basename(path)}…")
+        self.status(f"Opening the folder of {os.path.basename(path)}… (Ctrl+R)")
 
         def work() -> None:
             try:
                 ok, message = reveal.reveal(path, timeout=REVEAL_TIMEOUT)
             except Exception as exc:             # never kill the worker silently
-                ok, message = False, f"could not open a file manager ({exc!r})"
+                ok, message = False, f"Could not open a file manager ({exc!r})"
             self.queue_ui.put(("reveal", (ok, message)))
 
         threading.Thread(target=work, name="reveal", daemon=True).start()
@@ -4317,6 +4911,7 @@ class PlayerApp:
         except Exception:
             pass
         self.root.destroy()
+        self._icon = None
 
 
 def run(args) -> int:  # pragma: no cover - entry point
@@ -4331,20 +4926,8 @@ def run(args) -> int:  # pragma: no cover - entry point
         settings.interpolation = args.interpolation
     if getattr(args, "theme", None):
         settings.theme = args.theme      # the palette is bound in PlayerApp
-    app = PlayerApp(root, settings=settings, directory=args.directory or "",
-                    backend=args.backend, speed=getattr(args, "speed", 1.0),
-                    autoplay=getattr(args, "autoplay", False))
-    track = getattr(args, "track", None)
-    if track:
-        target = os.path.abspath(track)
-
-        def start_track():
-            index = next((i for i, t in enumerate(app.queue) if t.path == target), None)
-            if index is not None:
-                app._play_index(index)
-            elif app.queue:
-                app._play_index(0)
-
-        root.after(1200, start_track)
+    PlayerApp(root, settings=settings, directory=args.directory or "",
+              backend=args.backend, speed=getattr(args, "speed", 1.0),
+              autoplay=getattr(args, "autoplay", False), start_track=getattr(args, "track", ""))
     root.mainloop()
     return 0

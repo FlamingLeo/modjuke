@@ -23,6 +23,10 @@ class StereoRing:
         self._buf = np.zeros((self.capacity, 2), dtype=np.float32)
         self._unscaled = np.zeros_like(self._buf)
         self._paused_gain = None
+        self._output_gain = None
+        self._target_gain = 1.0
+        self._gain_left = 0
+        self._output_level = (0.0, 0.0)
         self._w = 0
         self._r = 0
         self._count = 0
@@ -82,11 +86,12 @@ class StereoRing:
 
     def read_into(self, out: np.ndarray, frames: Optional[int] = None, *,
                   playback_time: Optional[float] = None, samplerate: float = 0.0) -> int:
-        """Fill out (shape (n, 2)); zero-fills whatever is not available."""
+        """Fill out (shape (n, 2)), zero-fills whatever is not available."""
         want = len(out) if frames is None else int(min(frames, len(out)))
         with self._lock:
             if self._paused:
                 out[:want] = 0.0
+                self._output_level = (0.0, 0.0)
                 return 0
             have = min(want, self._count)
             if have and playback_time is not None and samplerate > 0:
@@ -100,28 +105,69 @@ class StereoRing:
                     out[first : first + rest] = self._buf[:rest]
                 self._r = (self._r + have) % self.capacity
                 self._count -= have
-                if self._attack_left:
-                    n = min(have, self._attack_left)
-                    start = self._attack_frames - self._attack_left
-                    ramp = np.arange(start, start + n, dtype=np.float32) / self._attack_frames
-                    out[:n] *= ramp[:, None]
-                    self._attack_left -= n
             if have < want:
                 out[have:want] = 0.0
                 self.underflow_frames += want - have
+            if self._output_gain is not None:
+                # Advance through output silence too: late PCM must not revive an old gain.
+                self._apply_output_gain(out, want)
+            if have and self._attack_left:
+                n = min(have, self._attack_left)
+                start = self._attack_frames - self._attack_left
+                ramp = np.arange(start, start + n, dtype=np.float32) / self._attack_frames
+                out[:n] *= ramp[:, None]
+                self._attack_left -= n
+            if self._output_gain is not None and want:
+                left = float(np.abs(out[:want, 0]).max())
+                right = float(np.abs(out[:want, 1]).max())
+                self._output_level = (max(left, self._output_level[0] * 0.82),
+                                      max(right, self._output_level[1] * 0.82))
         return have
+
+    def set_output_gain(self, gain: float, ramp_frames: int = 0) -> None:
+        """Apply master gain on consumption, never by rewriting or discarding queued PCM."""
+        gain = max(0.0, min(1.0, float(gain)))
+        with self._lock:
+            if self._output_gain is None or self._paused or ramp_frames <= 0:
+                self._output_gain = self._target_gain = gain
+                self._gain_left = 0
+            elif gain != self._target_gain:
+                self._target_gain = gain
+                self._gain_left = int(ramp_frames)
+
+    def _apply_output_gain(self, out: np.ndarray, have: int) -> None:
+        # Called under the ring lock. Continue ramps across arbitrary callback sizes.
+        n = min(have, self._gain_left)
+        if n:
+            ramp = (self._output_gain + (self._target_gain - self._output_gain)
+                    * (np.arange(1, n + 1, dtype=np.float32) / self._gain_left))
+            if n == self._gain_left:
+                ramp[-1] = self._target_gain
+            out[:n] *= ramp[:, None]
+            self._gain_left -= n
+            self._output_gain = float(ramp[-1]) if self._gain_left else self._target_gain
+        if have > n and self._output_gain != 1.0:
+            out[n:have] *= self._output_gain
+
+    def output_level(self) -> tuple[float, float]:
+        with self._lock:
+            return self._output_level
 
     def clear(self) -> None:
         with self._lock:
             self._r = self._w
             self._count = 0
-            # Clear old timing on seek or load; do not reuse frame indices.
+            # Clear old timing on seek or load, do not reuse frame indices.
             self._marks.clear()
             self._playback.clear()
             self._positions.clear()
             self._cleared_at = self._written
             self._paused_gain = None
             self._attack_left = 0
+            self._output_level = (0.0, 0.0)
+            if self._output_gain is not None:
+                self._output_gain = self._target_gain
+                self._gain_left = 0
 
     def _playback_frame(self, now):
         if self._paused or not self._playback:
@@ -132,7 +178,7 @@ class StereoRing:
         return frame + min(count, max(0.0, (now - start) * rate))
 
     def playback_mark(self, now: Optional[float] = None):
-        """Return the output-timed row; hold it while paused or through silence."""
+        """Return the output-timed row, hold it while paused or through silence."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if not self._marks:
@@ -145,7 +191,7 @@ class StereoRing:
             return self._marks[0][1]
 
     def pause(self, *, rewind=False, now=None) -> None:
-        """Hold PCM unchanged; reclaim submitted frames only when the device discards them."""
+        """Hold PCM unchanged, reclaim submitted frames only when the device discards them."""
         now = time.monotonic() if now is None else now
         with self._lock:
             if self._paused:
@@ -155,6 +201,10 @@ class StereoRing:
             self._count = min(self.capacity, max(0, self._written - frame))
             self._r = (self._w - self._count) % self.capacity
             self._paused = True
+            self._output_level = (0.0, 0.0)
+            if self._output_gain is not None:
+                self._output_gain = self._target_gain
+                self._gain_left = 0
             self._playback.clear()
             while len(self._marks) > 1 and self._marks[1][0] <= frame:
                 self._marks.popleft()
@@ -163,6 +213,10 @@ class StereoRing:
         """Apply volume changes to held PCM, including unmuting previously silent audio."""
         with self._lock:
             if not self._paused:
+                return
+            if self._output_gain is not None:
+                self._output_gain = self._target_gain = gain
+                self._gain_left = 0
                 return
             self._paused_gain = gain
             first = min(self._count, self.capacity - self._r)
@@ -341,7 +395,7 @@ class SoundDeviceOutput(OutputDevice):
             return None
 
     def _playback_delay(self, time_info) -> float:
-        """Use device timestamps to find the playback delay; fall back to stream or requested
+        """Use device timestamps to find the playback delay, fall back to stream or requested
         latency."""
         try:
             dac, current = float(time_info.outputBufferDacTime), float(time_info.currentTime)
@@ -449,7 +503,7 @@ class SoundCardOutput(OutputDevice):
                 channels=2,
                 blocksize=self.blocksize,
             )
-            player.__enter__()      # opens the stream; kept open until stop()
+            player.__enter__()      # opens the stream, kept open until stop()
             self._player = player
         except AudioError:
             raise
@@ -465,7 +519,7 @@ class SoundCardOutput(OutputDevice):
     def _loop(self) -> None:
         try:
             while not self._stop.is_set():
-                # soundcard timing is approximate; only Linux exposes a stream-latency estimate.
+                # soundcard timing is approximate, only Linux exposes a stream-latency estimate.
                 delay = 0.0
                 try:
                     latency = float(getattr(self._player, "latency", 0.0))
@@ -536,6 +590,7 @@ def create_output(
                 rate = SoundDeviceOutput.default_samplerate(device) or 48000
             else:
                 rate = 48000
+        out = None
         try:
             r = ring
             if r is None:
@@ -545,10 +600,15 @@ def create_output(
             out.start()
             if log:
                 extra = f" @ {out.samplerate} Hz" if name != "null" else f" @ {out.samplerate} Hz (silent)"
-                log(f"audio output: {name} ({out.description}){extra}")
+                log(f"Audio output: {name} ({out.description}){extra}")
             return out, r
         except Exception as exc:
+            if out is not None:
+                try:
+                    out.stop()
+                except Exception:
+                    pass
             errors.append(f"{name}: {exc}")
             if prefer not in ("auto", "", None):
                 raise AudioError(f"Backend '{prefer}' could not be opened: {exc}") from exc
-    raise AudioError("No audio backend available: " + "; ".join(errors))
+    raise AudioError("No audio backend available: " + ", ".join(errors))

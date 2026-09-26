@@ -30,7 +30,7 @@ DEFAULT_INTERPOLATION = "sinc"
 
 
 def interpolation_length(mode) -> Optional[int]:
-    """Return the filter length for a name or supported length; return None for unknown values."""
+    """Return the filter length for a name or supported length, return None for unknown values."""
     if isinstance(mode, bool):
         return None
     if isinstance(mode, int):
@@ -259,7 +259,7 @@ class LibOpenMPT:
             "openmpt_module_ctl_set_boolean", c_int, c_void_p, c_char_p, c_int
         )
 
-        # render parameters (the mixer's own settings; interpolation lives here)
+        # render parameters (the mixer's own settings, interpolation lives here)
         self._set_render_param = sig_opt(
             "openmpt_module_set_render_param", c_int, c_void_p, c_int, c_int32
         )
@@ -436,7 +436,7 @@ class Module:
     def metadata(self) -> dict:
         keys = self._lib._take_string(self._lib._get_metadata_keys(self.handle))
         out = {}
-        for key in filter(None, keys.split(";")):
+        for key in filter(None, keys.split(",")):
             out[key] = self._lib._take_string(self._lib._get_metadata(self.handle, key.encode()))
         return out
 
@@ -463,7 +463,7 @@ class Module:
             num_instruments=self.num_instruments(),
             num_samples=self.num_samples(),
             num_subsongs=self.num_subsongs(),
-            subsong_names=list(filter(None, names.split(";"))),
+            subsong_names=list(filter(None, names.split(","))),
             sample_names=self.sample_names(),
             instrument_names=self.instrument_names(),
             message=md.get("message", "") or md.get("message_raw", ""),
@@ -493,7 +493,7 @@ class Module:
         return bool(self._lib._ctl_set_text(self.handle, b"play.at_end", mode.encode()))
 
     def set_interpolation(self, mode) -> bool:
-        """Set the resampling filter; raise OpenMPTError for unknown filters or an unavailable API."""
+        """Set the resampling filter, raise OpenMPTError for unknown filters or an unavailable API."""
         length = interpolation_length(mode)
         if length is None:
             raise OpenMPTError(f"Unknown interpolation filter {mode!r}")
@@ -645,7 +645,7 @@ class Module:
         return (note, instrument, _join_volume(vol_effect, volume), _join_effect(effect, parameter))
 
     def pattern_data(self, pattern: int, channels: Optional[int] = None) -> dict:
-        """Read a pattern on the render thread; return its index, dimensions, and formatted cells."""
+        """Read a pattern on the render thread, return its index, dimensions, and formatted cells."""
         rows = self.pattern_rows(pattern)
         count = int(channels if channels is not None else self.num_channels())
         cells = [[self.pattern_cell(pattern, row, channel) for channel in range(count)]

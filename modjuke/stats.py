@@ -6,7 +6,7 @@ import math
 import os
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 from .config import config_dir
 
@@ -40,7 +40,7 @@ class ModuleStats:
     title: str = ""
     plays: int = 0
     seconds: float = 0.0
-    last_played: float = 0.0  # UTC epoch; displayed in the user's local timezone
+    last_played: float = 0.0  # UTC epoch, displayed in the user's local timezone
 
 
 class StatsStore:
@@ -86,7 +86,7 @@ class StatsStore:
         path = path_key(path)
         if path not in self.records:
             if len(self.records) >= MAX_MODULES:
-                self.error = "Listening stats limit reached; existing history is kept."
+                self.error = "Listening stats limit reached, existing history is kept."
                 return False
             self.records[path] = ModuleStats(path)
         row = self.records[path]
@@ -105,9 +105,18 @@ class StatsStore:
         fd, temporary = tempfile.mkstemp(dir=folder, suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                json.dump({"version": 1, "since": since,
-                           "modules": [asdict(r) for r in records.values()]},
-                          stream, ensure_ascii=True, allow_nan=False)
+                encoder = json.JSONEncoder(ensure_ascii=True, allow_nan=False)
+                stream.write('{"version": 1, "since": ' + encoder.encode(since)
+                             + ', "modules": [')
+                # Keep the same JSON bytes without copying the entire history at once.
+                for index, record in enumerate(records.values()):
+                    if index:
+                        stream.write(", ")
+                    stream.write(encoder.encode({
+                        "path": record.path, "title": record.title, "plays": record.plays,
+                        "seconds": record.seconds, "last_played": record.last_played,
+                    }))
+                stream.write("]}")
             os.replace(temporary, self.path)
         finally:
             if os.path.exists(temporary):
@@ -152,14 +161,22 @@ class StatsStore:
 
     def ranked(self, order="plays", query="") -> list[ModuleStats]:
         terms = query.casefold().split()
-        rows = [r for r in self.records.values()
-                if all(t in (r.path + " " + r.title).casefold() for t in terms)]
+        if terms:
+            first, *remaining = terms
+            rows = []
+            for record in self.records.values():
+                text = (record.path + " " + record.title).casefold()
+                if first in text and (not remaining or all(term in text for term in remaining)):
+                    rows.append(record)
+        else:
+            rows = list(self.records.values())
         field = order if order in ("plays", "seconds", "last_played") else "plays"
-        return sorted(rows, key=lambda r: (-getattr(r, field), -r.seconds, r.path.casefold()))
+        rows.sort(key=lambda r: (-getattr(r, field), -r.seconds, r.path.casefold()))
+        return rows
 
 
 class ListeningCounter:
-    """Observe engine snapshots; never use song position as elapsed listening time."""
+    """Observe engine snapshots, never use song position as elapsed listening time."""
     def __init__(self, store: StatsStore, enabled: bool = True):
         self.store = store
         self.enabled = bool(enabled)
@@ -238,7 +255,7 @@ class ListeningCounter:
             self._active = False
             self._require_audio = True
             return
-        # EOF may still have queued audio; finished means the ring has drained.
+        # EOF may still have queued audio, finished means the ring has drained.
         active = bool((snap.playing or snap.ended) and not snap.paused and not snap.finished)
         elapsed = now - previous_time if previous_time is not None else 0.0
         self._budget = min(MAX_GAP, self._budget + delta_audio)
@@ -260,6 +277,6 @@ class ListeningCounter:
             if self.store.record(path, seconds, play, title, when):
                 self._counted = True
         if not active:
-            # Paused PCM is retained for resume; seeks and loads discard that queue.
+            # Paused PCM is retained for resume, seeks and loads discard that queue.
             self._budget = min(self._budget, max(0.0, snap.buffer_seconds)) if snap.paused else 0.0
         self._active = active

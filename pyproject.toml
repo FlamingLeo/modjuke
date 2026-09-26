@@ -24,3 +24,6 @@ modjuke-gui = "modjuke.main:main"
 
 [tool.setuptools]
 packages = ["modjuke"]
+
+[tool.setuptools.data-files]
+"share/modjuke" = ["img/modjuke.png"]

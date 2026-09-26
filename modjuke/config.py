@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import tempfile
@@ -42,7 +43,7 @@ def clamp_ui_fps(value) -> int:
     """A sane refresh rate from whatever is in the settings file."""
     try:
         number = int(round(float(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return UI_FPS_DEFAULT
     return max(UI_FPS_MIN, min(number, UI_FPS_MAX))
 from typing import Any
@@ -77,6 +78,7 @@ class Settings:
 
     window_title: str = "track"
     queue_mode: str = "by directory"
+    queue_source: str = ""          # empty: infer source from older queue_mode settings
     active_playlist: str = ""
     filter_formats: list = field(default_factory=list)
     filter_min: float = 0.0
@@ -109,6 +111,7 @@ class Settings:
     window_geometry: str = ""
     show_metadata: bool = True
     theme: str = theme.DEFAULT_THEME
+    custom_themes: dict = field(default_factory=dict)
     remember_position: bool = True
     cache_analysis: bool = True
     auto_analyze: bool = True
@@ -127,8 +130,11 @@ class Settings:
         if not isinstance(raw, dict):
             return cls()
         known = {f.name for f in fields(cls)}
-        clean: dict[str, Any] = {}
+        custom = theme.clean_custom_themes(raw.get("custom_themes"))
+        clean: dict[str, Any] = {"custom_themes": custom}
         for key, value in (raw or {}).items():
+            if key == "custom_themes":
+                continue
             if key == "shuffle_paths":
                 if isinstance(value, list):
                     clean[key] = [str(v) for v in value][:MAX_SHUFFLE_PATHS]
@@ -144,26 +150,38 @@ class Settings:
                 clean[key] = clamp_ui_fps(value)
                 continue
             if key == "theme":
-                clean[key] = theme.normalise(value)
+                clean[key] = theme.normalise(value, custom)
                 continue
             if key in known:
                 default = getattr(cls(), key)
                 try:
-                    clean[key] = type(default)(value) if isinstance(default, (int, float, str)) else value
+                    converted = type(default)(value) if isinstance(default, (int, float, str)) else value
+                    if isinstance(default, (int, float)) and not math.isfinite(converted):
+                        continue
+                    clean[key] = converted
                 except Exception:
                     continue
-        # Upgrade the old default once; subsequent user latency choices stay untouched.
+        # Upgrade the old default once, subsequent user latency choices stay untouched.
         if "latency_revision" not in raw and clean.get("latency_ms") == 120:
             clean["latency_ms"] = 20
         return cls(**clean)
 
-    def save(self, path: str | None = None) -> None:
+    def save(self, path: str | None = None) -> bool:
         path = path or config_path()
+        tmp = None
         try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+            directory = os.path.dirname(path) or "."
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(asdict(self), fh, indent=2, sort_keys=True)
             os.replace(tmp, path)
+            return True
         except Exception:
-            pass
+            return False
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass

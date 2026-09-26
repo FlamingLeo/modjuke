@@ -476,7 +476,7 @@ class FolderDialog(tk.Toplevel):
         return max(width - 40, 260)
 
     def _on_resize(self, event) -> None:
-        """Schedule a breadcrumb refit for dialog-width changes; ignore child resize events."""
+        """Schedule a breadcrumb refit for dialog-width changes, ignore child resize events."""
         if event.widget is not self:
             return
         if abs(self._crumb_space() - self._crumb_fit) > 40 and not self._crumb_timer:
@@ -525,7 +525,7 @@ class FolderDialog(tk.Toplevel):
         self.refresh()
 
     def navigate(self, path: str, initial: bool = False) -> bool:
-        """Show path; keeps the current folder and reports the problem if it
+        """Show path, keeps the current folder and reports the problem if it
         is not a readable folder."""
         resolved, error = expand_path(path)
         if error:
@@ -616,7 +616,7 @@ class FolderDialog(tk.Toplevel):
             self.dirs_tree.selection_set(children[0])
             self.dirs_tree.focus(children[0])
         if len(pairs) >= MAX_LISTED_DIRS:
-            self._status.set(f"showing the first {MAX_LISTED_DIRS} folders …")
+            self._status.set(f"Showing the first {MAX_LISTED_DIRS} folders …")
         self._queue_preview(self._cwd)
 
     def select_path(self, path: str) -> bool:
@@ -656,7 +656,7 @@ class FolderDialog(tk.Toplevel):
         """Count modules in a background worker, cancelling the previous request."""
         self._count_token += 1
         token = self._count_token
-        self._status.set(f"counting modules in {os.path.basename(path) or path} …")
+        self._status.set(f"Counting modules in {os.path.basename(path) or path} …")
         direct = count_module_files(self._cwd)
         same = os.path.abspath(path) == os.path.abspath(self._cwd)
 
@@ -695,7 +695,7 @@ class FolderDialog(tk.Toplevel):
             text = (f"{more}{modules} playable module{'s' if modules != 1 else ''} in {where}"
                     f", {folders} folder{'s' if folders != 1 else ''} scanned")
         else:
-            text = f"no playable modules in {label}"
+            text = f"No playable modules in {label}"
         if not same:
             text += f", {direct} directly in the current folder"
         if truncated:
@@ -736,7 +736,7 @@ class FolderDialog(tk.Toplevel):
         """Hand over to the desktop picker (only shown when one exists)."""
         chosen = pick_directory_system(self, self._cwd, self.title())
         if chosen is None:
-            self._status.set("no system dialog available on this system")
+            self._status.set("No system dialog available on this system")
             return
         self.result = chosen or ""
         self.destroy()

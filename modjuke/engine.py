@@ -26,7 +26,7 @@ class Snapshot:
     """Immutable-ish view of the player state (read by the UI at ~12 Hz)."""
 
     generation: int = 0
-    play_id: int = 0               # explicit load/replay identity; recovery keeps it
+    play_id: int = 0               # explicit load/replay identity, recovery keeps it
     audio_seconds: float = 0.0     # actual rendering, never advanced by a seek
     path: str = ""
     loading: bool = False
@@ -87,7 +87,7 @@ class _Worker(threading.Thread):
         self._abandon = threading.Event()
         self._module: Optional[Module] = None
         self._buf = np.zeros((engine.blocksize, 2), dtype=np.float32)
-        self._gain = 0.0
+        self._start_gain = 0.0
         self._fade_frames = 0
         self._key = None
         self._key_frames = 0
@@ -162,7 +162,7 @@ class _Worker(threading.Thread):
         except _Abandoned:
             pass
         except Exception as exc:  # never let the thread die silently
-            self._emit(MSG_ERROR, f"render worker stopped: {exc!r}")
+            self._emit(MSG_ERROR, f"Render worker stopped: {exc!r}")
             self.publish(playing=False)
         finally:
             self._close_module()
@@ -209,20 +209,23 @@ class _Worker(threading.Thread):
             self._apply_command(name, kwargs)
 
     def _apply_command(self, name: str, kwargs: dict) -> None:
+        self._check_alive()
         if name == "load":
             self._do_load(**kwargs)
         elif name == "listening_start":
             self._audio_seconds = 0.0
             self.publish(play_id=kwargs["play_id"], audio_seconds=0.0)
         elif name == "pause":
-            if kwargs.get("paused"):
-                self.engine._pause_output()
-                self.publish(paused=True, playing=False, vu=(), level=(0.0, 0.0))
-            else:
-                self._gain = self.engine.effective_gain()
-                self.engine._resume_output()
-                self.publish(paused=False, playing=not self.snapshot().ended,
-                             progress_time=time.monotonic())
+            with self.engine._lock:
+                self._check_alive()
+                if kwargs.get("paused"):
+                    self.engine._pause_output()
+                    self.publish(paused=True, playing=False, vu=(), level=(0.0, 0.0))
+                else:
+                    self._start_gain = 1.0
+                    self.engine._resume_output()
+                    self.publish(paused=False, playing=not self.snapshot().ended,
+                                 progress_time=time.monotonic())
         elif name == "seek":
             self._do_seek(float(kwargs["position"]))
         elif name == "loop":
@@ -234,14 +237,16 @@ class _Worker(threading.Thread):
                 if self._module is not None:
                     self._module.set_tempo_factor(float(kwargs["factor"]))
             except Exception as exc:
-                self._emit(MSG_WARN, f"tempo factor ignored: {exc}")
+                self._emit(MSG_WARN, f"Tempo factor ignored: {exc}")
         elif name == "interpolation":
             self._apply_interpolation(str(kwargs["mode"]))
         elif name in ("song", "pattern"):
             self._describe(name, kwargs)
         elif name == "unload":
             self._close_module()
-            self.engine.ring.clear()
+            with self.engine._lock:
+                self._check_alive()
+                self.engine.ring.clear()
             self.publish(loaded=False, playing=False, paused=False, ended=False,
                          path="", info=None, position=0.0, duration=0.0,
                          duration_valid=False, failed="", vu=(), level=(0.0, 0.0))
@@ -256,8 +261,10 @@ class _Worker(threading.Thread):
         self.publish(play_id=self.engine._play_serial if play_id is None else play_id,
                      audio_seconds=0.0)
         self._close_module()
-        self.engine.ring.clear()
-        self._gain = 0.0
+        with self.engine._lock:
+            self._check_alive()
+            self.engine.ring.clear()
+        self._start_gain = 0.0
         self._fade_frames = int(self.engine.samplerate * 0.015)
         self._key = None
         self._key_frames = 0
@@ -279,13 +286,16 @@ class _Worker(threading.Thread):
         try:
             mod = lib.open_file(path)
         except Exception as exc:
+            self._check_alive()
             text = str(exc) or exc.__class__.__name__
             self.publish(loading=False, loaded=False, playing=False, failed=text,
                          info=None, path=path)
-            self._emit(MSG_ERROR, f"cannot load {path}: {text}")
-            self.engine._notify("load_failed", path=path, error=text, generation=self.generation)
+            self._emit(MSG_ERROR, f"Cannot load {path}: {text}")
+            self.engine._notify("load_failed", path=path, error=text, generation=self.generation,
+                                play_id=self.snapshot().play_id)
             return
         self._module = mod
+        self._check_alive()
         try:
             duration = mod.duration()
             if subsong:
@@ -296,19 +306,19 @@ class _Worker(threading.Thread):
                     pass
             mod.set_repeat_count(-1 if self.snapshot().loop else 0)
             try:
-                # Keep EOF stopped; seeking explicitly starts another playback.
+                # Keep EOF stopped, seeking explicitly starts another playback.
                 mod.set_at_end("stop")
             except Exception:
                 pass
             mode = self.engine.settings.interpolation
             if interpolation_length(mode) is None:
-                self._emit(MSG_WARN, f"unknown resampling filter {mode!r} in the settings - "
+                self._emit(MSG_WARN, f"Unknown resampling filter {mode!r} in the settings - "
                                      f"using {DEFAULT_INTERPOLATION}")
                 mode = DEFAULT_INTERPOLATION
             try:
                 mod.set_interpolation(mode)
             except Exception as exc:
-                self._emit(MSG_WARN, f"resampling filter not applied: {exc}")
+                self._emit(MSG_WARN, f"Resampling filter not applied: {exc}")
             info = mod.info(path)
             if position > 0:
                 mod.seek_seconds(position)
@@ -323,23 +333,25 @@ class _Worker(threading.Thread):
                 interpolation=mod.interpolation(),
                 order=mod.current_order(), pattern=mod.current_pattern(), row=mod.current_row(),
             )
-            self._emit(MSG_INFO, f"loaded {path} ({info.format or '?'}, "
+            self._emit(MSG_INFO, f"Loaded {path} ({info.format or '?'}, "
                                  f"{info.num_channels}ch, {duration:.1f}s)")
         except Exception as exc:
             text = f"{exc!r}"
             self.publish(loading=False, loaded=True, playing=False, failed=text)
-            self._emit(MSG_ERROR, f"module failed after load: {text}")
-        if start_paused:
-            self.engine.ring.pause()
-        else:
-            self.engine._resume_output()
+            self._emit(MSG_ERROR, f"Module failed after load: {text}")
+        with self.engine._lock:
+            self._check_alive()
+            if start_paused:
+                self.engine.ring.pause()
+            else:
+                self.engine._resume_output()
         self._load_started = time.monotonic()
 
     def _apply_interpolation(self, mode: str, *, announce: bool = True) -> bool:
         """Apply the resampling filter to the current module without reloading it."""
         length = interpolation_length(mode)
         if length is None:
-            self._emit(MSG_WARN, f"unknown resampling filter {mode!r} - keeping "
+            self._emit(MSG_WARN, f"Unknown resampling filter {mode!r} - keeping "
                                  f"{interpolation_name(self.snapshot().interpolation) or 'the default'}")
             return False
         if self._module is None:
@@ -347,12 +359,12 @@ class _Worker(threading.Thread):
         try:
             self._module.set_interpolation(length)
         except Exception as exc:
-            self._emit(MSG_WARN, f"resampling filter unchanged: {exc}")
+            self._emit(MSG_WARN, f"Resampling filter unchanged: {exc}")
             return False
         actual = self._module.interpolation()
         self.publish(interpolation=actual)
         if announce:
-            self._emit(MSG_INFO, f"resampling: {interpolation_name(actual) or mode} "
+            self._emit(MSG_INFO, f"Resampling: {interpolation_name(actual) or mode} "
                                  f"({actual} tap filter)")
         return True
 
@@ -362,16 +374,18 @@ class _Worker(threading.Thread):
             return
         try:
             self._module.set_repeat_count(-1 if loop else 0)
-            self._emit(MSG_INFO, "loop " + ("on" if loop else "off"))
+            self._emit(MSG_INFO, "Loop " + ("on" if loop else "off"))
         except Exception as exc:
-            self._emit(MSG_WARN, f"loop change failed: {exc}")
+            self._emit(MSG_WARN, f"Loop change failed: {exc}")
 
     def _do_subsong(self, index: int) -> None:
         if self._module is None:
             return
         try:
             self._module.select_subsong(index)
-            self.engine.ring.clear()
+            with self.engine._lock:
+                self._check_alive()
+                self.engine.ring.clear()
             duration = self._module.duration()
             self._frames = 0
             self._key = None
@@ -381,18 +395,22 @@ class _Worker(threading.Thread):
                          duration_valid=bool(math.isfinite(duration) and duration > 0),
                          position=self._module.position_seconds(), ended=False,
                          finished=False, loop_index=0)
-            self._emit(MSG_INFO, f"subsong {index + 1}/{self.snapshot().num_subsongs}")
+            self._emit(MSG_INFO, f"Subsong {index + 1}/{self.snapshot().num_subsongs}")
+        except _Abandoned:
+            raise
         except Exception as exc:
-            self._emit(MSG_WARN, f"cannot select subsong {index}: {exc}")
+            self._emit(MSG_WARN, f"Cannot select subsong {index}: {exc}")
 
     def _do_seek(self, position: float) -> None:
         if self._module is None:
             return
         try:
             newpos = self._module.seek_seconds(max(0.0, position))
-            self.engine.ring.clear()
+            with self.engine._lock:
+                self._check_alive()
+                self.engine.ring.clear()
             self._fade_frames = int(self.engine.samplerate * 0.012)
-            self._gain = 0.0
+            self._start_gain = 0.0
             self._frames = int(newpos * self.engine.samplerate)
             self._key = None
             self._key_frames = self._frames
@@ -404,8 +422,10 @@ class _Worker(threading.Thread):
             self.publish(position=newpos, ended=False, finished=False,
                          order=self._module.current_order(), row=self._module.current_row(),
                          playing=not st.paused)
+        except _Abandoned:
+            raise
         except Exception as exc:
-            self._emit(MSG_WARN, f"seek failed: {exc}")
+            self._emit(MSG_WARN, f"Seek failed: {exc}")
 
     def _wait_for_drain(self) -> None:
         """Song is over: wait until the buffered tail has been played."""
@@ -415,19 +435,19 @@ class _Worker(threading.Thread):
                          level=(0.0, 0.0))
             self.engine._notify(
                 "finished", path=self.snapshot().path, duration=self.snapshot().duration,
-                loop=self.snapshot().loop, generation=self.generation,
+                loop=self.snapshot().loop, generation=self.generation, play_id=self.snapshot().play_id,
             )
-            self._emit(MSG_INFO, "song finished")
+            self._emit(MSG_INFO, "Song finished")
         self._idle(0.02)
 
     def _render(self) -> None:  # noqa: C901
         ring: StereoRing = self.engine.ring
         block = self.engine.blocksize
-        target = int(self.engine.samplerate * self.engine.buffer_ms / 1000.0)
+        target = self.engine.samplerate * self.engine.buffer_ms // 1000
         target = max(target, block * 2)
         available = ring.available()
         if available >= target or ring.space() < 64:
-            self._idle(0.005)     # device is behind; wait instead of dropping audio
+            self._idle(0.005)     # device is behind, wait instead of dropping audio
             return
         frames = min(block, target - available, ring.space())
         module = self._module
@@ -435,27 +455,25 @@ class _Worker(threading.Thread):
         identity = (state.generation, state.play_id, state.path, state.subsong)
         before = (identity, state.order, state.pattern, state.row)
         n = module.read_interleaved_float(self.engine.samplerate, frames, self._buf)
+        self._check_alive()
         if n <= 0:
             self.publish(ended=True, playing=False)
             return
         data = self._buf[:n]
 
-        target_gain = self.engine.effective_gain()
         if self._fade_frames > 0:
             f = min(self._fade_frames, n)
             data[:f] *= np.linspace(0.0, 1.0, f, endpoint=False, dtype=np.float32)[:, None]
             self._fade_frames -= f
-        unscaled = data.copy()
-        if abs(target_gain - self._gain) < 1e-4:
-            if abs(target_gain - 1.0) > 1e-6:
-                data *= target_gain
-            self._gain = target_gain
-        else:
-            ramp = np.linspace(self._gain, target_gain, n, dtype=np.float32)[:, None]
-            data *= ramp
-            self._gain = target_gain
+        # Keep the load/seek envelope in PCM, but apply master volume only at output.
+        if self._start_gain < 1.0:
+            data *= np.linspace(self._start_gain, 1.0, n, dtype=np.float32)[:, None]
+            self._start_gain = 1.0
 
-        peak = np.abs(self._buf[:n]).max(axis=0) if n else np.zeros(2, dtype=np.float32)
+        # Reduce each stereo channel separately, avoiding the slow two-column reduction.
+        peak = np.array((np.abs(data[:, 0]).max(), np.abs(data[:, 1]).max()),
+                        dtype=np.float32)
+        peak *= self.engine.effective_gain()  # retain the silence-watchdog policy
         # limit to a couple of pixels of work: no full copy needed
         self.level = np.maximum(peak, self.level * 0.82)
 
@@ -465,8 +483,10 @@ class _Worker(threading.Thread):
         pattern = module.current_pattern()
         row = module.current_row()
         position = module.position_seconds()
-        ring.write(data, before=before, after=(identity, order, pattern, row),
-                   position_before=state.position, position_after=position, unscaled=unscaled)
+        with self.engine._lock:
+            self._check_alive()
+            ring.write(data, before=before, after=(identity, order, pattern, row),
+                       position_before=state.position, position_after=position)
         speed = module.current_speed()
         tempo = module.current_tempo()
         key = (order, pattern, row, speed, tempo)
@@ -494,7 +514,7 @@ class _Worker(threading.Thread):
             order=order, pattern=pattern, row=row, speed=speed, tempo=tempo,
             playing_channels=module.playing_channels(), loop_index=loop_index,
             vu=vu,
-            level=(float(self.level[0] * self._gain), float(self.level[1] * self._gain)),
+            level=(float(self.level[0]), float(self.level[1])),
             progress_time=time.monotonic(), rendered_seconds=self._frames / self.engine.samplerate,
         )
 
@@ -522,9 +542,9 @@ class _Worker(threading.Thread):
             self.publish(stalled=True, stall_seconds=no_progress)
             if not self._stall_reported:
                 self._stall_reported = True
-                self._emit(MSG_WARN, f"module stalled: {reason}")
+                self._emit(MSG_WARN, f"Module stalled: {reason}")
                 self.engine._notify("stalled", path=self.snapshot().path, reason=reason,
-                                    position=position, generation=self.generation)
+                                    position=position, generation=self.generation, play_id=self.snapshot().play_id)
         else:
             self.publish(stalled=False, stall_seconds=no_progress)
 
@@ -536,9 +556,9 @@ class _Worker(threading.Thread):
         ):
             self._overrun_reported = True
             self._emit(MSG_WARN,
-                       f"module did not end after {position:.0f}s (expected {duration:.0f}s)")
+                       f"Module did not end after {position:.0f}s (expected {duration:.0f}s)")
             self.engine._notify("overrun", path=self.snapshot().path, position=position,
-                                duration=duration, generation=self.generation)
+                                duration=duration, generation=self.generation, play_id=self.snapshot().play_id)
 
 
 class PlaybackEngine:
@@ -555,6 +575,7 @@ class PlaybackEngine:
         metering: bool = True,
     ):
         self.settings = settings
+        self.excluded = None
         self.backend_name = backend
         self._samplerate = (int(samplerate) if samplerate is not None else
                             normalise_sample_rate(getattr(settings, "samplerate", 0))) or None
@@ -594,6 +615,7 @@ class PlaybackEngine:
             speed=self.speed,
             log=lambda text: self._message(MSG_INFO, text),
         )
+        r.set_output_gain(self.effective_gain())
         self.output, self.ring = out, r
         self.samplerate = out.samplerate
         self.buffer_ms = int(getattr(self.settings, "buffer_ms", 220))
@@ -608,9 +630,9 @@ class PlaybackEngine:
             try:
                 new_ring = old_ring if old_ring.paused else StereoRing(5 * max(self.samplerate, 44100))
                 self._open_output(ring=new_ring)
-                self._message(MSG_WARN, f"audio device reopened ({self.output.name})")
+                self._message(MSG_WARN, f"Audio device reopened ({self.output.name})")
             except AudioError as exc:
-                self._message(MSG_ERROR, f"could not reopen audio device: {exc}")
+                self._message(MSG_ERROR, f"Could not reopen audio device: {exc}")
                 try:
                     self.ring = old_ring
                 except Exception:
@@ -621,14 +643,16 @@ class PlaybackEngine:
             try:
                 self.output.pause()
             except Exception as exc:
-                self._message(MSG_WARN, f"audio pause: {exc}")
+                self._message(MSG_WARN, f"Audio pause: {exc}")
 
     def _resume_output(self) -> None:
         with self._lock:
+            if self.excluded is not None and self.excluded(self.snapshot().path):
+                return
             try:
                 self.output.resume()
             except Exception as exc:
-                self._message(MSG_WARN, f"audio resume: {exc}")
+                self._message(MSG_WARN, f"Audio resume: {exc}")
 
     def restart_output(self, backend: Optional[str] = None) -> None:
         """Public: switch backend / recover from a dead sound card."""
@@ -672,16 +696,23 @@ class PlaybackEngine:
                 return out
 
     @property
+    def play_id(self) -> int:
+        with self._lock:
+            return self._play_serial
+
+    @property
     def volume(self) -> float:
         return self._volume
 
     def set_volume(self, value: float) -> None:
-        self._volume = max(0.0, min(1.0, float(value)))
-        self.ring.set_paused_gain(self.effective_gain())
+        with self._lock:
+            self._volume = max(0.0, min(1.0, float(value)))
+            self.ring.set_output_gain(self.effective_gain(), max(1, round(self.samplerate * 0.005)))
 
     def set_muted(self, muted: bool) -> None:
-        self._muted = bool(muted)
-        self.ring.set_paused_gain(self.effective_gain())
+        with self._lock:
+            self._muted = bool(muted)
+            self.ring.set_output_gain(self.effective_gain(), max(1, round(self.samplerate * 0.005)))
 
     @property
     def muted(self) -> bool:
@@ -714,12 +745,12 @@ class PlaybackEngine:
             try:
                 self._supervise_once()
             except Exception as exc:  # pragma: no cover - defensive
-                self._message(MSG_ERROR, f"supervisor error: {exc!r}")
+                self._message(MSG_ERROR, f"Supervisor error: {exc!r}")
 
     def _supervise_once(self) -> None:
         out = self.output
         if out is not None and not out.is_running() and not self._shutdown.is_set():
-            self._message(MSG_WARN, "audio device stopped; reopening")
+            self._message(MSG_WARN, "Audio device stopped, reopening")
             self._reopen_output()
 
         worker = self._current()
@@ -730,10 +761,10 @@ class PlaybackEngine:
 
         if not worker.is_alive():
             if not self._shutdown.is_set() and st.path and not st.finished:
-                self._message(MSG_WARN, f"render thread died; restarting ({st.path})")
+                self._message(MSG_WARN, f"Render thread died, restarting ({st.path})")
                 worker.abandon()
                 self._spawn(st.path, st.position, paused=True)
-                self._notify("restarted", path=st.path, reason="thread died")
+                self._notify("restarted", path=st.path, reason="thread died", play_id=st.play_id)
             return
 
         if st.loading and now - worker._load_started > max(20.0, self.settings.hang_timeout * 3):
@@ -753,24 +784,26 @@ class PlaybackEngine:
         path = st.path
         count = self._restarts.get(path, 0) + 1
         self._restarts[path] = count
-        limit = max(1, int(self.settings.max_restarts))
+        limit = max(0, int(self.settings.max_restarts))
         if count > limit:
             self._message(MSG_ERROR, f"{path}: giving up after {count - 1} restarts ({reason})")
-            self._notify("track_broken", path=path, reason=reason, restarts=count - 1)
+            self._notify("track_broken", path=path, reason=reason, restarts=count - 1, play_id=st.play_id)
             worker.abandon()
             self._spawn("", 0.0, paused=True)
             return
-        self._message(MSG_WARN, f"restarting playback ({reason}); attempt {count}/{limit}")
+        self._message(MSG_WARN, f"Restarting playback ({reason}), attempt {count}/{limit}")
         worker.abandon()
         new_worker = self._spawn(path, st.position, paused=st.paused)
         new_worker.publish(restarts=count)
-        self._notify("restarted", path=path, reason=reason, restarts=count)
+        self._notify("restarted", path=path, reason=reason, restarts=count, play_id=st.play_id)
 
     def snapshot(self) -> Snapshot:
         worker = self._current()
         if worker is None:
             return Snapshot(loop=bool(self.settings.loop_track))
         snap = worker.snapshot()
+        if snap.loaded and not snap.finished and not snap.failed:
+            snap.level = self.ring.output_level()
         if self.ring.paused and snap.loaded:
             snap.paused, snap.playing = True, False
             snap.vu, snap.level = (), (0.0, 0.0)
@@ -800,12 +833,15 @@ class PlaybackEngine:
 
     def play_path(self, path: str, position: float = 0.0, paused: bool = False,
                   loop: Optional[bool] = None, subsong: int = 0) -> None:
+        if self.excluded is not None and self.excluded(path):
+            self._message(MSG_WARN, "This song is ignored - restore it in Settings → Ignored songs")
+            return
         if loop is not None:
             self.settings.loop_track = bool(loop)
         with self._lock:
             self._play_serial += 1
             play_id = self._play_serial
-        self._message(MSG_DEBUG, f"queue: {path}")
+        self._message(MSG_DEBUG, f"Queue: {path}")
         worker = self._current()
         if worker is not None and worker.is_alive():
             worker.post("load", path=path, position=position, start_paused=paused,
@@ -826,6 +862,8 @@ class PlaybackEngine:
         if worker is None:
             return
         st = self.snapshot()
+        if self.excluded is not None and self.excluded(st.path):
+            return
         if st.finished or (st.ended and not st.paused):
             # the song is over: pressing play replays it from the top
             with self._lock:
@@ -834,7 +872,7 @@ class PlaybackEngine:
             worker.post("listening_start", play_id=play_id)
             worker.post("seek", position=0.0)
             worker.post("pause", paused=False)
-            self._message(MSG_INFO, "replaying from the start")
+            self._message(MSG_INFO, "Replaying from the start")
         else:
             worker.post("pause", paused=False)
 
@@ -849,7 +887,7 @@ class PlaybackEngine:
         st = self.snapshot()
         if not st.loaded:
             return
-        if st.paused:
+        if st.paused or st.finished:
             self.play()
         else:
             self.pause()

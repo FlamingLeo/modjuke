@@ -10,6 +10,7 @@ import random
 import re
 import threading
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Iterable, Optional
 
 from .openmpt import ModuleInfo, get_lib, supported_extensions
@@ -26,7 +27,7 @@ _DIGITS = re.compile(r"(\d+)")
 def natural_key(text: str):
     """Case-insensitive natural sort key: 'mod2' < 'mod10'."""
     return tuple(
-        int(part) if part.isdigit() else part.casefold() for part in _DIGITS.split(text)
+        int(part) if part.isdecimal() else part.casefold() for part in _DIGITS.split(text)
     ) or ("",)
 
 @dataclass
@@ -178,10 +179,12 @@ def order_tracks(tracks: Iterable[Track], mode: str, rng: Optional[random.Random
     if mode == ORDER_ALPHABETICAL:
         return sorted(items, key=_alphabetical_key)
     if mode == ORDER_DIRECTORY:
+        # Reuse repeated folder names only during this sort, keep memory bounded.
+        directory_key = lru_cache(maxsize=1024)(natural_key)
         return sorted(
             items,
             key=lambda t: (
-                tuple(natural_key(p) for p in t.dir_parts),
+                tuple(directory_key(p) for p in t.dir_parts),
                 t.sort_name,
                 t.path.casefold(),
             ),

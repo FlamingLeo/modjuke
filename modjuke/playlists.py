@@ -7,6 +7,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from functools import wraps
+from stat import S_ISREG
 from typing import Iterable, Optional
 
 from .library import Track
@@ -14,8 +15,9 @@ from .library import Track
 from .config import config_dir
 
 PLAYLISTS_NAME = "playlists.json"
+FAVORITES_NAME = "Favorites"
 NAME_MAX = 80            # a playlist name is a label, not a file name
-MAX_PLAYLISTS = 500      # plenty; the file is meant to stay openable at a glance
+MAX_PLAYLISTS = 500      # plenty, the file is meant to stay openable at a glance
 MAX_TRACKS = 100000      # one playlist cannot grow past a sane queue
 
 
@@ -70,10 +72,12 @@ def _transaction(method):
         before = {k: Playlist(p.name, list(p.paths), p.root)
                   for k, p in self.playlists.items()}
         try:
-            return method(self, *args, **kwargs)
+            result = method(self, *args, **kwargs)
         except PlaylistError:
             self.playlists = before
             raise
+        self.revision += 1
+        return result
     return call
 
 
@@ -81,18 +85,26 @@ class PlaylistStore:
     """The playlist file: a small ordered set of named, ordered path lists."""
 
     def __init__(self, path: str):
+        self.excluded = None
         self.path = path
         self.playlists: dict[str, Playlist] = {}     # keyed by casefolded name
         self._external_tracks: dict[str, Track] = {}
+        self.revision = 0
         self.load()
 
     @staticmethod
     def _key(name: str) -> str:
         return name.casefold()
 
+    @staticmethod
+    def is_favorites(name: str) -> bool:
+        return str(name or "").strip().casefold() == FAVORITES_NAME.casefold()
+
     def load(self) -> None:
         """Reload playlists, tolerating missing files and damaged entries."""
-        self.playlists = {}
+        self.playlists = {self._key(FAVORITES_NAME): Playlist(FAVORITES_NAME)}
+        self.revision += 1
+        loaded = set()
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
@@ -112,9 +124,11 @@ class PlaylistStore:
                 continue
             if len(paths) > MAX_TRACKS:
                 paths = paths[:MAX_TRACKS]
-            if self._key(name) in self.playlists:
+            key = self._key(name)
+            if key in loaded:
                 continue            # a duplicate in a broken file: keep the first
-            self.playlists[self._key(name)] = Playlist(name, paths, root)
+            loaded.add(key)
+            self.playlists[key] = Playlist(name, paths, root)
 
     def save(self) -> None:
         tmp = None
@@ -148,7 +162,7 @@ class PlaylistStore:
         name = normalise_name(name)
         if self._key(name) in self.playlists:
             raise PlaylistError(f"A playlist called '{name}' already exists")
-        if len(self.playlists) >= MAX_PLAYLISTS:
+        if len(self.playlists) - 1 >= MAX_PLAYLISTS:
             raise PlaylistError(f"{MAX_PLAYLISTS} playlists is the limit")
         paths = _unique(paths)
         if len(paths) > MAX_TRACKS:
@@ -176,6 +190,8 @@ class PlaylistStore:
     @_transaction
     def rename(self, old, new) -> Playlist:
         old_key = self._key(normalise_name(old))
+        if self.is_favorites(old_key):
+            raise PlaylistError("Favorites cannot be renamed")
         if old_key not in self.playlists:
             raise PlaylistError(f"No playlist called '{old}'")
         new = normalise_name(new)
@@ -197,6 +213,8 @@ class PlaylistStore:
     @_transaction
     def remove(self, name) -> None:
         key = self._key(normalise_name(name))
+        if self.is_favorites(key):
+            raise PlaylistError("Favorites cannot be deleted, clear it instead")
         if key not in self.playlists:
             raise PlaylistError(f"No playlist called '{name}'")
         del self.playlists[key]
@@ -212,6 +230,8 @@ class PlaylistStore:
         missing: list[str] = []
         seen: set[str] = set()
         for path in playlist.paths:
+            if self.excluded is not None and self.excluded(path):
+                continue
             if path in seen:
                 continue
             seen.add(path)
@@ -219,9 +239,9 @@ class PlaylistStore:
             if track is None:
                 try:
                     stat = os.stat(path)
-                    if not os.path.isfile(path):
+                    if not S_ISREG(stat.st_mode):
                         raise OSError("Not a file")
-                except OSError:
+                except (OSError, ValueError):
                     self._external_tracks.pop(path, None)
                     missing.append(path)
                     continue
@@ -249,7 +269,7 @@ def write_m3u(paths: Iterable[str], path: str) -> int:
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write("\r\n".join(lines) + "\r\n")
-    except OSError:
+    except (OSError, ValueError):
         return 0
     return count
 

@@ -1,5 +1,6 @@
-"""Five shared colour palettes, switchable while the app is running."""
+"""Built-in and user-defined colour palettes, switchable while the app is running."""
 
+import re
 import sys
 
 BG = "#1b1d23"
@@ -140,13 +141,72 @@ _ALIASES = {
 }
 
 _current = DEFAULT_THEME
+_active_palette = dict(_THEMES[_current])
+_custom = {}
+_HEX = re.compile(r"#[0-9a-fA-F]{6}\Z")
+_CUSTOM_ID = re.compile(r"custom:[a-z0-9-]{1,64}\Z")
+MAX_CUSTOM_THEMES = 100
 
 
-def normalise(name) -> str:
-    """A palette key for whatever spelling came in (unknown -> the default)."""
-    key = str(name or "").strip().lower().replace("_", "-").replace(" ", "-")
+def valid_colour(value) -> bool:
+    return isinstance(value, str) and _HEX.fullmatch(value) is not None
+
+
+def clean_custom_themes(raw) -> dict:
+    """Keep valid named palettes only, missing future roles inherit Dark."""
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    reserved = {value.casefold() for value in (*THEME_NAMES, *(THEME_LABELS[k] for k in THEME_NAMES), *_ALIASES)}
+    for key, entry in raw.items():
+        if len(result) >= MAX_CUSTOM_THEMES:
+            break
+        if not isinstance(key, str) or not _CUSTOM_ID.fullmatch(key) or not isinstance(entry, dict):
+            continue
+        name, colours = entry.get("name"), entry.get("colours")
+        if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 60
+                or name.strip().casefold().startswith("custom:")
+                or any(ord(c) < 32 for c in name) or name.strip().casefold() in reserved
+                or not isinstance(colours, dict)):
+            continue
+        alias = name.strip().lower().replace("_", "-").replace(" ", "-")
+        alias = _ALIASES.get(alias.replace("-", ""), _ALIASES.get(alias, alias))
+        if alias in THEME_NAMES:
+            continue
+        if any(not valid_colour(value) for role, value in colours.items() if role in COLOUR_NAMES):
+            continue
+        palette = dict(_THEMES[DEFAULT_THEME])
+        palette.update({role: value.lower() for role, value in colours.items() if role in COLOUR_NAMES})
+        result[key] = {"name": name.strip(), "colours": palette}
+        reserved.add(name.strip().casefold())
+    return result
+
+
+def set_custom_themes(raw) -> None:
+    """Register settings palettes, activate separately so edits can repaint the same key."""
+    global _custom
+    for key in _custom:
+        _THEMES.pop(key, None)
+        THEME_LABELS.pop(key, None)
+    _custom = clean_custom_themes(raw)
+    for key, entry in _custom.items():
+        _THEMES[key] = dict(entry["colours"])
+        THEME_LABELS[key] = entry["name"] + " (custom)"
+
+
+def normalise(name, custom_themes=None) -> str:
+    """Resolve a built-in name, custom identifier or custom display name."""
+    text = str(name or "").strip()
+    custom = _custom if custom_themes is None else custom_themes
+    for key, entry in custom.items():
+        if text.casefold() in (key.casefold(), entry["name"].casefold()):
+            return key
+    for key, entry in custom.items():
+        if text.casefold() == (entry["name"] + " (custom)").casefold():
+            return key
+    key = text.lower().replace("_", "-").replace(" ", "-")
     key = _ALIASES.get(key.replace("-", ""), _ALIASES.get(key, key))
-    return key if key in _THEMES else DEFAULT_THEME
+    return key if key in THEME_NAMES else DEFAULT_THEME
 
 
 def current() -> str:
@@ -183,12 +243,13 @@ def _rebind(old: dict, new: dict) -> list:
 
 def activate(name) -> str:
     """Activate a palette and return the name actually selected."""
-    global _current
+    global _current, _active_palette
     key = normalise(name)
-    old = _THEMES[_current]
+    old = _active_palette
     new = _THEMES[key]
-    if key != _current:
+    if key != _current or old != new:
         _rebind(old, new)
         globals().update({colour: new[colour] for colour in COLOUR_NAMES})
         _current = key
+        _active_palette = dict(new)
     return _current

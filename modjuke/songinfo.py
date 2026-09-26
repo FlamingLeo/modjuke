@@ -53,7 +53,7 @@ def clean_message(message: str) -> str:
 
 
 def names_are_the_comment(samples: list[str], comment: str) -> bool:
-    """Check whether the comment duplicates the sample-name list; do not assume this from the
+    """Check whether the comment duplicates the sample-name list, do not assume this from the
     format."""
     names = [name.strip() for name in samples if name.strip()]
     lines = [line.strip() for line in comment.splitlines() if line.strip()]
