@@ -436,7 +436,7 @@ class Module:
     def metadata(self) -> dict:
         keys = self._lib._take_string(self._lib._get_metadata_keys(self.handle))
         out = {}
-        for key in filter(None, keys.split(",")):
+        for key in filter(None, keys.split(";")):
             out[key] = self._lib._take_string(self._lib._get_metadata(self.handle, key.encode()))
         return out
 
@@ -463,7 +463,7 @@ class Module:
             num_instruments=self.num_instruments(),
             num_samples=self.num_samples(),
             num_subsongs=self.num_subsongs(),
-            subsong_names=list(filter(None, names.split(","))),
+            subsong_names=list(filter(None, names.split(";"))),
             sample_names=self.sample_names(),
             instrument_names=self.instrument_names(),
             message=md.get("message", "") or md.get("message_raw", ""),
