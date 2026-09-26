@@ -1,5 +1,7 @@
 # modjuke
 
+![interface](img/player.png)
+
 A desktop tracker-music player built with [**libopenmpt**](https://lib.openmpt.org/libopenmpt/) and [**Tkinter**](https://docs.python.org/3/library/tkinter.html).
 
 ## Features
