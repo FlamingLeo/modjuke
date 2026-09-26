@@ -240,10 +240,10 @@ def install(root: Path) -> None:
         subprocess.run([str(python), "-I", "-m", "pip", "install", "--disable-pip-version-check",
                         "--no-input", str(build_source) + "[audio]"], check=True, env=pip_env)
         subprocess.run([str(python), "-I", "-c",
-                        "import tkinter, numpy, importlib.util, "
-                        "from modjuke.openmpt import get_lib, "
-                        "assert importlib.util.find_spec('sounddevice'), "
-                        "assert importlib.util.find_spec('soundcard'), "
+                        "import tkinter, numpy, importlib.util; "
+                        "from modjuke.openmpt import get_lib; "
+                        "assert importlib.util.find_spec('sounddevice'); "
+                        "assert importlib.util.find_spec('soundcard'); "
                         "print('Installed modjuke, libopenmpt', get_lib().version_string)"], check=True)
         shutil.rmtree(build_source)
         launcher = "#!/bin/sh\n# Managed by modjuke's per-user installer.\n"
