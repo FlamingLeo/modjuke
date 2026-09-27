@@ -1377,6 +1377,8 @@ class SettingsDialog(tk.Toplevel):
         self._interp_was = s.interpolation
 
     def destroy(self) -> None:
+        if self.app._settings_dialog is self:
+            self.app._settings_dialog = None
         super().destroy()
         # Release Tk objects on the UI thread.
         self.sample_rate_combo = None
@@ -1621,6 +1623,7 @@ class PlayerApp:
                                            enabled=self.settings.track_listening_stats)
         self._stats_window: Optional[StatsWindow] = None
         self._about_window: Optional[AboutWindow] = None
+        self._settings_dialog: Optional[SettingsDialog] = None
         self._stats_warning = ""
         source = self.settings.queue_source
         if source not in ("library", "playlist"):
@@ -1853,7 +1856,7 @@ class PlayerApp:
         self.about_button.pack(side="left", padx=(8, 0))
         self.add_hint(self.about_button, "About modjuke (F1)")
         self.settings_button = ttk.Button(bar, text="Settings",
-                                          command=lambda: SettingsDialog(self))
+                                          command=self.open_settings)
         self.settings_button.pack(side="right")
         self.stats_btn = ttk.Button(bar, text="Listening stats", command=self.open_stats)
         self.stats_btn.pack(side="right", padx=(0, 6))
@@ -2814,6 +2817,17 @@ class PlayerApp:
             window.close_btn.focus_set()
             return
         self._about_window = AboutWindow(self)
+
+    def open_settings(self) -> None:
+        """Open or raise the single Settings dialog."""
+        self._dismiss_playlist_menu()
+        dialog = self._settings_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.deiconify()
+            dialog.lift()
+            dialog.focus_set()
+            return
+        self._settings_dialog = SettingsDialog(self)
 
     def open_stats(self) -> None:
         self._dismiss_playlist_menu()
