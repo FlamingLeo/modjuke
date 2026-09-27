@@ -18,7 +18,7 @@ from typing import Optional
 from . import library, reveal
 from .audio import AudioError
 from .cache import CACHE_NAME, AnalysisCache, cache_path
-from .config import (APP_NAME, APP_TITLE, MAX_SHUFFLE_PATHS, UI_FPS_DEFAULT,
+from .config import (APP_NAME, APP_TITLE, UI_FPS_DEFAULT,
                      UI_RATE_LABELS, UI_RATE_VALUES, Settings, SAMPLE_RATE_LABELS,
                      SAMPLE_RATE_VALUES, normalise_sample_rate)
 from .folderdialog import enable_select_all, pick_directory, show_path_tail, \
@@ -30,6 +30,7 @@ from .filters import (QueueFilter, filter_from_settings, formats_in,
 from .playlists import (FAVORITES_NAME, PlaylistError, PlaylistStore, normalise_name, playlists_path,
                         read_m3u, write_m3u)
 from .ignored import IgnoreError, IgnoreStore, ignored_path
+from .shuffles import ShuffleStore, library_key, playlist_key, shuffles_path
 from .ignoreview import IgnoreDialog
 from .songinfo import SongInfoWindow
 from .stats import ListeningCounter, StatsStore, stats_path
@@ -1569,8 +1570,11 @@ class PlayerApp:
         self._playing_path = ""                      # path of the running track
         self._reveal_enabled = False                 # "Show in folder" button state
         self._reveal_pending = False                 # a file manager call is in flight
-        self._shuffle_paths: list[str] = []          # stored shuffle order
+        self._shuffle_paths: list[str] = []          # shuffle order of _shuffle_key's source
+        self._shuffle_key: Optional[str] = None      # the source _shuffle_paths belongs to
         self._shuffle_seed = int(self.settings.shuffle_seed) or 0
+        self._shuffles = ShuffleStore(shuffles_path(self.config_file))
+        self._library_root = ""                     # folder self.tracks was scanned from
         self._row_of_path: dict[str, str] = {}
         self._base_tags: dict[str, tuple] = {}
         self.paned: Optional[ttk.Panedwindow] = None   # set while building the body
@@ -1634,6 +1638,7 @@ class PlayerApp:
             self.settings.shuffle_paths = []
         self.settings.active_playlist = self._active_playlist
         self.settings.queue_source = "playlist" if self._active_playlist else "library"
+        self._migrate_shuffle_order()
         if (self.settings.queue_mode not in library.ORDER_MODES + (library.ORDER_PLAYLIST,)
                 or self.settings.queue_mode == library.ORDER_PLAYLIST and not self._active_playlist):
             self.settings.queue_mode = library.ORDER_DIRECTORY
@@ -2658,9 +2663,6 @@ class PlayerApp:
         self._scan_cancel = threading.Event()
         if self._analysis_running:
             self._analyzer.cancel.set()
-        root_changed = bool(self._directory) and os.path.abspath(path) != self._directory
-        if root_changed and not self._active_playlist:
-            self._reset_shuffle_plan()
         self._directory = path
         self.settings.last_directory = path
         self._save_settings()
@@ -2693,6 +2695,7 @@ class PlayerApp:
         if result.cancelled or (cancel is not None and cancel is not self._scan_cancel):
             return
         self.tracks = result.tracks
+        self._library_root = os.path.abspath(result.root)
         for track in self.tracks:
             track.broken = None
         self.count_label.configure(
@@ -2915,9 +2918,30 @@ class PlayerApp:
                     return path
         return ""
 
+    def _shuffle_source_key(self) -> str:
+        """Identify the collection a shuffle order belongs to: a playlist or a library folder."""
+        if self._active_playlist:
+            return playlist_key(self._active_playlist)
+        return library_key(self._library_root)
+
+    def _migrate_shuffle_order(self) -> None:
+        """Move the single order older versions kept in the settings into the per-source store."""
+        legacy = [p for p in (self.settings.shuffle_paths or []) if isinstance(p, str)]
+        if not legacy:
+            return
+        if self._active_playlist:
+            key = playlist_key(self._active_playlist)
+        else:
+            directory = self.settings.last_directory
+            key = library_key(os.path.abspath(os.path.expanduser(directory)) if directory else "")
+        if key not in self._shuffles and not self._shuffles.put(key, legacy):
+            return                              # keep the old copy until it can be saved
+        self.settings.shuffle_paths = []
+
     def _draw_shuffle_plan(self, new_seed: Optional[int] = None, first: Optional[str] = None,
                            avoid_first: str = "") -> None:
-        """Reuse the saved shuffle seed unless a new order is requested."""
+        """Draw an order for the current source and remember it. Only "Shuffle now", a queue
+        repeat, or a source that has never been shuffled should get here."""
         seed = new_seed
         if seed is None:
             seed = self._shuffle_seed or self.settings.shuffle_seed or \
@@ -2934,34 +2958,25 @@ class PlayerApp:
             if len(slots) > 1 and plan[slots[0]].path == avoid_first:
                 other = random.Random(seed).choice(slots[1:])
                 plan[slots[0]], plan[other] = plan[other], plan[slots[0]]
+        self._shuffle_key = self._shuffle_source_key()
         self._shuffle_paths = [t.path for t in plan]
         self._remember_shuffle_plan()
 
     def _remember_shuffle_plan(self) -> None:
-        if len(self._shuffle_paths) <= MAX_SHUFFLE_PATHS:
-            self.settings.shuffle_paths = list(self._shuffle_paths)
-        else:                                   # keep the config small
-            self.settings.shuffle_paths = []
-
-    def _rotate_shuffle_to_anchor(self) -> None:
-        anchor = self._anchor_path()
-        if anchor:
-            self._shuffle_paths = library.rotate_to_front(self._shuffle_paths, anchor)
-            self._remember_shuffle_plan()
+        if not self._shuffle_paths or self._shuffle_key is None:
+            return
+        if not self._shuffles.put(self._shuffle_key, self._shuffle_paths) and self._shuffles.error:
+            self.log(MSG_WARN, self._shuffles.error)
 
     def _ensure_shuffle_plan(self) -> None:
-        if self._shuffle_paths:
+        """Bring back the saved order of the current source, draw one only if it has none."""
+        key = self._shuffle_source_key()
+        if self._shuffle_key == key and self._shuffle_paths:
             return
-        stored = [p for p in (self.settings.shuffle_paths or []) if isinstance(p, str)]
-        if stored:
-            # from the last session: bring the queue back exactly as it was
-            self._shuffle_paths = stored
-            return
-        self._draw_shuffle_plan()
-
-    def _reset_shuffle_plan(self) -> None:
-        self._shuffle_paths = []
-        self.settings.shuffle_paths = []
+        self._shuffle_key = key
+        self._shuffle_paths = self._shuffles.get(key)
+        if not self._shuffle_paths and self._queue_source_tracks():
+            self._draw_shuffle_plan()
 
     def _refresh_queue_controls(self) -> None:
         self._source_names = [""] + self._playlists.names()
@@ -2989,7 +3004,6 @@ class PlayerApp:
             self._active_playlist = ""
             self._playlist_paths = []
             self._playlist_dirty = False
-            self._reset_shuffle_plan()
             if self.order_var.get() == library.ORDER_PLAYLIST:
                 self.order_var.set(library.ORDER_DIRECTORY)
             self.rebuild_queue(keep_playing=True)
@@ -3002,12 +3016,7 @@ class PlayerApp:
             self.on_order_changed()
 
     def on_order_changed(self) -> None:
-        """Change ordering within the selected source, without redrawing a saved shuffle."""
-        if self.order_var.get() == library.ORDER_SHUFFLE:
-            if self._shuffle_paths:
-                self._rotate_shuffle_to_anchor()
-            else:
-                self._draw_shuffle_plan()
+        """Change ordering within the selected source. A saved shuffle comes back unchanged."""
         self.rebuild_queue()
         if self.order_var.get() == library.ORDER_SHUFFLE:
             self.status("Shuffle queue ready - 'Shuffle now' draws a new order (Ctrl+S)")
@@ -3039,7 +3048,6 @@ class PlayerApp:
             self._active_playlist = ""
             self._playlist_paths = []
             self._playlist_dirty = False
-            self._reset_shuffle_plan()
             self.status("The selected playlist is gone - Library selected (Ctrl+P)")
         if mode not in library.ORDER_MODES + (library.ORDER_PLAYLIST,) or (
                 mode == library.ORDER_PLAYLIST and not self._active_playlist):
@@ -3885,8 +3893,6 @@ class PlayerApp:
         playlist = self._playlists.get(name)
         if playlist is None:
             return
-        if self._active_playlist != playlist.name:
-            self._reset_shuffle_plan()
         self._active_playlist = playlist.name
         self.settings.active_playlist = playlist.name
         self._playlist_paths = list(playlist.paths)
@@ -3948,9 +3954,11 @@ class PlayerApp:
         except PlaylistError as exc:
             messagebox.showerror("Playlists", str(exc))
             return None
+        self._shuffles.rename(playlist_key(old), playlist_key(playlist.name))
         if self._active_playlist.casefold() == str(old or "").strip().casefold():
             self._active_playlist = playlist.name
             self.settings.active_playlist = playlist.name
+            self._shuffle_key = None            # reload the order under its new name
         self.rebuild_queue(keep_playing=True)
         self.status(f"Playlist '{old}' is now '{playlist.name}' (Ctrl+P)")
         return playlist.name
@@ -3961,12 +3969,12 @@ class PlayerApp:
         except PlaylistError as exc:
             messagebox.showerror("Playlists", str(exc))
             return
+        self._shuffles.remove(playlist_key(name))
         if self._active_playlist.casefold() == str(name or "").strip().casefold():
             self._active_playlist = ""
             self.settings.active_playlist = ""
             self._playlist_paths = []
             self._playlist_dirty = False
-            self._reset_shuffle_plan()
             if self.order_var.get() == library.ORDER_PLAYLIST:
                 self.order_var.set(library.ORDER_DIRECTORY)
         self._save_settings()

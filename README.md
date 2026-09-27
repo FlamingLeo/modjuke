@@ -175,7 +175,7 @@ Changing sources keeps the current order choice, except that switching to Librar
 
 **Shuffle now** (Ctrl+S) draws a new order for the current source, keeping the current song first when it belongs to that source. Search and filters narrow that plan without reshuffling it. New songs join the queue without rearranging existing ones, use Shuffle now to mix them in. **Repeat queue** draws a fresh shuffle each round and avoids immediately repeating the last song when another visible song is available.
 
-The selected source, order, and current shuffle survive restarting the app. Changing source or order does not interrupt the current song. Opening/rescanning a folder updates Library without replacing a selected playlist source.
+The selected source, order, and current shuffle survive restarting the app. Every source (each library folder and each playlist) keeps its own shuffle order: switching source or order and back brings the same sequence back. A new order is only drawn by **Shuffle now**, by **Repeat queue** starting a new round, or the first time a source is shuffled. Changing source or order does not interrupt the current song. Opening/rescanning a folder updates Library without replacing a selected playlist source.
 
 ### Automatic analysis
 
@@ -318,6 +318,7 @@ The default data directory is:
 | `playlists.json` | Named playlists and file paths |
 | `listening-stats.json` | Local listening history |
 | `ignored.json` | Exact file paths hidden everywhere (members kept for restoration) |
+| `shuffles.json` | The saved shuffle order of each library folder and playlist |
 
 Back up this directory to retain your preferences and history.
 
