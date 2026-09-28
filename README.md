@@ -1,55 +1,49 @@
 # modjuke
 
-![interface](img/player.png)
-
-A desktop tracker-music player built with [**libopenmpt**](https://lib.openmpt.org/libopenmpt/) and [**Tkinter**](https://docs.python.org/3/library/tkinter.html).
+A desktop tracker-music player built with **C++20**, [**Qt 6**](https://www.qt.io/) and [**libopenmpt**](https://lib.openmpt.org/libopenmpt/).
 
 ## Features
 
 - Folder scanning, search, and filters for format, duration, and playable files.
-- **Automatic background analysis** for module lengths, formats, channel counts, and titles.
+- Automatic background analysis of library modules for lengths, formats, channel counts, subsong counts, and titles.
 - Playlists with automatic saving, drag-to-reorder, and M3U import/export.
 - Favorites and ignore lists.
-- A tracker view with optional smooth following.
+- A tracker view with centered playback following and optional smooth scrolling.
 - Song information, sample/instrument names, and module comments.
-- Track looping, queue repeat, and shuffle.
-- Configurable audio backends, output sample rate, interpolation, buffering, and device latency.
-- Five built-in themes plus custom themes with a visual colour editor.
+- Track looping, queue repeat, persistent shuffle orders, and subsong selection.
+- Configurable output sample rate, interpolation, buffering, and silent playback.
+- Five built-in themes plus custom themes with a visual color editor.
 - Optional session restoration and local listening history.
+- Selectable queue columns with independently saved visibility preferences.
 
 ## Requirements
 
-- Python **3.9 or newer**.
-- [Tkinter](https://docs.python.org/3/library/tkinter.html) for the graphical interface.
-- The **[libopenmpt](https://lib.openmpt.org/libopenmpt/) shared library**, installed separately from the Python packages.
-- [NumPy](https://numpy.org/) and at least one audio backend for audible playback: [`sounddevice`](https://python-sounddevice.readthedocs.io/en/0.5.3/) or [`soundcard`](https://soundcard.readthedocs.io/en/latest/).
+- A **C++20** compiler, **CMake 3.22+**, and a build system such as Ninja.
+- **Qt 6.4+** development packages: Core, Gui, Widgets, Multimedia, and DBus.
+- The **libopenmpt shared library**, installed separately. The player loads it at runtime. libopenmpt headers are not required.
+- For audible playback, an available system audio output supported by Qt Multimedia.
 
 ## Installation (Linux, per-user)
 
-Install the external system dependencies first.
+Install the system dependencies first. For example:
 
 ```bash
 sudo apt update
-sudo apt install python3-venv python3-tk libopenmpt0t64 libportaudio2 libpulse0 libasound2-plugins
+sudo apt install build-essential cmake ninja-build qt6-base-dev qt6-multimedia-dev libopenmpt0t64
 ```
 
 > [!IMPORTANT]
-> On older Debian/Ubuntu-based releases, use `libopenmpt0` instead of `libopenmpt0t64` if that is the available package. On other Linux distributions, install the equivalent Python/venv, Tk, libopenmpt, PortAudio and PulseAudio client packages with your package manager. A PulseAudio-compatible service is needed to use the SoundCard backend on Linux, this is commonly provided by PulseAudio or PipeWire.
+> On older Debian/Ubuntu releases, use `libopenmpt0` if that is the available package. Other distributions use equivalent Qt and libopenmpt packages. Qt Multimedia uses the system audio service. a PulseAudio-compatible service is commonly provided by PulseAudio or PipeWire on Linux.
 
-Then install modjuke:
+From the extracted repository directory:
 
 ```bash
-sh install.sh
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build build --parallel 2
+cmake --install build
 ```
-
-If you're interested, the installer:
-
-- Checks Python 3.9+, Tkinter, libopenmpt and PortAudio.
-- Installs the application and its Python dependencies in a private virtual environment.
-- Adds `modjuke` and `modjuke-uninstall` to `~/.local/bin`.
-- Adds an application-menu entry and icon.
-
-**No native libraries are bundled in the release ZIP or copied from the system.** Tk, libopenmpt, PortAudio and the PulseAudio client library remain external system dependencies. Python packages such as NumPy, SoundDevice and SoundCard are installed separately into the private environment.
 
 Launch **modjuke** from the application menu, or run:
 
@@ -58,137 +52,91 @@ Launch **modjuke** from the application menu, or run:
 ~/.local/bin/modjuke --check
 ```
 
-If `~/.local/bin` is already on your `PATH`, the short command `modjuke` works too. Otherwise add this line to your shell profile and open a new terminal:
+If `~/.local/bin` is on your `PATH`, the shorter `modjuke` command works too. Otherwise add this line to your shell profile and open a new terminal:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-After a successful installation, the extracted source directory can be moved or deleted.
+### Updates and removal
 
-#### Updates and removal
+Close the player, extract the new source, and repeat the configure, build, and install commands with the same installation prefix. This replaces the installed executable and resources, not your settings or music. This CMake installation does not manage previous releases or automatic rollback.
 
-Close modjuke, extract a newer release, and run `sh install.sh` again. A fresh environment is prepared and checked before switching the launcher to it. A failed dependency installation leaves the previous version in place. The immediately previous release is retained, and older installer-owned releases are cleaned up on subsequent successful updates.
-
-To uninstall, close the application and run:
+Uninstall with the included script:
 
 ```bash
-~/.local/bin/modjuke-uninstall
+./uninstall.sh
 ```
 
-You can also use `sh install.sh --uninstall` from an extracted release, with the same `XDG_DATA_HOME` used for installation. Removal keeps your configuration, cached metadata, playlists, listening history and music. Modified launcher/menu/icon files and unrelated files in the installation directory are preserved with a notice.
+It removes the paths recorded in `build/install_manifest.txt`. If that manifest is unavailable, it removes the standard `~/.local` installation. For another prefix, specify it explicitly:
 
-#### Locations and installer options
+```bash
+./uninstall.sh --prefix /usr/local
+```
 
-| Item | Default location |
+For a system-wide installation, run the script with the privileges needed to remove those files (for example, `sudo ./uninstall.sh --prefix /usr/local`). Removal leaves your configuration, cached metadata, playlists, listening history, and music intact.
+
+### Locations
+
+| Item | Default per-user location |
 | --- | --- |
-| Application and private environments | `~/.local/share/modjuke/` |
-| Terminal commands | `~/.local/bin/modjuke`, `~/.local/bin/modjuke-uninstall` |
+| Executable | `~/.local/bin/modjuke` |
 | Menu entry | `~/.local/share/applications/modjuke.desktop` |
-| Icon | `~/.local/share/icons/modjuke.png` |
+| Icon | `~/.local/share/icons/hicolor/256x256/apps/modjuke.png` |
+| Configuration and local data | `~/.config/modjuke/`, unless `XDG_CONFIG_HOME` is set |
 
-> [!NOTE]
-> `XDG_DATA_HOME`, if set to an absolute path, replaces `~/.local/share` for the application, menu entry and icon. It does not change the configuration directory described below. A small `.modjuke-install.lock` file in the data directory prevents concurrent installs/uninstalls.
+After installation, the source directory can be moved or deleted. Qt and libopenmpt must remain installed on the system.
 
-```bash
-sh install.sh --check                    # check native prerequisites only
-sh install.sh --help
-PYTHON=/usr/bin/python3 sh install.sh    # choose a Python interpreter
-```
+### Run without installing
 
-If you use a custom `MODJUKE_LIBOPENMPT` path during installation, a successfully loaded override is recorded in the launcher so menu launches can find it too. An explicit runtime override takes precedence.
-
-The release layout keeps image assets separate from the Python package:
-
-```text
-img/
-  modjuke.png
-modjuke/
-install.py
-install.sh
-pyproject.toml
-requirements.txt
-README.md
-```
-
-The installer reads the application icon from `img/modjuke.png` and installs it into the icon directory listed above. The same PNG is used for application windows and is included in pip-installed packages, no image-processing dependency is needed. Upgrades remove an old installer-owned icon only if its contents are unchanged, modified icons are preserved.
-
-### Manual installation with pip
-
-If you prefer managing the environment yourself, install the native dependencies, then run these commands from the directory containing `pyproject.toml`:
+After building, run directly from the repository:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install ".[audio]"
-modjuke --check
-modjuke
+./build/modjuke
+./build/modjuke --check
 ```
 
-With this method, activate the environment in each new terminal. It does not create a menu entry, the per-user installer above does.
-
-### Other platforms
-
-Install Python with Tkinter, libopenmpt, and any native audio libraries required by your chosen backend. Then create a virtual environment and run `python -m pip install ".[audio]"` from the project directory.
-
-- **Windows:** use `python -m venv .venv` and activate with `.venv\Scripts\Activate.ps1` in PowerShell. Install a libopenmpt DLL matching Python's architecture and ensure its dependencies are available.
-- **macOS:** libopenmpt and PortAudio are available through Homebrew (`brew install libopenmpt portaudio`). Ensure Tkinter is installed for the Python version you use.
-
-If automatic library detection fails, set `MODJUKE_LIBOPENMPT` to the full path of the shared library. For example, on Linux:
+If automatic libopenmpt detection fails, set its full shared-library path:
 
 ```bash
-export MODJUKE_LIBOPENMPT=/full/path/to/libopenmpt.so
+MODJUKE_LIBOPENMPT=/full/path/to/libopenmpt.so.0 ./build/modjuke
 ```
 
-Use the appropriate `.dll` or `.dylib` path on Windows or macOS.
-
-### Run without installing the application package
-
-From the extracted project directory, inside an activated virtual environment:
-
-```bash
-python -m pip install -r requirements.txt
-python -m modjuke
-```
-
-System dependencies such as Tkinter and libopenmpt are still required.
+The override is a runtime environment variable, not a path recorded by the CMake installer. Set it in your launch environment if it is also needed for application-menu launches.
 
 ## Getting started
 
 1. Open a folder with **Ctrl+O**, or use **Playlists** to add individual files.
-2. Let automatic analysis fill in the module details. Playback can continue while it runs.
+2. Let automatic analysis fill in library module details. Playback can continue while it runs.
 3. Double-click a queue entry, or select it and press **Enter**, to play.
 4. Switch between **Player** and **Tracker** with the tabs or **Ctrl+T**.
 
-Search narrows the displayed queue. The Filter dialog adds format, duration, and playable-only criteria. Use **Rescan** or **F5** to find files added or changed outside the application.
+Search narrows the displayed queue. The Filter dialog adds format, duration, and playable-only criteria. Use **Rescan** or **F5** to discover files added or changed outside the application.
 
 ### Queue source and order
 
 Use **Source** to choose **Library** or a saved playlist, including Favorites. **Order** applies only to that source:
 
-- **By directory** groups the songs into folder branches in one queue.
+- **By directory** groups songs into folder branches in one queue.
 - **Alphabetical** shows one list sorted by filename.
-- **Shuffle** shuffles the selected library or playlist, without creating another playlist or changing its saved order.
+- **Shuffle** shuffles the selected library or playlist without changing its saved order.
 - **Saved order** is available for playlists. Use it to view and edit their stored sequence.
 
-Changing sources keeps the current order choice, except that switching to Library changes Saved order to By directory. The **Playlists → Load** action also selects a source without changing the order choice. Saving the current queue as a new playlist, or importing an M3U, opens it in Saved order.
+Changing sources keeps the current order choice, except that switching to Library changes Saved order to By directory. **Playlists → Load** also selects a source without changing the order choice. Saving the current queue as a new playlist, or importing an M3U, opens it in Saved order.
 
-**Shuffle now** (Ctrl+S) draws a new order for the current source, keeping the current song first when it belongs to that source. Search and filters narrow that plan without reshuffling it. New songs join the queue without rearranging existing ones, use Shuffle now to mix them in. **Repeat queue** draws a fresh shuffle each round and avoids immediately repeating the last song when another visible song is available.
+**Shuffle now** (**Ctrl+S**) draws a new order for the current source, keeping the current song first when it belongs to that source. Search and filters narrow that plan without reshuffling it. New songs join the queue without rearranging existing ones. use Shuffle now to mix them in. **Repeat queue** draws a fresh shuffle each round and avoids immediately repeating the last song when another visible song is available. Ignoring the final queued song also starts a fresh round when both Shuffle and Repeat queue are enabled.
 
-The selected source, order, and current shuffle survive restarting the app. Every source (each library folder and each playlist) keeps its own shuffle order: switching source or order and back brings the same sequence back. A new order is only drawn by **Shuffle now**, by **Repeat queue** starting a new round, or the first time a source is shuffled. Changing source or order does not interrupt the current song. Opening/rescanning a folder updates Library without replacing a selected playlist source.
+The selected source, order, and current shuffle survive restarting the app. Each library folder and playlist keeps its own shuffle order. Switching source or order and back brings the same sequence back. Changing source or order does not interrupt the current song and reveals it at the top of the visible queue if it is included. Opening or rescanning a folder updates Library without replacing a selected playlist source.
+
+Use **Columns** to show or hide Folder, Length, Format, Channels, and Subsongs. Module always remains visible. The **Ch** and **Ss** headers show channel and subsong counts. **Ctrl+0** resets column widths and layout without changing your column visibility choices.
 
 ### Automatic analysis
 
-**Settings → Analyze files automatically** is on by default, including when loading an older configuration that does not contain this setting.
+**Settings → Analyze new files automatically** is on by default. Opening or rescanning the library starts background analysis of missing details, including library files hidden by search or filters. Matching cached metadata is reused. Analysis populates lengths, titles, formats, and channel/subsong counts without requiring playback.
 
-Folder loads, rescans and playlist updates initiate a background analysis. This includes additions and M3U imports, as well as files hidden by search or filters. Matching cached details are reused, and only new or changed files are analyzed as needed. Files discovered during an active batch are picked up afterward.
+Turn the setting off and save to prevent future automatic batches. An existing batch can be canceled using the analysis button. **Analyze** remains available for manual library analysis. after re-enabling automatic analysis, rescan to pick up missing details. **Keep duration/title details (analysis cache)** controls whether newly analyzed metadata is saved for later runs.
 
-To reduce background CPU or disk activity, turn the setting off and press **Save**. Pending automatic work stops after the current file finishes. The **Analyze** button remains available for manual use. Re-enabling automatic analysis catches up on missing details.
-
-**Keep module details** is a separate setting controlling retention of the metadata cache between runs.
-
-> [!IMPORTANT]
-> Automatic analysis does not mean automatic filesystem watching. Use Rescan to discover external changes to an open folder. The headless `--scan` command also has its own explicit `--analyze` option.
+Automatic analysis covers the open library. playlist-only additions are not automatically analyzed. Analysis also does **not** watch the filesystem. Use Rescan to discover external changes. The headless `--scan` command has a separate explicit `--analyze` option.
 
 ### Playlists
 
@@ -201,53 +149,81 @@ While a playlist is loaded:
 
 ### Favorites
 
-- Click **☆** in the Player’s song-info panel to add the currently loaded song to Favorites. A filled **★** means it is saved, click again to remove it. 
-- Select one or more queue songs, then **right-click → Add to Favorites**. Duplicate entries are skipped. You can also choose Favorites from **Add to playlist**.
-- Choose **Source → Playlist: Favorites** to browse it. Use **Order → Shuffle** to shuffle Favorites or **Saved order** to edit its sequence.
-- Favorites cannot be renamed or deleted. **Clear Favorites** removes all entries after confirmation, but keeps the playlist and your music files.
+- Click **☆** in the Player's song-info panel to add the loaded song to Favorites. **★** means it is saved. click again to remove it.
+- Select queue songs, then **right-click → Add to Favorites**. Duplicate entries are skipped. Favorites is also available under **Add to playlist**.
+- Choose **Source → Playlist: Favorites** to browse it. Use **Shuffle** to shuffle Favorites or **Saved order** to edit its sequence.
+- Favorites cannot be renamed or deleted. **Clear Favorites** removes its entries after confirmation, but keeps the playlist and your music files.
 
-Favorites is saved in `playlists.json` beside your settings. An existing playlist named Favorites (case-insensitively) is reused with its contents and spelling preserved. 
-
->[!NOTE]
->Importing `Favorites.m3u` creates a separately named playlist rather than overwriting Favorites.
+Favorites is stored in `playlists.json`. An existing playlist named Favorites, case-insensitively, is reused with its contents and spelling preserved. Importing `Favorites.m3u` creates a separately named playlist instead of overwriting Favorites.
 
 ### Tracker and song information
 
-The Tracker view displays the song's patterns. **Following** keeps the playback row in view, scrolling manually switches following off. Use **Follow** to return to playback following. **Shift+wheel** scrolls across channels when they do not all fit.
+The Tracker view displays the module's patterns. **Following** keeps the playback row centered. scrolling manually switches following off. Use **Follow** to resume. **Shift+wheel** scrolls across channels when they do not all fit.
 
-**Smooth tracker scrolling** is off by default, enable it in Settings.
+**Smooth tracker scrolling** is off by default. enable it in Settings. Folder and source/queue toolbar rows are hidden in Tracker, while playback and queue state are retained. Open **Song info** with **Ctrl+I** for sample/instrument names and comments.
 
-Open **Song info** with **Ctrl+I** for sample/instrument names and comments.
+### Subsongs
+
+Some files contain multiple songs or independent sequences recognized by libopenmpt. The Player's subsong selector is numbered starting at **1**. Choosing a subsong restarts it, preserves pause, and turns off **Play all subsongs**.
+
+- A newly selected file starts at its first subsong.
+- Session restoration can reopen the saved subsong and position, paused.
+- **Play all subsongs** is off by default. Enabling it starts at the first subsong and plays the sequence before advancing to the next file, when auto-advance is enabled. Loop repeats the whole sequence in this mode.
+- Time and seeking refer to the current subsong, not a combined timeline.
+- The queue, Next, and Previous remain **file-based**. subsongs do not become separate queue entries.
+
+Subsong detection depends on libopenmpt and can include alternate starting positions. A module that never ends naturally cannot advance automatically.
 
 ## Settings and audio
 
-Use **Save** to apply and remember settings. **Cancel** discards pending changes, interpolation previews are restored on cancellation.
+Use **Save** to apply and remember settings. **Cancel** discards pending preference and theme changes. The ignored-song manager performs its own changes immediately. those are not rolled back by canceling Settings.
 
 | Setting | Default / behavior |
 | --- | --- |
-| Analyze files automatically | On, incremental background metadata reads |
-| Keep module details | On, reuse cached metadata between runs |
-| Pick up where you left off | On, restore the last module paused at its saved position |
-| Keep listening stats | On, local play counts and playback time |
-| Smooth tracker scrolling | Off, optional smooth playback following |
-| Colour scheme | Dark, changes apply on Save without restarting |
-| Update rate | 60 redraws per second, lower rates reduce UI work |
-| Audio backend | Auto: try SoundDevice, then SoundCard, then silent output |
-| Output sample rate | Device default |
-| Interpolation | Sinc, off, linear, and cubic are also available |
-| Buffer | 220 ms of audio rendered ahead |
-| Device latency | 20 ms target, actual latency depends on the device/backend |
-| Restart budget | 3 automatic recovery attempts per track, 0 disables retries |
+| Analyze new files automatically | On. background analysis when opening/rescanning the library |
+| Keep duration/title details | On. save analyzed metadata for reuse |
+| Remember the subsong and playing position | On. restore the last module paused |
+| Record local listening stats | On. local play counts and playback time |
+| Smooth tracker scrolling | Off. optional smooth playback following |
+| Theme | Dark. applies on Save without restarting |
+| Window title | Track name. module title, filename, and no track information are also available |
+| UI refresh | 60 updates per second. adjustable from 5 to 120 |
+| Audio backend | Default output through Qt Multimedia. silent fallback when unavailable |
+| Sample rate | Device default. common fixed rates are also available |
+| Interpolation | Sinc. off, linear, and cubic are also available |
+| Buffer | 220 ms requested audio buffer |
+| Don't ask again when ignoring songs | Off. uncheck to restore the confirmation |
 
-Changing the output sample rate can briefly restart audio. A higher device-latency target can help on systems that crackle or underrun under load. 
+The CLI backend names are **`auto`** and **`null`**. Changing audio settings can briefly restart output. Theme changes alone do not restart playback. The requested buffer size is not a guarantee of end-to-end device latency.
+
+Device-latency and watchdog/restart-budget fields are not active Qt controls. This player does not implement an audio watchdog.
 
 ### Custom themes
 
-In **Settings → Colour scheme**, choose **New theme…** to start from the selected palette. The separate editor groups all 33 shared colour roles into surfaces, text/accents, status/meters, tracker, seek bar and tracker effects. Select a role or click the sample preview, then use **Choose colour…** or enter a `#RRGGBB` value. Give the theme a unique name and press **Use theme** to return to Settings.
+In **Settings → Appearance → Theme**, select a starting palette and choose **New theme…**. The editor groups all **33 color roles** into:
 
-Saved custom themes appear in the same selector. **Edit…** updates them, and **Delete** schedules removal when you save Settings. Built-in themes cannot be overwritten or deleted, use New theme to copy one. Custom definitions live in `custom_themes` in the existing settings JSON, alongside the selected theme. Up to 100 custom themes can be stored.
+- Surfaces
+- Text and accents
+- Status and meters
+- Tracker
+- Seek bar
+- Tracker effects
 
-A saved custom theme can also be selected by name: `modjuke --theme "My theme"`.
+Select a role in the list or click the sample preview. Use **Choose color…**, or enter a six-digit **`#RRGGBB`** value. The preview updates locally without recoloring the player or changing its audio. The preview also supports arrow-key role selection. A main-text contrast hint helps spot hard-to-read combinations without preventing intentional low-contrast themes.
+
+**Reset color** restores the selected color to its value when the editor opened. **Reset all colors…** restores the entire starting palette after confirmation, keeping the name.
+
+Give the theme a unique name of 1–60 characters, then press **Use theme** to return to Settings. Press **Save** in Settings to apply and persist it. Canceling the editor discards that edit. canceling Settings discards all staged theme creations, edits, and deletions.
+
+Saved custom themes appear as **Name (custom)**. **Edit…** updates or renames the selected custom theme without changing its ID. **Delete** schedules its removal after confirmation and selects Dark. Built-in themes cannot be overwritten or deleted. use New theme to copy one. Up to **100 custom themes** can be stored. Built-in names and aliases, duplicate names ignoring case, control characters, and the `custom:` name prefix are not allowed.
+
+The built-in themes are **Dark**, **Light**, **Midnight**, **High contrast**, and **Amber CRT**. A saved custom theme can also be selected by name:
+
+```bash
+modjuke --theme "My theme"
+```
+
+Custom definitions are stored under `custom_themes` in `config.json`, with a stable `custom:<id>` and all 33 roles. The JSON key **`colours`** is retained for backwards compatibility. the UI and documentation otherwise use American English.
 
 ## Keyboard and mouse controls
 
@@ -255,13 +231,14 @@ A saved custom theme can also be selected by name: `modjuke --theme "My theme"`.
 | --- | --- |
 | Space | Play / pause |
 | Enter in the queue | Play the selected track |
-| Page Up / Page Down | Previous / next track, Previous restarts the current track when past 3 seconds |
+| Page Up / Page Down | Previous / next file. Previous restarts the current song when past 3 seconds |
 | Left / Right | Seek backward / forward 5 seconds |
 | Ctrl+Left / Ctrl+Right | Seek backward / forward 30 seconds |
 | Up / Down in the queue | Move selection |
 | L / R / M | Toggle track loop / queue repeat / mute |
 | + / − | Increase / decrease volume |
-| Wheel over volume controls | Adjust volume |
+| 0 | Set volume to zero |
+| Wheel over the volume slider | Adjust volume |
 | F1 | Open About |
 | Ctrl+O | Open a folder |
 | F5 | Rescan the current folder |
@@ -275,7 +252,7 @@ A saved custom theme can also be selected by name: `modjuke --theme "My theme"`.
 | Ctrl+I | Open Song info |
 | Ctrl+H | Open Listening stats |
 | Ctrl+R | Show the playing file in the file manager |
-| Ctrl+0 | Reset the queue layout |
+| Ctrl+0 | Reset queue widths/layout, retaining column visibility |
 
 ## Command-line examples
 
@@ -284,17 +261,16 @@ A saved custom theme can also be selected by name: `modjuke --theme "My theme"`.
 modjuke ~/Music/Modules
 modjuke ~/Music/Modules --autoplay
 
-# Choose a theme or audio backend
+# Choose a theme and output backend
 modjuke --theme amber
-modjuke --backend sounddevice --volume 70
-modjuke --backend soundcard
+modjuke --backend auto --volume 70
 
 # Run without audible output
 modjuke --backend null
 
 # List a directory without opening the GUI
 modjuke --scan ~/Music/Modules
-modjuke --scan ~/Music/Modules --analyze --order alphabetical
+modjuke --scan ~/Music/Modules --analyze --order
 
 # Diagnostics
 modjuke --check
@@ -302,42 +278,59 @@ modjuke --version
 modjuke --help
 ```
 
-Other options include `--interpolation off|linear|cubic|sinc`, `--track FILE`, and the testing-oriented `--speed N`. `--track FILE` plays exactly that file once startup scanning finishes (or immediately when no scan is needed), without replacing the selected library/playlist or its queue. It takes precedence over `--autoplay` and session restoration.
+For the headless scanner, **`--order` is a flag** that requests alphabetical sorting. it does not take `alphabetical` as an argument. Scanning prints a text listing, not JSON. `--scan`, `--check`, and `--version` do not need a display. GUI commands and `--help` initialize Qt Widgets.
+
+Other options include `--dir PATH`, `--interpolation off|linear|cubic|sinc`, `--track FILE`, and `--speed N`. `--track FILE` requests that file at startup without replacing the selected library/playlist source. It takes precedence over autoplay and session restoration.
 
 ## Local data
 
-The default data directory is:
-
-- **Linux/macOS:** `$XDG_CONFIG_HOME/modjuke`, or `~/.config/modjuke` when that variable is not set.
-- **Windows:** `%APPDATA%\modjuke`, falling back to a `modjuke` folder in the home directory if `APPDATA` is unavailable.
+On Linux, the data directory is **`$XDG_CONFIG_HOME/modjuke`**, or **`~/.config/modjuke`** when the variable is not set.
 
 | File | Contents |
 | --- | --- |
-| `config.json` | Preferences, session information, and window state |
+| `config.json` | Shared preferences, custom themes, session information, and window state |
 | `analysis.json` | Cached module metadata |
 | `playlists.json` | Named playlists and file paths |
 | `listening-stats.json` | Local listening history |
-| `ignored.json` | Exact file paths hidden everywhere (members kept for restoration) |
-| `shuffles.json` | The saved shuffle order of each library folder and playlist |
+| `ignored.json` | Exact file paths hidden everywhere. playlist membership is retained for restoration |
+| `shuffles.json` | Saved shuffle order for each library folder and playlist |
+| `qt-ui.json` | Qt-only ignore confirmation, Play all subsongs, and hidden queue columns |
 
-Back up this directory to retain your preferences and history.
+Back up this directory to retain preferences and history. The first six files contain shared preferences and data, including the custom-theme format. Qt-only preferences are kept separate. Run one application at a time against a shared data directory to avoid competing saves.
+
+The app starts a fresh shuffle round when ignoring the final song with Repeat queue enabled.
+
+For a separate Qt profile, set `XDG_CONFIG_HOME` to a different base directory before launching:
+
+```bash
+XDG_CONFIG_HOME="$HOME/.config/modjuke-profile" modjuke
+```
 
 ## Troubleshooting
 
 **The player runs, but there is no sound**  
-Run `modjuke --check` and inspect the selected output in the application. The `null` backend is intentionally silent. Check mute, volume, the system output device, and whether an audio backend is installed. Try selecting SoundDevice or SoundCard explicitly.
+Run `modjuke --check`, then inspect the output shown in the application. The check command validates libopenmpt and prints saved preferences. it is not a speaker check. The `null` backend is intentionally silent. Select Default output, check mute and volume, and verify the system output device and Qt Multimedia installation. Qt may fall back to silent output when no audio device is available.
 
 **libopenmpt could not be found**  
-Install the native shared library, not just the Python dependencies. If needed, set `MODJUKE_LIBOPENMPT` to its full path. On Windows, check DLL architecture and dependent DLLs as well.
+Install the native shared library. If needed, set `MODJUKE_LIBOPENMPT` to its full path. libopenmpt development headers are not required.
 
-**Tkinter is unavailable**  
-Install Tkinter for the Python interpreter used by your virtual environment. On Debian/Ubuntu-based systems this is typically `python3-tk`.
+**Qt reports a missing platform or multimedia plugin**  
+Install the distribution's Qt platform/Multimedia runtime packages. Keep plugins and Qt libraries from the same installation. do not point `QT_PLUGIN_PATH` at a different Qt version. Use `QT_DEBUG_PLUGINS=1` for diagnostics. A desktop display session is required for the graphical player.
 
 **Audio crackles or drops out**  
-Increase **Device latency (ms)**, try another backend, or lower the UI update rate. For very large libraries, temporarily disable automatic analysis. Bluetooth and system audio buffering can add latency beyond the requested target.
+Increase Buffer, lower UI refresh, or temporarily disable automatic analysis. Check system audio configuration and load. Bluetooth and system buffering can add latency beyond the requested buffer size. Device-latency and backend switches do not configure Qt output.
 
 **New files are not appearing**  
-Use Rescan or F5. Automatic analysis processes discovered files, it does not monitor filesystem changes continuously.
+Use Rescan or F5. Automatic analysis processes discovered library files. it does not continuously monitor filesystem changes.
 
-**A module is marked unreadable or behaves unexpectedly**  
-Check the log and try the file with another libopenmpt-based player. Format support depends on the installed library, and damaged modules may not load. modjuke includes configurable recovery and auto-skip safeguards, but these cannot repair a damaged file.
+**A custom theme is hard to read**  
+Restart with `modjuke --theme dark` or `--theme light`, then edit the custom palette in Settings. Unsaved preview changes affect only the editor.
+
+**Settings cannot be saved**  
+Check permissions and free space in the configuration directory. An unreadable or malformed `qt-ui.json` is not overwritten silently. back it up and repair or move it aside if appropriate. The Settings dialog keeps its drafts open for retry after a failed save.
+
+**A module is unreadable or behaves unexpectedly**  
+Check terminal diagnostics and try the file in another libopenmpt-based player. Format support and subsong detection depend on the installed library. Damaged files may not load, and the player cannot repair them.
+
+The archive contains application source and resources only—not build outputs or historical verification captures.
+

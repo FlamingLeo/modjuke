@@ -1,0 +1,18 @@
+<RCC><qresource prefix="/arrows">
+<file alias="down-black-disabled.png">arrows/down-black-disabled.png</file>
+<file alias="down-black.png">arrows/down-black.png</file>
+<file alias="down-white-disabled.png">arrows/down-white-disabled.png</file>
+<file alias="down-white.png">arrows/down-white.png</file>
+<file alias="left-black-disabled.png">arrows/left-black-disabled.png</file>
+<file alias="left-black.png">arrows/left-black.png</file>
+<file alias="left-white-disabled.png">arrows/left-white-disabled.png</file>
+<file alias="left-white.png">arrows/left-white.png</file>
+<file alias="right-black-disabled.png">arrows/right-black-disabled.png</file>
+<file alias="right-black.png">arrows/right-black.png</file>
+<file alias="right-white-disabled.png">arrows/right-white-disabled.png</file>
+<file alias="right-white.png">arrows/right-white.png</file>
+<file alias="up-black-disabled.png">arrows/up-black-disabled.png</file>
+<file alias="up-black.png">arrows/up-black.png</file>
+<file alias="up-white-disabled.png">arrows/up-white-disabled.png</file>
+<file alias="up-white.png">arrows/up-white.png</file>
+</qresource></RCC>

@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/modjuke">
+    <file alias="icon.png">modjuke.png</file>
+  </qresource>
+</RCC>
