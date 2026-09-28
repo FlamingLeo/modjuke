@@ -26,7 +26,6 @@ class QCheckBox;
 class QComboBox;
 class QSplitter;
 class QStackedWidget;
-class QDockWidget;
 class QTabBar;
 class QTimer;
 class TrackerView;

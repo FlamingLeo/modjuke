@@ -9,7 +9,6 @@
 #include <QApplication>
 #include <QContextMenuEvent>
 #include <QDir>
-#include <QDockWidget>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QRandomGenerator>
@@ -842,8 +841,9 @@ void MainWindow::buildTransport()
 
 void MainWindow::buildStatusBar()
 {
-    // the Tk layout ends with a status row and the transport below it; stack
-    // both in one chrome-less bottom dock, status first.
+    // Keep status and transport inside the central layout. A QDockWidget would
+    // add a vertical splitter handle above these rows, letting the bottom area
+    // be resized independently from the player.
     auto *bar = new QWidget(this);
     bar->setObjectName(QStringLiteral("barPanel"));
     auto *row = new QHBoxLayout(bar);
@@ -862,22 +862,13 @@ void MainWindow::buildStatusBar()
     playlistsBtn_->setToolTip(tr("Save the queue as a playlist (Ctrl+P)"));
     healthLabel_->setToolTip(tr("Layout reset: Ctrl+0"));
 
-    auto *bottom = new QWidget(this);
+    auto *bottom = new QWidget(centralWidget());
     auto *bl = new QVBoxLayout(bottom);
     bl->setContentsMargins(0, 0, 0, 0);
     bl->setSpacing(0);
     bl->addWidget(bar);
     bl->addWidget(transportBar_);
-    auto *dock = new QDockWidget(this);
-    dock->setObjectName(QStringLiteral("bottomDock"));
-    dock->setFeatures(QDockWidget::NoDockWidgetFeatures);
-    dock->setAllowedAreas(Qt::BottomDockWidgetArea);
-    auto *emptyTitle = new QWidget(dock);
-    emptyTitle->setFixedHeight(0);
-    dock->setTitleBarWidget(emptyTitle);
-    dock->setWidget(bottom);
-    dock->setAllowedAreas(Qt::BottomDockWidgetArea);
-    addDockWidget(Qt::BottomDockWidgetArea, dock);
+    centralWidget()->layout()->addWidget(bottom);
 }
 
 void MainWindow::bindShortcuts()
