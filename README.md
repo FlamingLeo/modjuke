@@ -1,5 +1,7 @@
 # modjuke
 
+![player](resources/player.png)
+
 A desktop tracker-music player built with **C++20**, [**Qt 6**](https://www.qt.io/) and [**libopenmpt**](https://lib.openmpt.org/libopenmpt/).
 
 ## Features
