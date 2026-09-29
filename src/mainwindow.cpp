@@ -498,16 +498,14 @@ void MainWindow::buildPlayerPage()
     auto *columnsMenu = new QMenu(tr("Columns"), queueView_);
     columnsMenu->setObjectName(QStringLiteral("queueColumnsMenu"));
     columnsMenu->setToolTipsVisible(true);
-    for (int c = QueueModel::Module; c < QueueModel::COLUMN_COUNT; ++c) {
+    // Module is the queue's identity column and is always visible. Do not
+    // include it in this menu: an unavailable option is clearer when omitted
+    // than when it looks like a disabled toggle.
+    for (int c = QueueModel::Folder; c < QueueModel::COLUMN_COUNT; ++c) {
         auto *action = columnsMenu->addAction(QueueModel::columnName(c));
         action->setObjectName(QStringLiteral("queueColumn_") + QueueModel::columnKey(c));
         action->setCheckable(true);
         action->setChecked(!queueView_->isColumnHidden(c));
-        if (c == QueueModel::Module) {
-            action->setEnabled(false);
-            action->setToolTip(tr("Module is always shown."));
-            continue;
-        }
         connect(action, &QAction::toggled, this, [this, action, c](bool shown) {
             const QStringList previous = settings_.hiddenQueueColumns;
             const QString key = QueueModel::columnKey(c);
