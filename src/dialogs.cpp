@@ -875,9 +875,8 @@ AboutDialog::AboutDialog(QWidget *parent, const QString &libopenmptVersion, bool
 {
     setWindowTitle(tr("About modjuke"));
     auto *root = new QVBoxLayout(this);
-    root->addWidget(new QLabel(tr("<h2>modjuke</h2>"), this));
-    root->addWidget(new QLabel(tr("A tracker-music player for the desktop.<br/>"
-                                  "C++/Qt port - plays MOD, XM, IT, S3M and friends "
+    root->addWidget(new QLabel(tr("Made by FlamingLeo, 2026.<br/>"
+                                  "Plays MOD, XM, IT, S3M and friends "
                                   "through libopenmpt.<br/>"
                                   "Project page: <a href=\"https://github.com/FlamingLeo/modjuke\">"
                                   "github.com/FlamingLeo/modjuke</a>"),

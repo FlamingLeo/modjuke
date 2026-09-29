@@ -456,7 +456,7 @@ int QueueTableView::minimumColumnWidth(int column) const
 
 void QueueTableView::resetColumnWidths()
 {
-    static constexpr int defaults[QueueModel::COLUMN_COUNT] = {300, 170, 54, 52, 34, 34};
+    static constexpr int defaults[QueueModel::COLUMN_COUNT] = {300, 170, 54, 52, 44, 44};
     auto *header = horizontalHeader();
     header->setStretchLastSection(false);
     header->setMinimumSectionSize(1);
