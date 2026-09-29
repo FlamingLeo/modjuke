@@ -6,6 +6,7 @@
 #include "themeeditor.h"
 #include <QUuid>
 #include <QSignalBlocker>
+#include <QtGlobal>
 
 #include <QDateTime>
 #include <QDialogButtonBox>
@@ -875,20 +876,28 @@ AboutDialog::AboutDialog(QWidget *parent, const QString &libopenmptVersion, bool
 {
     setWindowTitle(tr("About modjuke"));
     auto *root = new QVBoxLayout(this);
-    root->addWidget(new QLabel(tr("Made by FlamingLeo, 2026.<br/>"
-                                  "Plays MOD, XM, IT, S3M and friends "
-                                  "through libopenmpt.<br/>"
-                                  "Project page: <a href=\"https://github.com/FlamingLeo/modjuke\">"
-                                  "github.com/FlamingLeo/modjuke</a>"),
-                               this));
-    auto *libLabel = new QLabel(libLoaded ? tr("libopenmpt %1").arg(libopenmptVersion)
-                                          : tr("libopenmpt was not found - install libopenmpt0 "
-                                               "or set MODJUKE_LIBOPENMPT."),
-                                this);
+    auto *aboutLabel = new QLabel(tr("Made by FlamingLeo, 2026.<br/>"
+                                     "Plays MOD, XM, IT, S3M and friends "
+                                     "through libopenmpt.<br/>"
+                                     "Project page: <a href=\"https://github.com/FlamingLeo/modjuke\">"
+                                     "github.com/FlamingLeo/modjuke</a>"),
+                                  this);
+    aboutLabel->setTextFormat(Qt::RichText);
+    aboutLabel->setOpenExternalLinks(true);
+    aboutLabel->setTextInteractionFlags(Qt::TextBrowserInteraction);
+    aboutLabel->setWordWrap(true);
+    root->addWidget(aboutLabel);
+    const QString qtVersion = QString::fromLatin1(qVersion());
+    auto *libLabel = new QLabel(
+        libLoaded ? tr("libopenmpt %1<br/>Qt %2").arg(libopenmptVersion, qtVersion)
+                  : tr("libopenmpt was not found - install libopenmpt0<br/>"
+                       "or set MODJUKE_LIBOPENMPT.<br/>Qt %1").arg(qtVersion),
+        this);
+    libLabel->setTextFormat(Qt::RichText);
     libLabel->setWordWrap(true);
     root->addWidget(libLabel);
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     root->addWidget(buttons);
-    resize(430, 220);
+    resize(430, 190);
 }
