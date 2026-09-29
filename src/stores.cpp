@@ -724,13 +724,22 @@ QVector<ModuleStats> StatsStore::mostPlayed(int limit) const
 
 void StatsStore::resetAll()
 {
-    // stats.py reset(): the empty file is written before the memory clears, and
-    // an unreadable previous file is replaced on purpose
+    // A failed reset must not leave the dialog empty while the old file still
+    // exists; restore the in-memory history if the replacement cannot be saved.
+    const QHash<QString, ModuleStats> oldRecords = records_;
+    const double oldSince = since_;
+    const bool oldDirty = dirty_;
+    const bool oldBlocked = blocked_;
     records_.clear();
     since_ = double(QDateTime::currentMSecsSinceEpoch()) / 1000.0;
     dirty_ = true;
-    blocked_ = false;
-    save();
+    blocked_ = false; // an explicit reset is allowed to replace bad history
+    if (save())
+        return;
+    records_ = oldRecords;
+    since_ = oldSince;
+    dirty_ = oldDirty;
+    blocked_ = oldBlocked;
 }
 
 double StatsStore::totalSeconds() const

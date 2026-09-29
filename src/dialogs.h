@@ -135,10 +135,14 @@ class StatsDialog : public QDialog {
 public:
     StatsDialog(QWidget *parent, StatsStore *store);
 
+signals:
+    void statsReset();
+
 private:
     void refresh();
     QTreeWidget *tree_ = nullptr;
     QLabel *totalLabel_ = nullptr;
+    QLabel *errorLabel_ = nullptr;
     StatsStore *store_;
 };
 

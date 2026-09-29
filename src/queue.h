@@ -43,6 +43,8 @@ public:
     QString pathAt(const QModelIndex &index) const;
     int queueIndexAt(const QModelIndex &index) const;
     QModelIndex indexOfPath(const QString &path) const;
+    bool isDirectory(const QModelIndex &index) const;
+    void toggleDirectory(const QModelIndex &index);
 
     void setReorderFlags(bool on) { reorderFlags_ = on; }
     bool reorderFlags_ = false;
@@ -61,11 +63,13 @@ private:
         Kind kind = TrackRow;
         int queueIndex = -1;          // TrackRow
         QString dir;                  // DirRow label
-        int depth = 0;                // DirRow indent
+        QString dirPath;              // DirRow path relative to the source root
+        int depth = 0;                // visual tree depth; files are children of their deepest folder
     };
 
     QVector<Row> rows_;
     QHash<QString, int> rowByPath_; // first visible row; rebuilt with the model
+    QSet<QString> collapsedDirs_;   // relative directory paths, only used in directory order
     QVector<Track> queue_;
     QSet<QString> missing_;
     QString playingPath_;

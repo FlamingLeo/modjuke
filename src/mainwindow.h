@@ -105,6 +105,7 @@ private:
     void syncTrackerSong();
     void revealPlayingInQueue();
     QStringList queueViewContext_;
+    void recordPendingStat(const EngineSnapshot &snap);
     void flushStats();
     bool typing() const;
 
@@ -236,6 +237,10 @@ private:
     double statsAccum_ = 0.0;
     bool statsDirty_ = false;
     QString statsPath_;
+    QString statsTitle_;
+    QString statsPendingPath_;
+    quint64 statsPendingGeneration_ = 0;
+    quint64 statsCountedGeneration_ = 0;
     QPointer<SettingsDialog> settingsDialog_;
     bool seeking_ = false;
     bool closing_ = false;

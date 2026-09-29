@@ -69,30 +69,56 @@ void QueueModel::rebuildRows(bool showDirectoryRows)
 {
     rows_.clear(); rows_.reserve(queue_.size());
     rowByPath_.clear(); rowByPath_.reserve(queue_.size());
-    auto appendTrack = [this](int i) {
+    auto appendTrack = [this](int i, int depth) {
         if (!rowByPath_.contains(queue_[i].path)) rowByPath_.insert(queue_[i].path, int(rows_.size()));
-        rows_.append(Row{TrackRow, i, QString(), 0});
+        rows_.append(Row{TrackRow, i, QString(), QString(), depth});
     };
     if (!showDirectoryRows) {
         for (int i = 0; i < queue_.size(); ++i)
-            appendTrack(i);
+            appendTrack(i, 0);
         return;
     }
-    QStringList openDirs;
+
+    // Keep the directory rows in the same flat model, but retain the complete
+    // relative path for each one.  Using only the displayed folder name would
+    // make two folders such as "A/Music" and "B/Music" collapse together.
+    QStringList openPaths;
     for (int i = 0; i < queue_.size(); ++i) {
         const QStringList parts = queue_[i].relDir.isEmpty()
                                       ? QStringList{}
                                       : queue_[i].relDir.split(QLatin1Char('/'), Qt::SkipEmptyParts);
         int common = 0;
-        while (common < parts.size() && common < openDirs.size()
-               && openDirs[common] == parts[common])
+        while (common < parts.size() && common < openPaths.size()
+               && openPaths[common].section(QLatin1Char('/'), -1) == parts[common])
             ++common;
-        openDirs.resize(common);
-        for (int d = common; d < parts.size(); ++d) {
-            rows_.append(Row{DirRow, -1, parts[d], d});
-            openDirs << parts[d];
+        openPaths.resize(common);
+
+        // A collapsed ancestor hides all of its descendants, but remains in
+        // openPaths so that the header itself is not duplicated for every file.
+        bool hiddenByAncestor = false;
+        for (const QString &path : openPaths) {
+            if (collapsedDirs_.contains(path)) {
+                hiddenByAncestor = true;
+                break;
+            }
         }
-        appendTrack(i);
+        if (hiddenByAncestor)
+            continue;
+
+        for (int d = common; d < parts.size(); ++d) {
+            const QString prefix = parts.mid(0, d + 1).join(QLatin1Char('/'));
+            const bool collapsed = collapsedDirs_.contains(prefix);
+            rows_.append(Row{DirRow, -1, parts[d], prefix, d});
+            openPaths << prefix;
+            if (collapsed) {
+                hiddenByAncestor = true;
+                break;
+            }
+        }
+        if (!hiddenByAncestor)
+            // Keep files just inside their deepest folder; root-level files
+            // remain flush-left while nested files get a small tree indent.
+            appendTrack(i, parts.size());
     }
 }
 
@@ -113,8 +139,15 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
         return {};
     const Row &row = rows_[index.row()];
     if (row.kind == DirRow) {
-        if (role == Qt::DisplayRole && index.column() == Module)
-            return QStringLiteral("%1%2").arg(QString(2 * row.depth, QLatin1Char(' ')), row.dir);
+        if (role == Qt::DisplayRole && index.column() == Module) {
+            const QString arrow = collapsedDirs_.contains(row.dirPath)
+                ? QStringLiteral("\u25b8 ") : QStringLiteral("\u25be ");
+            return QStringLiteral("%1%2%3")
+                .arg(QString(2 * row.depth, QLatin1Char(' ')), arrow, row.dir);
+        }
+        if (role == Qt::ToolTipRole)
+            return collapsedDirs_.contains(row.dirPath)
+                ? tr("Click to expand this folder") : tr("Click to collapse this folder");
         if (role == Qt::ForegroundRole)
             return directoryColor_.isValid() ? directoryColor_ : QColor("#5aa9ff");
         if (role == Qt::DecorationRole && index.column() == Module)
@@ -126,7 +159,10 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
     const Track &track = queue_[row.queueIndex];
     if (role == Qt::DisplayRole) {
         switch (index.column()) {
-        case Module: return track.name;
+        case Module:
+            return row.depth > 0
+                ? QString(2 * row.depth, QLatin1Char(' ')) + track.name
+                : track.name;
         case Folder: return track.relDir.isEmpty() ? QStringLiteral(".") : track.relDir;
         case Length: return track.durationText();
         case Format: return track.fmt.toUpper();
@@ -200,6 +236,26 @@ QString QueueModel::pathAt(const QModelIndex &index) const
         return {};
     const Row &row = rows_[index.row()];
     return row.kind == TrackRow ? queue_[row.queueIndex].path : QString();
+}
+
+bool QueueModel::isDirectory(const QModelIndex &index) const
+{
+    return index.isValid() && index.row() >= 0 && index.row() < rows_.size()
+        && rows_[index.row()].kind == DirRow;
+}
+
+void QueueModel::toggleDirectory(const QModelIndex &index)
+{
+    if (!isDirectory(index))
+        return;
+    const QString path = rows_[index.row()].dirPath;
+    if (collapsedDirs_.contains(path))
+        collapsedDirs_.remove(path);
+    else
+        collapsedDirs_.insert(path);
+    beginResetModel();
+    rebuildRows(true);
+    endResetModel();
 }
 
 int QueueModel::queueIndexAt(const QModelIndex &index) const
@@ -501,6 +557,10 @@ void QueueTableView::contextMenuEvent(QContextMenuEvent *event)
     QString path;
     if (auto *model = qobject_cast<QueueModel *>(this->model()))
         path = model->pathAt(hit);
+    if (path.isEmpty()) {
+        event->accept();
+        return; // directory headers and empty space have no song menu
+    }
     emit contextMenuFor(event->globalPos(), path);
 }
 
@@ -512,8 +572,16 @@ QModelIndex QueueTableView::currentIndexAtSelected()
 
 void QueueTableView::mousePressEvent(QMouseEvent *event)
 {
-    if (reorderEnabled_ && event->button() == Qt::LeftButton)
-        dragStart_ = event->pos();
+    if (event->button() == Qt::LeftButton) {
+        const QModelIndex hit = indexAt(event->pos());
+        if (auto *model = qobject_cast<QueueModel *>(this->model()); model && model->isDirectory(hit)) {
+            model->toggleDirectory(hit);
+            event->accept();
+            return;
+        }
+        if (reorderEnabled_)
+            dragStart_ = event->pos();
+    }
     QTableView::mousePressEvent(event);
 }
 

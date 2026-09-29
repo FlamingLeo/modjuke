@@ -392,6 +392,10 @@ void MainWindow::buildPages()
             [this](const QString &path) { playPath(path); });
     connect(queueView_, &QueueTableView::contextMenuFor, this,
             [this](const QPoint &globalPos, const QString &path) {
+                // Directory headers are structural rows, not songs. Do not
+                // offer song actions (especially Add to playlist) for them.
+                if (path.isEmpty())
+                    return;
                 QMenu menu(this);
                 menu.addAction(tr("Play now"), [this, path] { playPath(path); });
                 menu.addSeparator();
@@ -1366,7 +1370,25 @@ void MainWindow::playPath(const QString &path, double position, bool paused, int
         return;
     }
     const int index = queueIndexOf(path);
+    // A manual track change can happen before the next UI tick (including a
+    // restart of the same path), so settle the previous interval now rather
+    // than attributing it to the new playback generation.
+    if (settings_.trackListeningStats) {
+        flushStats();
+        statsTimer_.restart();
+    }
     engine_.playPath(path, position, paused, subsong, preserveBufferedTail);
+    // Count a play only after the asynchronous load succeeds. Keeping the
+    // generation lets a quick A→B change discard A rather than recording a
+    // failed or superseded load, while a paused session is counted on resume.
+    const EngineSnapshot requested = engine_.snapshot();
+    if (settings_.trackListeningStats) {
+        statsPendingPath_ = path;
+        statsPendingGeneration_ = requested.songGeneration;
+    } else {
+        statsPendingPath_.clear();
+        statsPendingGeneration_ = 0;
+    }
     queueModel_->setPlayingPath(path);
     if (index >= 0) {
         queueView_->setCurrentIndex(queueModel_->indexOfPath(path));
@@ -1774,7 +1796,30 @@ bool MainWindow::applySettingsFromDialog(SettingsDialog *dialog)
                              tr("Could not save settings. Check the config folder and qt-ui.json."));
         return false;
     }
+    const bool statsChanged = updated.trackListeningStats != settings_.trackListeningStats;
+    if (statsChanged && settings_.trackListeningStats && !updated.trackListeningStats) {
+        // Settle time collected under the old setting before turning recording
+        // off; otherwise it would remain in the accumulator and be attributed
+        // to a later session if stats are enabled again.
+        flushStats();
+        stats_.save();
+    }
     settings_ = updated;
+    if (statsChanged) {
+        statsTimer_.restart();
+        if (!settings_.trackListeningStats) {
+            statsAccum_ = 0.0;
+            statsPendingPath_.clear();
+            statsPendingGeneration_ = 0;
+        } else {
+            const EngineSnapshot snap = engine_.snapshot();
+            if (snap.loaded && !snap.loading && !snap.failed && !snap.paused
+                && snap.playing) {
+                statsPendingPath_ = snap.path;
+                statsPendingGeneration_ = snap.songGeneration;
+            }
+        }
+    }
     if (audioChanged)
         engine_.applySettings(settings_);
     uiTimer_->setInterval(std::max(1000 / std::clamp(settings_.uiFps, 5, 120), 8));
@@ -1796,6 +1841,17 @@ void MainWindow::openStatsDialog()
     flushStats();
     stats_.save();
     StatsDialog dialog(this, &stats_);
+    connect(&dialog, &StatsDialog::statsReset, this, [this] {
+        statsAccum_ = 0.0;
+        statsTimer_.restart();
+        statsCountedGeneration_ = 0;
+        const EngineSnapshot snap = engine_.snapshot();
+        if (settings_.trackListeningStats && snap.loaded && !snap.loading
+            && !snap.failed && !snap.paused && snap.playing) {
+            statsPendingPath_ = snap.path;
+            statsPendingGeneration_ = snap.songGeneration;
+        }
+    });
     dialog.exec();
 }
 
@@ -1871,13 +1927,37 @@ void MainWindow::tick()
     if (!snap.loaded || snap.loading)
         trackerHeader_->setText(snap.loading ? tr("Loading tracker…") : tr("No module loaded"));
 
-    // listening stats
-    if (settings_.trackListeningStats && snap.playing && !snap.paused && snap.loaded) {
-        if (statsPath_ != snap.path) {
-            flushStats();
-            statsPath_ = snap.path;
+    // listening stats.  The engine loads asynchronously, so count a play only
+    // for the generation requested by playPath() once it is really loaded. The
+    // old implementation only recorded elapsed seconds with play=false, which
+    // made every play count stay at zero.
+    if (statsPath_ != snap.path) {
+        flushStats();
+        statsPath_ = snap.path;
+        statsTitle_ = snap.info.title;
+        statsTimer_.restart();
+        if (snap.path.isEmpty()) {
+            statsPendingPath_.clear();
+            statsPendingGeneration_ = 0;
         }
-        statsAccum_ += statsTimer_.restart() / 1000.0;
+    } else if (!snap.info.title.isEmpty()) {
+        statsTitle_ = snap.info.title;
+    }
+
+    // EngineSnapshot::ended is a terminal state in the Qt renderer (it stays
+    // true until the next load), so it must not be treated as active time.
+    const bool statsLoaded = settings_.trackListeningStats && snap.loaded && !snap.loading
+        && !snap.failed && !snap.paused;
+    const bool statsActive = statsLoaded && snap.playing;
+    // A very short module can reach ended between two UI ticks. It still counts
+    // as a play, but ended must not contribute an endless stream of seconds.
+    recordPendingStat(snap);
+    if (statsActive) {
+        const double elapsed = statsTimer_.restart() / 1000.0;
+        // Do not turn a blocked UI or a suspended machine into fake listening
+        // time. Normal refresh intervals are far below this two-second cap.
+        if (elapsed >= 0.0 && elapsed <= 2.0)
+            statsAccum_ += elapsed;
         if (statsAccum_ >= 15.0) {
             flushStats();
             stats_.save();
@@ -2031,13 +2111,30 @@ void MainWindow::updateWindowTitle(const EngineSnapshot &snap)
         setWindowTitle(title);
 }
 
+void MainWindow::recordPendingStat(const EngineSnapshot &snap)
+{
+    if (!settings_.trackListeningStats || !snap.loaded || snap.loading || snap.failed
+        || snap.paused || snap.path.isEmpty() || (!snap.playing && !snap.ended)
+        || statsPendingPath_ != snap.path
+        || statsPendingGeneration_ != snap.songGeneration
+        || statsCountedGeneration_ == snap.songGeneration)
+        return;
+    if (stats_.record(snap.path, 0.0, true, snap.info.title)) {
+        statsDirty_ = true;
+        statsCountedGeneration_ = snap.songGeneration;
+        statsPendingPath_.clear();
+        statsPendingGeneration_ = 0;
+    }
+}
+
 void MainWindow::flushStats()
 {
+    // Also settle a pending play here. This covers very short modules and
+    // track changes that arrive before the next periodic UI tick.
+    recordPendingStat(engine_.snapshot());
     if (statsAccum_ > 0.5 && !statsPath_.isEmpty() && settings_.trackListeningStats) {
-        const EngineSnapshot snap = engine_.snapshot();
-        stats_.record(statsPath_, statsAccum_, false, snap.info.title);
-        statsAccum_ = 0.0;
-        statsDirty_ = true;
+        if (stats_.record(statsPath_, statsAccum_, false, statsTitle_))
+            statsDirty_ = true;
     }
     statsAccum_ = 0.0;
 }

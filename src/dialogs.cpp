@@ -763,6 +763,9 @@ StatsDialog::StatsDialog(QWidget *parent, StatsStore *store) : QDialog(parent), 
     root->addWidget(tree_, 1);
     totalLabel_ = new QLabel(this);
     root->addWidget(totalLabel_);
+    errorLabel_ = new QLabel(this);
+    errorLabel_->setWordWrap(true);
+    root->addWidget(errorLabel_);
     auto *buttons = new QHBoxLayout;
     auto *clearBtn = new QPushButton(tr("Clear stats"), this);
     connect(clearBtn, &QPushButton::clicked, this, [this] {
@@ -771,6 +774,8 @@ StatsDialog::StatsDialog(QWidget *parent, StatsStore *store) : QDialog(parent), 
             store_->resetAll();
             store_->save();
             refresh();
+            if (store_->error.isEmpty())
+                emit statsReset();
         }
     });
     buttons->addWidget(clearBtn);
@@ -799,6 +804,8 @@ void StatsDialog::refresh()
     }
     totalLabel_->setText(tr("%1 modules, %2 total listening time")
                              .arg(store_->count()).arg(formatTime(store_->totalSeconds())));
+    errorLabel_->setText(store_->error);
+    errorLabel_->setVisible(!store_->error.isEmpty());
 }
 
 // ============================================================================
