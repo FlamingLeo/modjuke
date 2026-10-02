@@ -20,10 +20,24 @@ A Windows 9x version is available [here](https://github.com/FlamingLeo/modjuke95
 - Optional session restoration and local listening history.
 - Selectable queue columns with independently saved visibility preferences.
 
+## Downloads
+
+Ready-made packages for Linux, Windows and macOS are on the [releases page](https://github.com/FlamingLeo/modjuke/releases). They include Qt and libopenmpt, so nothing else needs to be installed.
+
+| System | Package | First start |
+| --- | --- | --- |
+| Linux (x86-64, glibc 2.35+: Ubuntu 22.04, Debian 12, Mint 21 or newer) | `modjuke-VERSION-x86_64.AppImage` | `chmod +x` the file, then run it |
+| Windows 10/11 (x64) | `modjuke-VERSION-windows-x64.zip` | Extract the folder and run `modjuke.exe`. SmartScreen may warn about an unknown publisher: **More info → Run anyway** |
+| macOS 12+ (Apple silicon and Intel) | `modjuke-VERSION-macos.dmg` | Drag modjuke to Applications. The app isn't notarized: on first start, confirm in **System Settings → Privacy & Security → Open Anyway** |
+
+Settings and data are shared with a source build (see [Local data](#local-data)). On Windows, `modjuke.exe --check` and `--scan` print to the console they were started from; cmd shows the output after its prompt, so redirect it for scripts (`modjuke.exe --check > check.txt`).
+
+The packages are built by GitHub Actions (`.github/workflows/build.yml`) on every push to `master` and kept as artifacts of the run. A tag `v*` (for example `git tag v1.1 && git push origin v1.1`) also creates a draft release with the three packages attached, to be published on GitHub.
+
 ## Requirements
 
 - A **C++20** compiler, **CMake 3.22+**, and a build system such as Ninja.
-- **Qt 6.4+** development packages: Core, Gui, Widgets, Multimedia, and DBus.
+- **Qt 6.4+** development packages: Core, Gui, Widgets, Multimedia, and (on Linux) DBus.
 - The **libopenmpt shared library**, installed separately. The player loads it at runtime. libopenmpt headers are not required.
 - For audible playback, an available system audio output supported by Qt Multimedia.
 
@@ -107,6 +121,16 @@ MODJUKE_LIBOPENMPT=/full/path/to/libopenmpt.so.0 ./build/modjuke
 ```
 
 The override is a runtime environment variable, not a path recorded by the CMake installer. Set it in your launch environment if it is also needed for application-menu launches.
+
+### Packages and other systems
+
+The scripts in `packaging/` make the same packages as the releases. Each needs a Release build first. The Linux and macOS packages build libopenmpt from its official source release (`packaging/libopenmpt.sh`, no extra libraries needed); the Windows package uses the official libopenmpt DLLs. Output goes to `dist/`.
+
+- **Linux AppImage:** `sh packaging/appimage.sh build`, with Qt's `qmake` on `PATH` (or `QMAKE=/path/to/qmake`). The AppImage runs on systems at least as new as the one it was built on.
+- **Windows:** build with MSVC and Qt for MSVC (from the [Qt online installer](https://www.qt.io/download-qt-installer-oss) or [aqtinstall](https://github.com/miurahr/aqtinstall)) in a Visual Studio developer PowerShell, with Qt's `bin` folder on `PATH`, then run `pwsh packaging/windows.ps1 -BuildDir build`.
+- **macOS:** with Qt for macOS, configure with `-DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"` for both processor types, then run `sh packaging/macos.sh build`. Without packaging, `brew install libopenmpt` provides the library for `build/modjuke.app`.
+
+On every system, modjuke looks for libopenmpt next to itself first (`../lib/libopenmpt.so.0` on Linux, `libopenmpt.dll` on Windows, `Contents/Frameworks/libopenmpt.0.dylib` on macOS), then in the system's library locations (on macOS also Homebrew's). `MODJUKE_LIBOPENMPT` takes precedence over all of them.
 
 ## Getting started
 
@@ -288,7 +312,7 @@ Other options include `--dir PATH`, `--interpolation off|linear|cubic|sinc`, `--
 
 ## Local data
 
-On Linux, the data directory is **`$XDG_CONFIG_HOME/modjuke`**, or **`~/.config/modjuke`** when the variable is not set.
+The data directory is **`$XDG_CONFIG_HOME/modjuke`**, or **`~/.config/modjuke`** when the variable is not set, on every system: on Windows that's `%USERPROFILE%\.config\modjuke`, on macOS `/Users/NAME/.config/modjuke`.
 
 | File | Contents |
 | --- | --- |
@@ -316,7 +340,7 @@ XDG_CONFIG_HOME="$HOME/.config/modjuke-profile" modjuke
 Run `modjuke --check`, then inspect the output shown in the application. The check command validates libopenmpt and prints saved preferences. it is not a speaker check. The `null` backend is intentionally silent. Select Default output, check mute and volume, and verify the system output device and Qt Multimedia installation. Qt may fall back to silent output when no audio device is available.
 
 **libopenmpt could not be found**  
-Install the native shared library. If needed, set `MODJUKE_LIBOPENMPT` to its full path. libopenmpt development headers are not required.
+Install the native shared library. If needed, set `MODJUKE_LIBOPENMPT` to its full path. libopenmpt development headers are not required. The packages include libopenmpt; `modjuke --check` shows which file was loaded.
 
 **Qt reports a missing platform or multimedia plugin**  
 Install the distribution's Qt platform/Multimedia runtime packages. Keep plugins and Qt libraries from the same installation. do not point `QT_PLUGIN_PATH` at a different Qt version. Use `QT_DEBUG_PLUGINS=1` for diagnostics. A desktop display session is required for the graphical player.

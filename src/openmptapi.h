@@ -113,6 +113,7 @@ public:
 
     const Api &api() const { return *api_; }
     QString versionString() const { return versionString_; }
+    QString libraryPath() const { return library_.fileName(); }   // the file that was loaded
     bool extensionSupported(const QByteArray &extLower) const;
     QStringList supportedExtensions() const;   // without dots, lower case
 

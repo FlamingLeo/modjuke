@@ -71,3 +71,6 @@ __pycache__/
 *.pyc
 /compile_commands.json
 /shots/
+
+# packaging output (packaging/*.sh, packaging/windows.ps1)
+/dist/

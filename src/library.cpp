@@ -1,8 +1,14 @@
 #include "library.h"
 
-#include <sys/stat.h>
-#ifdef Q_OS_UNIX
+#if defined(Q_OS_WIN)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dirent.h>
+#include <sys/stat.h>
 #endif
 
 #include <QDateTime>
@@ -245,9 +251,26 @@ OrderMode orderModeFromName(const QString &name)
 
 double fileMTime(const QString &path)
 {
+    // Full precision, like Python's os.stat().st_mtime (the shared analysis
+    // cache compares it): nanoseconds on Linux/macOS, 100 ns on Windows.
+#if defined(Q_OS_WIN)
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    const QString native = QDir::toNativeSeparators(path);
+    if (GetFileAttributesExW(reinterpret_cast<const wchar_t *>(native.utf16()), GetFileExInfoStandard, &data)) {
+        const quint64 ticks = (quint64(data.ftLastWriteTime.dwHighDateTime) << 32)
+                              | data.ftLastWriteTime.dwLowDateTime;
+        return double(qint64(ticks) - 116444736000000000LL) / 1e7;   // 1601 -> 1970, 100 ns units
+    }
+#else
     struct stat st;
-    if (::stat(QFile::encodeName(path).constData(), &st) == 0)
+    if (::stat(QFile::encodeName(path).constData(), &st) == 0) {
+#if defined(Q_OS_MACOS)
+        return double(st.st_mtime) + double(st.st_mtimespec.tv_nsec) / 1e9;
+#else
         return double(st.st_mtime) + double(st.st_mtim.tv_nsec) / 1e9;
+#endif
+    }
+#endif
     return double(QFileInfo(path).lastModified().toMSecsSinceEpoch()) / 1000.0;
 }
 

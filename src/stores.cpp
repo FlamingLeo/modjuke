@@ -699,7 +699,7 @@ QStringList readM3u(const QString &path, int *skippedOut)
             continue;
         if (entry.startsWith(QLatin1String("file://")))
             entry = QUrl(entry).toLocalFile();
-        if (!entry.startsWith(QLatin1Char('/')))
+        if (!QDir::isAbsolutePath(entry))   // also C:\... on Windows
             entry = QDir(base).filePath(entry);
         entry = QDir::cleanPath(entry);
         // relative entries written on Windows use backslashes
@@ -934,7 +934,7 @@ IgnoreStore::IgnoreStore(const QString &path) : path_(path.isEmpty() ? ignoredPa
     for (const QJsonValue &item : array) {
         // ignored.py: every entry must be a non-empty absolute path
         if (!item.isString() || item.toString().isEmpty()
-            || !item.toString().startsWith(QLatin1Char('/'))) {
+            || !QDir::isAbsolutePath(item.toString())) {
             refuse(QObject::tr("Ignored paths must be absolute file paths"));
             return;
         }

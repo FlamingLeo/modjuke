@@ -1,0 +1,22 @@
+modjuke packages include these third-party components.
+
+Qt 6 (https://www.qt.io/)
+  Licensed under the GNU Lesser General Public License v3 (LGPLv3).
+  Qt's libraries are included as separate shared libraries / frameworks /
+  DLLs and can be replaced with other builds of the same Qt version.
+  Source: https://download.qt.io/official_releases/qt/
+  License text: https://www.gnu.org/licenses/lgpl-3.0.html
+  Qt Multimedia may include FFmpeg libraries (LGPL v2.1 or later):
+  https://ffmpeg.org/legal.html
+
+libopenmpt (https://lib.openmpt.org/)
+  BSD 3-Clause license; see licenses/libopenmpt.txt.
+  The Linux and macOS packages build it from the official source release
+  with its bundled miniz (MIT), minimp3 (CC0) and stb_vorbis (MIT or public
+  domain); see licenses/. The Windows package uses the official DLLs, which
+  include mpg123 (LGPL 2.1), libogg, libvorbis (BSD) and zlib; their license
+  texts are in licenses/.
+
+Microsoft Visual C++ runtime (Windows package only)
+  msvcp140*.dll, vcruntime140*.dll: redistributable files of Microsoft
+  Visual Studio, included under its license terms.

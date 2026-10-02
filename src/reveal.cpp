@@ -1,7 +1,9 @@
 #include "reveal.h"
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusPendingCallWatcher>
+#endif
 #include <QDesktopServices>
 #include <QFileInfo>
 #include <QDir>
