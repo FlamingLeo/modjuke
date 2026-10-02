@@ -144,6 +144,7 @@ _current = DEFAULT_THEME
 _active_palette = dict(_THEMES[_current])
 _custom = {}
 _HEX = re.compile(r"#[0-9a-fA-F]{6}\Z")
+_SHORT_HEX = re.compile(r"#[0-9a-fA-F]{3}\Z")
 _CUSTOM_ID = re.compile(r"custom:[a-z0-9-]{1,64}\Z")
 MAX_CUSTOM_THEMES = 100
 
@@ -152,8 +153,17 @@ def valid_colour(value) -> bool:
     return isinstance(value, str) and _HEX.fullmatch(value) is not None
 
 
+def _clean_colour(value):
+    """'#rrggbb' in lower case (the short '#rgb' expanded), or None."""
+    if valid_colour(value):
+        return value.lower()
+    if isinstance(value, str) and _SHORT_HEX.fullmatch(value):
+        return "#" + "".join(c * 2 for c in value[1:]).lower()
+    return None
+
+
 def clean_custom_themes(raw) -> dict:
-    """Keep valid named palettes only, missing future roles inherit Dark."""
+    """Keep valid named palettes; missing or invalid roles inherit Dark."""
     if not isinstance(raw, dict):
         return {}
     result = {}
@@ -173,10 +183,13 @@ def clean_custom_themes(raw) -> dict:
         alias = _ALIASES.get(alias.replace("-", ""), _ALIASES.get(alias, alias))
         if alias in THEME_NAMES:
             continue
-        if any(not valid_colour(value) for role, value in colours.items() if role in COLOUR_NAMES):
-            continue
+        # An invalid colour only loses that role (it keeps the Dark value); it
+        # used to drop the whole theme, which the next save then deleted.
         palette = dict(_THEMES[DEFAULT_THEME])
-        palette.update({role: value.lower() for role, value in colours.items() if role in COLOUR_NAMES})
+        for role, value in colours.items():
+            clean = _clean_colour(value) if role in COLOUR_NAMES else None
+            if clean is not None:
+                palette[role] = clean
         result[key] = {"name": name.strip(), "colours": palette}
         reserved.add(name.strip().casefold())
     return result
