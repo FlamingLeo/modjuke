@@ -2,7 +2,9 @@
 
 ![player](resources/player.png)
 
-A desktop tracker-music player built with **C++20**, [**Qt 6**](https://www.qt.io/) and [**libopenmpt**](https://lib.openmpt.org/libopenmpt/).
+A tracker-music player built with **C++20**, [**Qt 6**](https://www.qt.io/) and [**libopenmpt**](https://lib.openmpt.org/libopenmpt/) for modern desktops.
+
+A Windows 9x version is available [here](https://github.com/FlamingLeo/modjuke95).
 
 ## Features
 

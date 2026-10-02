@@ -1,2 +1,0 @@
-- Investigate listening stats, they don't seem to work properly
-- When sorting by directory, indent files a bit, allow collapsing folders, and remove superfluous folder options like right clicking to add to playlist, even though they don't do anything
