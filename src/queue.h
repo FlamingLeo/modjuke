@@ -51,7 +51,8 @@ public:
 
     void setPlayingPath(const QString &path);
     void setMissingPaths(const QSet<QString> &missing);
-    void setAccent(const QColor &background, const QColor &foreground);
+    // the playing row: its own colors, so it stays distinct from the selection
+    void setPlayingColors(const QColor &background, const QColor &foreground);
     void setColors(const QColor &stripe, const QColor &dim, const QColor &red);
     void setDirectoryColor(const QColor &color) { directoryColor_ = color; }
 
@@ -73,7 +74,7 @@ private:
     QVector<Track> queue_;
     QSet<QString> missing_;
     QString playingPath_;
-    QColor accentBg_, accentFg_, stripe_, dim_, red_, directoryColor_;
+    QColor playingBg_, playingFg_, stripe_, dim_, red_, directoryColor_;
     void rebuildRows(bool showDirectoryRows);
 };
 

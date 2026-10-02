@@ -11,6 +11,7 @@
 #include <QStyle>
 #include <QTimer>
 #include <QEvent>
+#include <QFont>
 #include <algorithm>
 
 namespace {
@@ -45,10 +46,10 @@ QString QueueModel::columnName(int column)
     }
 }
 
-void QueueModel::setAccent(const QColor &background, const QColor &foreground)
+void QueueModel::setPlayingColors(const QColor &background, const QColor &foreground)
 {
-    accentBg_ = background;
-    accentFg_ = foreground;
+    playingBg_ = background;
+    playingFg_ = foreground;
 }
 
 void QueueModel::setColors(const QColor &stripe, const QColor &dim, const QColor &red)
@@ -188,9 +189,15 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
     const bool playing = !playingPath_.isEmpty() && track.path == playingPath_;
     if (playing) {
         if (role == Qt::BackgroundRole)
-            return accentBg_;
+            return playingBg_;
         if (role == Qt::ForegroundRole)
-            return accentFg_;
+            return playingFg_;
+        if (role == Qt::FontRole) {
+            // bold also marks it when the row is selected (selection colors win)
+            QFont font = QApplication::font();
+            font.setBold(true);
+            return font;
+        }
         return {};
     }
     if (role == Qt::ForegroundRole) {

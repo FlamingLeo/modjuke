@@ -2425,7 +2425,14 @@ void MainWindow::applyTheme()
     seekSlider_->applyPalette(&palette_);
     vu_->applyPalette(&palette_);
     tracker_->applyPalette(&palette_);
-    queueModel_->setAccent(palette_[Palette::ACCENT_DIM], palette_[Palette::ON_ACCENT]);
+    // The playing row is tinted green (the theme's background, 35% toward its
+    // GREEN), unlike the selection (ACCENT_DIM). Derived rather than a theme
+    // role of its own, as the roles are shared with the Python version.
+    const QColor bg = palette_[Palette::BG], green = palette_[Palette::GREEN];
+    const auto mix = [](int a, int b) { return a + qRound((b - a) * 0.35); };
+    queueModel_->setPlayingColors(QColor(mix(bg.red(), green.red()), mix(bg.green(), green.green()),
+                                         mix(bg.blue(), green.blue())),
+                                  palette_[Palette::FG]);
     queueModel_->setDirectoryColor(palette_[Palette::ACCENT]);
     queueModel_->setColors(palette_[Palette::BG_STRIPE], palette_[Palette::FG_DIM],
                             palette_[Palette::RED]);

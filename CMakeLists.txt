@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(modjuke VERSION 1.0.0 LANGUAGES CXX)
+project(modjuke VERSION 1.0.1 LANGUAGES CXX)
 
 # Targets Qt 6.4.2 (Linux Mint 22 / Ubuntu 24.04); builds against newer too,
 # and on Windows and macOS (packaging/ and .github/workflows/build.yml).
