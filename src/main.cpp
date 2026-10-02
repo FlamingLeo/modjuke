@@ -18,6 +18,7 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QTextStream>
+#include <algorithm>
 
 #ifdef _WIN32
 #ifndef NOMINMAX

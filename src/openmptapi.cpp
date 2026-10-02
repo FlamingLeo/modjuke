@@ -8,6 +8,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // C API prototypes + resolved pointers
@@ -260,16 +261,17 @@ OpenMPTLib *OpenMPTLib::instance(QString *errorOut)
     auto *candidate = new OpenMPTLib;
     if (!candidate->library_.isLoaded() || !candidate->api_
         || !candidate->api_->module_create_from_memory2) {
-        g_loadError = QStringLiteral(
-            "libopenmpt could not be found or is too old.\n"
+        // (no #if inside the QStringLiteral macro: MSVC rejects that)
 #if defined(Q_OS_WIN)
-            "  Put libopenmpt.dll (and its openmpt-*.dll files) next to modjuke.exe.\n"
+        const char *hint = "  Put libopenmpt.dll (and its openmpt-*.dll files) next to modjuke.exe.\n";
 #elif defined(Q_OS_MACOS)
-            "  macOS:  brew install libopenmpt\n"
+        const char *hint = "  macOS:  brew install libopenmpt\n";
 #else
-            "  Linux:  sudo apt install libopenmpt0t64   (older releases: libopenmpt0)\n"
+        const char *hint = "  Linux:  sudo apt install libopenmpt0t64   (older releases: libopenmpt0)\n";
 #endif
-            "You can also set MODJUKE_LIBOPENMPT to the library's full path");
+        g_loadError = QStringLiteral("libopenmpt could not be found or is too old.\n")
+                      + QLatin1String(hint)
+                      + QStringLiteral("You can also set MODJUKE_LIBOPENMPT to the library's full path");
         if (errorOut)
             *errorOut = g_loadError;
         delete candidate;

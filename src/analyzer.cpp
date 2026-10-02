@@ -9,6 +9,7 @@
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QThread>
+#include <algorithm>
 
 // The heavy lifting runs inside Worker::run on a secondary thread; the only
 // GUI contact is queued signal emission.

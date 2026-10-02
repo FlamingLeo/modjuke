@@ -11,6 +11,7 @@
 #include <QStyle>
 #include <QTimer>
 #include <QEvent>
+#include <algorithm>
 
 namespace {
 constexpr const char *kMimeType = "application/x-modjuke-rows";

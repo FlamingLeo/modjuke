@@ -19,7 +19,7 @@ jobs:
     # the AppImage runs on systems with this glibc (2.35) or newer
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # tags, for the version in the file names
       - name: Install build dependencies
@@ -45,7 +45,7 @@ jobs:
         run: |
           APPIMAGE_EXTRACT_AND_RUN=1 XDG_CONFIG_HOME=$RUNNER_TEMP ./dist/modjuke-*-x86_64.AppImage --check | tee check.txt
           grep -q '^libopenmpt: 0\.8.*lib/libopenmpt\.so\.0' check.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: modjuke-linux
           path: dist/*.AppImage
@@ -54,7 +54,7 @@ jobs:
   windows:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: ilammy/msvc-dev-cmd@v1   # MSVC, Ninja and the runtime DLLs' location
@@ -78,7 +78,7 @@ jobs:
             -RedirectStandardOutput check.txt
           Get-Content check.txt
           if (-not (Select-String -Path check.txt -Pattern '^libopenmpt: 0\.8.*modjuke[\\/]libopenmpt\.dll')) { exit 1 }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: modjuke-windows
           path: dist/*.zip
@@ -89,7 +89,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: '12.0'   # Qt 6.8's minimum
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: jurplel/install-qt-action@v4
@@ -112,7 +112,7 @@ jobs:
           lipo -archs $APP/Contents/Frameworks/libopenmpt.0.dylib
           XDG_CONFIG_HOME=$RUNNER_TEMP $APP/Contents/MacOS/modjuke --check | tee check.txt
           grep -q '^libopenmpt: 0\.8.*Frameworks/libopenmpt\.0\.dylib' check.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: modjuke-macos
           path: dist/*.dmg
@@ -125,7 +125,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

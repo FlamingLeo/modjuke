@@ -22,6 +22,7 @@
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <functional>
+#include <algorithm>
 
 namespace {
 
