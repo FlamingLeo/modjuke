@@ -16,6 +16,31 @@
 #include <algorithm>
 #include <cmath>
 
+void ElidedLabel::setFullText(const QString &text)
+{
+    full_ = text;
+    setToolTip(text);
+    elide();
+}
+
+void ElidedLabel::resizeEvent(QResizeEvent *event)
+{
+    QLabel::resizeEvent(event);
+    elide();
+}
+
+void ElidedLabel::changeEvent(QEvent *event)
+{
+    QLabel::changeEvent(event);
+    if (event->type() == QEvent::FontChange || event->type() == QEvent::StyleChange)
+        elide();
+}
+
+void ElidedLabel::elide()
+{
+    setText(fontMetrics().elidedText(full_, Qt::ElideRight, contentsRect().width()));
+}
+
 StableLabelButton::StableLabelButton(const QStringList &labels, QWidget *parent)
     : QPushButton(labels.value(0), parent), labels_(labels)
 {
@@ -189,7 +214,7 @@ void VuMeter::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, false);
-    const Palette fallback = Palette::builtin(QStringLiteral("dark"));
+    static const Palette fallback = Palette::builtin(QStringLiteral("dark"));   // once, not per frame
     const Palette &pal = palette_ ? *palette_ : fallback;
 
     auto barColor = [&](float frac) {
@@ -300,7 +325,6 @@ void TrackerView::setSong(const QString &path, const QVector<int> &orders,
     patterns_.clear();
     rowCache_.clear();
     requestedPatterns_.clear();
-    selectedPattern_ = -1;
     following_ = true;
     emit followingChanged(true);
     horizontalScrollBar()->setValue(0);
@@ -329,7 +353,6 @@ void TrackerView::clearSong()
     playing_ = paused_ = false;
     topRow_ = 0.0;
     gliding_ = false; rowTime_ = lastTick_ = -1;
-    selectedPattern_ = -1;
     updateScrollBars();
     viewport()->update();
 }
@@ -571,102 +594,121 @@ void TrackerView::mousePressEvent(QMouseEvent *event)
     QAbstractScrollArea::mousePressEvent(event);
 }
 
-int TrackerView::selectedPattern() const
-{
-    return selectedPattern_;
-}
-
 void TrackerView::jumpPattern(int direction)
 {
     if (orders_.isEmpty())
         return;
-    int order = currentOrder_;
-    if (direction > 0) {
-        for (int step = 1; step <= orders_.size(); ++step) {
-            order = (order + 1) % orders_.size();
+    // the next order in that direction (wrapping) that holds a pattern
+    auto step = [this](int order, bool forward) {
+        const int count = orders_.size();
+        for (int i = 0; i < count; ++i) {
+            order = forward ? (order + 1) % count : (order - 1 + count) % count;
             if (orders_.value(order, -1) >= 0)
                 break;
         }
-    } else {
-        for (int step = 1; step <= orders_.size(); ++step) {
-            order = (order - 1 + orders_.size()) % orders_.size();
-            if (orders_.value(order, -1) >= 0)
-                break;
-        }
-        if (order == currentOrder_) {
-            // already at the start of this pattern: go to the previous one
-            for (int step = 1; step <= orders_.size(); ++step) {
-                order = (order - 1 + orders_.size()) % orders_.size();
-                if (orders_.value(order, -1) >= 0)
-                    break;
-            }
-        }
-    }
+        return order;
+    };
+    int order = step(currentOrder_, direction > 0);
+    if (direction <= 0 && order == currentOrder_)
+        order = step(order, false);   // already at the start of this pattern: go to the previous one
     emit rowClicked(order, 0);
 }
 
 QColor TrackerView::effectColor(const QString &effect) const
 {
-    if (palette_ && !effect.isEmpty()) {
-        const QChar letter = effect.at(0).toUpper();
-        const QChar param = effect.size() > 1 ? effect.at(1).toUpper() : QChar();
-        // The module format family decides which letter map applies.
-        static const struct { const char *family; const char *global; const char *volume;
-                             const char *pan; const char *pitch; const char *misc; } maps[] = {
-            {"mod", "BDF", "7AC", "8", "01234", "569"},
-            {"xm", "BDF", "ACGHLT", "8PY", "01234", "569KRZ\\"},
-            {"s3m", "ABCT", "DIMNRVW", "PXY", "EFGHJU", "KLOQZ\\"},
+    if (!palette_)
+        return QColor(Qt::white);
+    if (effect.isEmpty())
+        return (*palette_)[Palette::TRACKER_BRIGHT];
+    using R = Palette::Role;
+    const QChar letter = effect.at(0).toUpper();
+    const QChar param = effect.size() > 1 ? effect.at(1).toUpper() : QChar();
+    if (letter == QLatin1Char('E') || letter == QLatin1Char('X') || letter == QLatin1Char('S')) {
+        // sub-command tables (same values as effects.py)
+        static const struct { QChar param; R role; } sub[] = {
+            {'0', R::EFFECT_MISC}, {'1', R::EFFECT_PITCH}, {'2', R::EFFECT_PITCH}, {'3', R::EFFECT_PITCH},
+            {'4', R::EFFECT_PITCH}, {'5', R::EFFECT_PITCH}, {'6', R::EFFECT_GLOBAL}, {'7', R::EFFECT_VOLUME},
+            {'8', R::EFFECT_PAN}, {'9', R::EFFECT_MISC}, {'A', R::EFFECT_VOLUME}, {'B', R::EFFECT_VOLUME},
+            {'C', R::EFFECT_MISC}, {'D', R::EFFECT_MISC}, {'E', R::EFFECT_GLOBAL}, {'F', R::EFFECT_MISC},
         };
-        int familyIndex = 0;
-        if (family_ == QLatin1String("xm"))
-            familyIndex = 1;
-        else if (family_ == QLatin1String("s3m") || family_ == QLatin1String("it")
-                 || family_ == QLatin1String("mptm"))
-            familyIndex = 2;
-        const auto &map = maps[familyIndex];
-        auto categoryFor = [&](const char *set) { return QString::fromLatin1(set).contains(letter); };
-        QString category;
-        if (letter == QLatin1Char('E') || letter == QLatin1Char('X') || letter == QLatin1Char('S')) {
-            // sub-command tables (same values as effects.py)
-            static const struct { QChar param; const char *category; } sub[] = {
-                {'0', "misc"}, {'1', "pitch"}, {'2', "pitch"}, {'3', "pitch"}, {'4', "pitch"},
-                {'5', "pitch"}, {'6', "global"}, {'7', "volume"}, {'8', "pan"}, {'9', "misc"},
-                {'A', "volume"}, {'B', "volume"}, {'C', "misc"}, {'D', "misc"}, {'E', "global"},
-                {'F', "misc"},
-            };
-            for (const auto &entry : sub) {
-                if (entry.param == param) {
-                    category = QString::fromLatin1(entry.category);
-                    break;
-                }
-            }
+        for (const auto &entry : sub) {
+            if (entry.param == param)
+                return (*palette_)[entry.role];
         }
-        if (category.isEmpty()) {
-            if (categoryFor(map.global)) category = QStringLiteral("global");
-            else if (categoryFor(map.volume)) category = QStringLiteral("volume");
-            else if (categoryFor(map.pan)) category = QStringLiteral("pan");
-            else if (categoryFor(map.pitch)) category = QStringLiteral("pitch");
-            else if (categoryFor(map.misc)) category = QStringLiteral("misc");
-        }
-        using R = Palette::Role;
-        if (category == QLatin1String("global"))
-            return (*palette_)[R::EFFECT_GLOBAL];
-        if (category == QLatin1String("volume"))
-            return (*palette_)[R::EFFECT_VOLUME];
-        if (category == QLatin1String("pan"))
-            return (*palette_)[R::EFFECT_PAN];
-        if (category == QLatin1String("pitch"))
-            return (*palette_)[R::EFFECT_PITCH];
-        if (category == QLatin1String("misc"))
-            return (*palette_)[R::EFFECT_MISC];
     }
-    return palette_ ? (*palette_)[Palette::TRACKER_BRIGHT] : QColor(Qt::white);
+    // The module format family decides which letter map applies; the first
+    // category holding the letter wins.
+    struct Category { const char *letters; R role; };
+    static const Category maps[][5] = {
+        {{"BDF", R::EFFECT_GLOBAL}, {"7AC", R::EFFECT_VOLUME}, {"8", R::EFFECT_PAN},
+         {"01234", R::EFFECT_PITCH}, {"569", R::EFFECT_MISC}},                          // mod
+        {{"BDF", R::EFFECT_GLOBAL}, {"ACGHLT", R::EFFECT_VOLUME}, {"8PY", R::EFFECT_PAN},
+         {"01234", R::EFFECT_PITCH}, {"569KRZ\\", R::EFFECT_MISC}},                    // xm
+        {{"ABCT", R::EFFECT_GLOBAL}, {"DIMNRVW", R::EFFECT_VOLUME}, {"PXY", R::EFFECT_PAN},
+         {"EFGHJU", R::EFFECT_PITCH}, {"KLOQZ\\", R::EFFECT_MISC}},                    // s3m, it, mptm
+    };
+    int familyIndex = 0;
+    if (family_ == QLatin1String("xm"))
+        familyIndex = 1;
+    else if (family_ == QLatin1String("s3m") || family_ == QLatin1String("it")
+             || family_ == QLatin1String("mptm"))
+        familyIndex = 2;
+    for (const Category &category : maps[familyIndex]) {
+        if (QLatin1String(category.letters).contains(letter))
+            return (*palette_)[category.role];
+    }
+    return (*palette_)[Palette::TRACKER_BRIGHT];
+}
+
+void TrackerView::paintRow(QPainter &p, const Line &l, bool highlight, int startChannel, int endChannel,
+                           const Palette &pal) const
+{
+    const int cw = QFontMetrics(monoFont_).horizontalAdvance(QLatin1Char('M'));
+    p.setFont(monoFont_);
+    p.fillRect(QRectF(0, 0, viewport()->width(), lineHeight_), highlight ? pal[Palette::TRACKER_PLAYING]
+               : (l.row % 4 == 0 ? pal[Palette::TRACKER_BEAT] : pal[Palette::BG_INPUT]));
+    p.setPen(highlight ? pal[Palette::ON_ACCENT] : pal[Palette::FG_DIM]);
+    p.drawText(QRectF(4, 0, rowNumberWidth_-10, lineHeight_), Qt::AlignRight | Qt::AlignVCenter,
+               l.empty ? QStringLiteral("---") : QStringLiteral("%1").arg(l.row, 2, 10, QLatin1Char('0')));
+    if (l.empty) {
+        p.setPen(pal[Palette::FG_FAINT]);
+        p.drawText(QRectF(rowNumberWidth_+2, 0, 250, lineHeight_), Qt::AlignLeft | Qt::AlignVCenter,
+                   tr("(empty pattern %1)").arg(orders_.value(l.orderIndex, -1)));
+        return;
+    }
+    const auto cached = patterns_.constFind(orders_.value(l.orderIndex, -1));
+    for (int ch = startChannel; ch < endChannel; ++ch) {
+        PatternDataReply::Cell cell;
+        if (cached != patterns_.constEnd() && l.row < cached->cells.size() && ch < cached->cells[l.row].size())
+            cell = cached->cells[l.row][ch];
+        int x = rowNumberWidth_ + (ch-startChannel) * channelWidth_;
+        const QColor faint = pal[highlight ? Palette::TRACKER_DIM : Palette::TRACKER_FAINT];
+        auto field = [&](QString text, int width, QColor color) {
+            if (text.isEmpty() || text == QLatin1String("...") || text == QLatin1String("..")) {
+                text = QString(width, QLatin1Char('.')); color = faint;
+            }
+            p.setPen(color);
+            p.drawText(QRectF(x, 0, cw*width, lineHeight_), Qt::AlignLeft | Qt::AlignVCenter, text.left(width));
+            x += cw*(width+1);
+        };
+        field(cell.note, 3, pal[Palette::TRACKER_BRIGHT]);
+        if (layout_ == Full) field(cell.instrument, 2, pal[highlight ? Palette::TRACKER_BRIGHT : Palette::TRACKER_DIM]);
+        if (layout_ == Full || layout_ == NoInstrument) {
+            field(cell.volume, 3, pal[Palette::EFFECT_VOLUME]);
+            field(cell.effect, 3, effectColor(cell.effect));
+        } else if (layout_ == Shared) {
+            const bool effect = !cell.effect.isEmpty();
+            field(effect ? cell.effect : cell.volume, 3, effect ? effectColor(cell.effect) : pal[Palette::EFFECT_VOLUME]);
+        }
+        p.setPen(pal[Palette::SEP]);
+        p.drawLine(QPointF(x-cw, 0), QPointF(x-cw, lineHeight_));
+    }
 }
 
 void TrackerView::paintEvent(QPaintEvent *)
 {
     QPainter p(viewport());
-    const Palette fallback = Palette::builtin(QStringLiteral("dark"));
+    static const Palette fallback = Palette::builtin(QStringLiteral("dark"));   // once, not per frame
     const Palette &pal = palette_ ? *palette_ : fallback;
     p.fillRect(viewport()->rect(), pal[Palette::BG_INPUT]);
     p.setFont(monoFont_);
@@ -693,9 +735,7 @@ void TrackerView::paintEvent(QPaintEvent *)
     }
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     for (int line = first; line < last; ++line) {
-        const auto &l = lines_[line];
         const qreal screenY = headerHeight_ + (line-topRow_) * lineHeight_;
-        const qreal y = 0;
         const bool highlight = line == playing && !path_.isEmpty();
         const quint64 key = quint64(line)*2 + (highlight ? 1 : 0);
         QPixmap *raster = rowCache_.object(key);
@@ -705,48 +745,8 @@ void TrackerView::paintEvent(QPaintEvent *)
             fresh.setDevicePixelRatio(dpr);
             fresh.fill(Qt::transparent);
             QPainter rowPainter(&fresh);
-            rowPainter.setFont(monoFont_);
-            auto &p = rowPainter;
-            p.fillRect(QRectF(0, y, viewport()->width(), lineHeight_), highlight ? pal[Palette::TRACKER_PLAYING]
-                       : (l.row % 4 == 0 ? pal[Palette::TRACKER_BEAT] : pal[Palette::BG_INPUT]));
-            p.setPen(highlight ? pal[Palette::ON_ACCENT] : pal[Palette::FG_DIM]);
-            p.drawText(QRectF(4, y, rowNumberWidth_-10, lineHeight_), Qt::AlignRight | Qt::AlignVCenter,
-                       l.empty ? QStringLiteral("---") : QStringLiteral("%1").arg(l.row, 2, 10, QLatin1Char('0')));
-            if (l.empty) {
-                p.setPen(pal[Palette::FG_FAINT]);
-                p.drawText(QRectF(rowNumberWidth_+2, y, 250, lineHeight_), Qt::AlignLeft | Qt::AlignVCenter,
-                           tr("(empty pattern %1)").arg(orders_.value(l.orderIndex, -1)));
-            } else {
-                const auto cached = patterns_.constFind(orders_.value(l.orderIndex, -1));
-                for (int ch = startChannel; ch < endChannel; ++ch) {
-                    PatternDataReply::Cell cell;
-                    if (cached != patterns_.constEnd() && l.row < cached->cells.size() && ch < cached->cells[l.row].size())
-                        cell = cached->cells[l.row][ch];
-                    int x = rowNumberWidth_ + (ch-startChannel) * channelWidth_;
-                    const QColor faint = pal[highlight ? Palette::TRACKER_DIM : Palette::TRACKER_FAINT];
-                    auto field = [&](QString text, int width, QColor color) {
-                        if (text.isEmpty() || text == QLatin1String("...") || text == QLatin1String("..")) {
-                            text = QString(width, QLatin1Char('.')); color = faint;
-                        }
-                        p.setPen(color);
-                        p.drawText(QRectF(x, y, cw*width, lineHeight_), Qt::AlignLeft | Qt::AlignVCenter, text.left(width));
-                        x += cw*(width+1);
-                    };
-                    field(cell.note, 3, pal[Palette::TRACKER_BRIGHT]);
-                    if (layout_ == Full) field(cell.instrument, 2, pal[highlight ? Palette::TRACKER_BRIGHT : Palette::TRACKER_DIM]);
-                    if (layout_ == Full || layout_ == NoInstrument) {
-                        field(cell.volume, 3, pal[Palette::EFFECT_VOLUME]);
-                        field(cell.effect, 3, effectColor(cell.effect));
-                    } else if (layout_ == Shared) {
-                        const bool effect = !cell.effect.isEmpty();
-                        field(effect ? cell.effect : cell.volume, 3, effect ? effectColor(cell.effect) : pal[Palette::EFFECT_VOLUME]);
-                    }
-                    p.setPen(pal[Palette::SEP]);
-                    p.drawLine(QPointF(x-cw, y), QPointF(x-cw, y+lineHeight_));
-                }
-            } // nonempty row
-        } // row painter (finish before storing or drawing the pixmap)
-        if (!raster) {
+            paintRow(rowPainter, lines_[line], highlight, startChannel, endChannel, pal);
+            rowPainter.end();   // finish before storing or drawing the pixmap
             const int cost = fresh.width()*fresh.height()*4;
             // Oversized single rows can still paint without exceeding the cache.
             if (cost <= rowCache_.maxCost()) {

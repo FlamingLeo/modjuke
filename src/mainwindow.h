@@ -1,34 +1,40 @@
-// The player window: toolbar, source/order/filter bar, queue table, song info
-// panel, tracker tab, transport, status bar. Port of modjuke/ui.py PlayerApp.
+// The player window: the tab strip, the queue side (QueuePanel), song info
+// panel, tracker tab, transport, status bar, and what connects them to the
+// library, the queue and the engine. Port of modjuke/ui.py PlayerApp.
 #pragma once
 
-#include "analyzer.h"
 #include "config.h"
 #include "dialogs.h"
 #include "engine.h"
-#include "queue.h"
+#include "ignorestore.h"
+#include "infopanel.h"
+#include "trackerpage.h"
+#include "transportbar.h"
+#include "listeningstats.h"
+#include "musiclibrary.h"
+#include "playbackqueue.h"
+#include "playliststore.h"
+#include "queuebuilder.h"
+#include "queuepanel.h"
+#include "queueplayer.h"
+#include "sessionoptions.h"
+#include "settingskeeper.h"
 #include "shuffles.h"
+#include "songactions.h"
 #include "theme.h"
-#include "widgets.h"
 
 #include <QElapsedTimer>
 #include <QMainWindow>
 #include <QPointer>
-#include <QVector>
+#include <QStringList>
 
+class ElidedLabel;
 class QLabel;
-class QLineEdit;
-class QPlainTextEdit;
 class QPushButton;
-class QSlider;
-class QSpinBox;
-class QCheckBox;
-class QComboBox;
 class QSplitter;
 class QStackedWidget;
 class QTabBar;
 class QTimer;
-class TrackerView;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -38,17 +44,19 @@ public:
     // ---- CLI entry points (main.cpp) ----
     void openDirectory(const QString &path);
     void startupPlay(const QString &track, bool autoplay);
-    void applyCliOverrides(const QHash<QString, QString> &overrides);   // volume/theme/speed/...
+    void applySessionOptions(SessionOptions options);   // the command line, this session only
     Engine &engine() { return engine_; }
     const Settings &settings() const { return settings_; }
 
 protected:
     void closeEvent(QCloseEvent *event) override;
-    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
+    void chooseFolder();
     void rescan();
     void analyzeNow();
+    void scanFolder(const QString &root);
+    void showTrackCount();
     void rebuildQueue();
     void reshuffle();
     void openFilterDialog();
@@ -61,201 +69,84 @@ private slots:
     void togglePlay();
     void playPrevious();
     void playNext();
-    void stopPlayback();
-    void toggleMute();
     void addCurrentFavorite();
     void ignoreCurrent();
     void ignorePath(const QString &path);
     void revealCurrent();
-    void addToPlaylistMenu();
-    void removeFromPlaylist();
+    QStringList actionPaths() const;   // the selected songs, or else the playing one
     void resetLayout();
     void tick();
-    void onFinished();
-    void restartQueue();
     void showTrackerTab(bool show);
 
 private:
-    struct CliState { bool autoplay = false; QString track; };
 
     // ---- setup ----
-    void buildToolbar();
-    void buildQueueBar();
     void buildPages();
     void buildPlayerPage();
-    void buildInfoPanel(class QWidget *parent);
-    void buildTrackerPage();
     void buildTransport();
     void buildStatusBar();
+    void connectQueuePanel();
     void bindShortcuts();
     void applyTheme();
     void refreshSourceCombo();
     void refreshQueueControls();
 
     // ---- behavior ----
-    void playPath(const QString &path, double position = 0.0, bool paused = false, int subsong = 0,
-                  bool preserveBufferedTail = false);
-    void restartQueueImpl(bool preserveBufferedTail);
-    void playSelected();
     bool confirmIgnorePath(const QString &path);
     bool changeIgnored(const QStringList &add, const QStringList &remove = {});
     QString currentPath() const;                       // playing (or empty)
-    QString selectedPath() const;                      // queue caret/selection
-    QStringList queueSelectedPaths() const;
-    void syncTrackerSong();
-    void revealPlayingInQueue();
+    QString anchorPath() const;                        // playing, or else the queue's selection
     QStringList queueViewContext_;
-    void recordPendingStat(const EngineSnapshot &snap);
-    void flushStats();
     bool typing() const;
 
-    int queueIndexOf(const QString &path) const;
-    int nextQueueIndexAfter(const QString &path) const;   // -1: unknown position
-    void handleLoadResult();                               // skips files that fail to load
-    Settings persistedSettings(const Settings &s) const;   // command-line values stay session-only
-    bool saveSettings(const Settings &s) const { return persistedSettings(s).save(); }
+    void applySettings(const Settings *previous);   // settings_ -> engine and UI
     void status(const QString &text);
     void appendLog(const QString &level, const QString &text);
-    void updateInfoPanel(const EngineSnapshot &snap);
-    void updateTransport(const EngineSnapshot &snap);
+    void updateLoadStatus(const EngineSnapshot &snap);   // the status bar while loading
     void updateWindowTitle(const EngineSnapshot &snap);
     void saveSession(bool force = false);
     void commitSettings();
     void applyOrderEdited(const QStringList &newOrder);
-    void startShotDriver();
-    bool snapShotForShots(ModuleInfo &outInfo);
+#ifdef MODJUKE_SHOT_DRIVER
+    void startShotDriver();   // shotdriver.cpp (CMake option MODJUKE_SHOT_DRIVER)
+#endif
     void moveSelectedRow(int delta);
-    QueueFilter filterFromSettings() const;
-    void syncFilterFromSettings();
     void applyQueueFilters();
 
-    // ---- shuffle plans (shuffles.py port) ----
-    QVector<Track> sourceTracks() const;                    // current collection, unfiltered
-    QString shuffleSourceKey() const;
-    void ensureShufflePlan(const QVector<Track> &source);   // restore; draw only if never drawn
-    void mergeNewIntoShufflePlan(const QVector<Track> &source);   // new songs -> random places
-    void drawShufflePlan(quint32 newSeed = 0, const QString &firstPath = QString(),
-                         const QString &avoidFirst = QString());
-    void migrateShuffleOrder();                             // settings.shuffle_paths -> store
-    void onPlaylistRenamed(const QString &oldName, const QString &newName);
-    void onPlaylistRemoved(const QString &name);
-
     Settings settings_;
+    SettingsKeeper keeper_{settings_};  // saves settings_ (command-line values stay session-only)
     Engine engine_;
     ShuffleStore shuffles_;
-    QString shuffleKey_;                       // source shufflePaths_ belongs to
-    QStringList shufflePaths_;                 // drawn order for that source
-    Analyzer analyzer_;
+    MusicLibrary library_;              // the scanned folder and its analysis
     PlaylistStore playlists_;
     IgnoreStore ignored_;
-    StatsStore stats_;
+    ListeningStats stats_;
     Palette palette_;
 
-    QVector<Track> libraryTracks_;                     // scanned library (all formats)
-    QVector<Track> orderedSource_; // invalidated by every full rebuild, reused for search-only edits
-    QVector<Track> queueTracks_;                       // currently visible queue
-    QHash<QString, int> queueIndex_;    // path -> index in queueTracks_ (incl. collapsed folders)
-    int playingQueueIndex_ = -1;        // last known queue index of the playing song
-    int pendingSkipDirection_ = 0;      // set before playPath: +1/-1 = skip on if it fails to load
-    int skipDirection_ = 0;             // ... for the load in flight (0: the user picked it)
-    quint64 skipGeneration_ = 0;        // song generation of that load
-    int skipRun_ = 0;                   // broken files skipped in a row
-    QHash<QString, QString> cliSaved_;  // option -> value saved before the command line overrode it
-    QHash<QString, QString> cliSession_; // option -> command-line value (this session only)
-    QString libraryRoot_;
-    int libraryDirs_ = 0;
-    int analyzedTotal_ = 0;
-    bool analysisRestartPending_ = false;
-    QHash<QString, Track> trackByPath_;
+    PlaybackQueue queue_;               // the visible queue and its unfiltered order
+    QueueBuilder builder_{settings_, library_, playlists_, ignored_, shuffles_};   // its source in play order
+    QueuePlayer player_{engine_, queue_, stats_, ignored_, settings_};   // what plays next
+    SongActions songActions_{this, settings_, playlists_, ignored_, library_, builder_};
+    bool statusShowsLoading_ = false;   // the status bar shows "Loading ..."
 
-    QWidget *toolbarRow_ = nullptr;
-    QWidget *queueBar_ = nullptr;
-
-    // toolbar
-    QPushButton *openButton_ = nullptr;
-    QPushButton *rescanButton_ = nullptr;
-    QPushButton *analyzeButton_ = nullptr;
-    QLineEdit *dirField_ = nullptr;
-    QLabel *countLabel_ = nullptr;
-
-    // queue bar
-    QComboBox *sourceCombo_ = nullptr;
-    QComboBox *orderCombo_ = nullptr;
-    QPushButton *shuffleBtn_ = nullptr;
-    QPushButton *playlistsBtn_ = nullptr;
-    QPushButton *filterBtn_ = nullptr;
-    QLineEdit *searchEdit_ = nullptr;
-    QLabel *filterLabel_ = nullptr;
+    QueuePanel *queuePanel_ = nullptr;  // folder row, queue controls, queue table
 
     // pages
     QWidget *playerPage_ = nullptr;
-    QWidget *trackerPage_ = nullptr;
+    TrackerPage *trackerPage_ = nullptr;
     QSplitter *splitter_ = nullptr;
     QTabBar *tabBar_ = nullptr;
     QStackedWidget *pages_ = nullptr;
-    QueueTableView *queueView_ = nullptr;
-    QueueModel *queueModel_ = nullptr;
-    QPushButton *addToPlaylistBtn_ = nullptr;
-    QPushButton *removeFromPlaylistBtn_ = nullptr;
 
-    // info panel
-    QLabel *titleLabel_ = nullptr;
-    QLabel *subtitleLabel_ = nullptr;
-    QPushButton *favoriteButton_ = nullptr;
-    QPushButton *ignoreButton_ = nullptr;
-    QPushButton *songInfoButton_ = nullptr;
-    QPushButton *revealButton_ = nullptr;
-    QHash<QString, QLabel *> infoLabels_;
-    VuMeter *vu_ = nullptr;
-    QSpinBox *subsongSpin_ = nullptr;
-    QLabel *subsongCountLabel_ = nullptr;
-    QLabel *subsongNameLabel_ = nullptr;
-    QCheckBox *allSubsongsCheck_ = nullptr;
-    QLabel *loopLabel_ = nullptr;
-    QPlainTextEdit *logView_ = nullptr;
-
-    // tracker page
-    QLabel *trackerHeader_ = nullptr;
-    QPushButton *followingButton_ = nullptr;
-    TrackerView *tracker_ = nullptr;
-    bool trackerSeen_ = false;
-    int songToken_ = 0;
-    QString songTokenKey_;
-
-    // transport
-    QWidget *transportBar_ = nullptr;
-    QPushButton *prevButton_ = nullptr;
-    QPushButton *playButton_ = nullptr;
-    QPushButton *nextButton_ = nullptr;
-    QPushButton *stopButton_ = nullptr;
-    QCheckBox *loopCheck_ = nullptr;
-    QCheckBox *repeatCheck_ = nullptr;
-    QPushButton *muteButton_ = nullptr;
-    QSlider *volumeSlider_ = nullptr;
-    QLabel *volumeLabel_ = nullptr;
-    JumpSlider *seekSlider_ = nullptr;
-    QLabel *timeLabel_ = nullptr;
-    QLabel *durationLabel_ = nullptr;
-    QLabel *queuePosLabel_ = nullptr;
-    bool transportCompact_ = false;
+    InfoPanel *infoPanel_ = nullptr;
+    TransportBar *transport_ = nullptr;
 
     // status bar
-    QLabel *statusLabel_ = nullptr;
+    ElidedLabel *statusLabel_ = nullptr;
     QLabel *healthLabel_ = nullptr;
     QPushButton *resetButton_ = nullptr;
 
     QTimer *uiTimer_ = nullptr;
     QElapsedTimer sessionTimer_;
-    QElapsedTimer statsTimer_;
-    double statsAccum_ = 0.0;
-    bool statsDirty_ = false;
-    QString statsPath_;
-    QString statsTitle_;
-    QString statsPendingPath_;
-    quint64 statsPendingGeneration_ = 0;
-    quint64 statsCountedGeneration_ = 0;
     QPointer<SettingsDialog> settingsDialog_;
-    bool seeking_ = false;
-    bool closing_ = false;
-    CliState cli_;
 };

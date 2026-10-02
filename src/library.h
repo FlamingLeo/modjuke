@@ -6,6 +6,8 @@
 
 #include <functional>
 
+struct CachedModule;
+
 struct Track {
     QString path;
     QString relDir;              // directory relative to the library root ("" = root)
@@ -22,6 +24,9 @@ struct Track {
     int subsongs = 0;
     QString title;
     QString broken;              // non-empty: failed to load
+
+    // Take the analyzer's (or the cache's) details and mark the track analyzed.
+    void applyAnalysis(const CachedModule &entry);
 
     QString durationText() const;
     QString displayTitle() const { return title.isEmpty() ? name : title; }

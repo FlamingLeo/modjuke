@@ -87,9 +87,9 @@ void ThemePreview::paintEvent(QPaintEvent *)
 {
     QPainter p(this);
     p.fillRect(rect(), palette_[R::BG]);
-    const qreal scale = std::min(width() / 520.0, height() / 400.0);
+    const qreal scale = std::min(width() / qreal(kCanvas.width()), height() / qreal(kCanvas.height()));
     transform_ = QTransform();
-    transform_.translate((width() - 520 * scale) / 2, (height() - 400 * scale) / 2);
+    transform_.translate((width() - kCanvas.width() * scale) / 2, (height() - kCanvas.height() * scale) / 2);
     transform_.scale(scale, scale);
     p.setTransform(transform_);
     p.setRenderHint(QPainter::Antialiasing);
@@ -104,7 +104,7 @@ void ThemePreview::paintEvent(QPaintEvent *)
         const qreal w = std::min(rect.width(), QFontMetricsF(p.font()).horizontalAdvance(s));
         hits_.append({QRectF(rect.x(), rect.center().y()-9, w, 18), role});
     };
-    box(QRectF(0,0,520,400), R::BG);
+    box(QRectF(QPointF(0,0), QSizeF(kCanvas)), R::BG);
     box(QRectF(12,12,496,38), R::BG_PANEL);
     text(QRectF(24,12,160,38), R::ACCENT, tr("PLAYER"));
     text(QRectF(330,12,165,38), R::FG_DIM, tr("02 / 24 modules"));
@@ -158,22 +158,26 @@ void ThemePreview::paintEvent(QPaintEvent *)
     for (const Hit &hit : hits_)
         if (hit.role == selected_) p.drawRect(hit.rect.adjusted(1,1,-1,-1));
 }
+const ThemePreview::Hit *ThemePreview::hitAt(const QPointF &pos) const
+{
+    // The last painted sample wins: text and bars lie on top of their surfaces.
+    const QPointF pt = transform_.inverted().map(pos);
+    for (auto it=hits_.crbegin(); it!=hits_.crend(); ++it)
+        if (it->rect.contains(pt)) return &*it;
+    return nullptr;
+}
 void ThemePreview::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() != Qt::LeftButton) return;
-    const QPointF pt = transform_.inverted().map(event->position());
-    for (auto it=hits_.crbegin(); it!=hits_.crend(); ++it)
-        if (it->rect.contains(pt)) { emit roleSelected(it->role); return; }
+    if (const Hit *hit = hitAt(event->position())) emit roleSelected(hit->role);
 }
 void ThemePreview::mouseMoveEvent(QMouseEvent *event)
 {
-    const QPointF pt = transform_.inverted().map(event->position());
-    for (auto it=hits_.crbegin(); it!=hits_.crend(); ++it)
-        if (it->rect.contains(pt)) {
-            setToolTip(QString::fromLatin1(R::roleName(it->role)) + QStringLiteral("  ") + palette_.name(it->role));
-            return;
-        }
+    if (const Hit *hit = hitAt(event->position()))
+        setToolTip(QString::fromLatin1(R::roleName(hit->role)) + QStringLiteral("  ") + palette_.name(hit->role));
 }
+// Arrow keys step through the roles in enum order, not the grouped order of
+// the role list.
 void ThemePreview::keyPressEvent(QKeyEvent *event)
 {
     int delta = 0;
@@ -299,11 +303,12 @@ void ThemeEditorDialog::validate()
     const QString name=name_->text().trimmed();
     if (!validHex(hex_->text())) message=tr("Enter a six-digit hex color, such as #5aa9ff.");
     else if (name.isEmpty() || name.size()>60) message=tr("Enter a theme name between 1 and 60 characters.");
-    else if (!existing_.contains(id_) && existing_.size()>=100) message=tr("You can store up to 100 custom themes. Delete one in Settings first.");
+    else if (!existing_.contains(id_) && existing_.size()>=R::kMaxCustomThemes)
+        message=tr("You can store up to %1 custom themes. Delete one in Settings first.").arg(R::kMaxCustomThemes);
     else {
-        QJsonObject proposed=existing_; proposed.insert(id_,definition());
-        const QJsonObject cleaned=R::cleanCustomThemes(proposed);
-        if (!cleaned.contains(id_) || cleaned.size()!=proposed.size())
+        bool unique=false;
+        R::withCustomTheme(existing_,id_,definition(),&unique);
+        if (!unique)
             message=tr("Use a unique name, not a built-in theme name or alias. Control characters and the custom: prefix are not allowed.");
     }
     valid_=message.isEmpty(); use_->setEnabled(valid_);

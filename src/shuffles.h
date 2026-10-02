@@ -9,13 +9,18 @@
 #include <QString>
 #include <QStringList>
 
+class QRandomGenerator;
+
 class ShuffleStore {
 public:
     explicit ShuffleStore(const QString &path = QString());
 
     static QString shufflesPath();                                  // <config dir>/shuffles.json
     static QString libraryKey(const QString &directory);            // "library:<abs path>"
-    static QString playlistKey(const QString &name);                // "playlist:<casefold name>"
+    static QString playlistKey(const QString &name);
+    // `fresh` paths at random places in `plan` (songs added after it was drawn)
+    static QStringList mergeIntoPlan(const QStringList &plan, const QStringList &fresh,
+                                     QRandomGenerator *rng);                // "playlist:<casefold name>"
 
     bool contains(const QString &key) const { return orders_.contains(key); }
     QStringList get(const QString &key) const;                      // [] when never drawn

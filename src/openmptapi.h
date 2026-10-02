@@ -77,12 +77,9 @@ public:
 
     bool setRepeatCount(int count) const;
     bool setCtlText(const char *ctl, const QString &value) const;
-    bool setCtlDouble(const char *ctl, double value) const;
     bool setInterpolationLength(int length) const;
     bool setTempoFactor(double factor) const;   // play.tempo_factor
-    void setAtEndStop() const;                   // analyzer: no endless follow
 
-    QStringList metadataKeys() const;
     QString metadata(const QString &key) const;
     QString instrumentName(int index) const;
     QString sampleName(int index) const;
@@ -90,14 +87,21 @@ public:
 
     enum CommandType { Note = 0, Instrument = 1, VolColEffect = 2, Effect = 3, Volume = 4, Parameter = 5 };
     QString formatCommand(int pattern, int row, int channel, CommandType type) const;
-    // Per-character highlight hints from libopenmpt: ' ' empty, '.' filler,
-    // 'n' note, 'i' instrument, 'e' effect, 'v' volume (may be empty).
-    QString highlightRow(int pattern, int row, int channel, CommandType type) const;
 
     ModuleInfo info(const QString &path = QString()) const;
+    // info() without the name lists and the message (the library analyzer's needs)
+    ModuleInfo summary(const QString &path = QString()) const;
 
 private:
     OpenMPTModule(const OpenMPTLib *lib, void *handle) : lib_(lib), handle_(handle) {}
+    ModuleInfo collect(const QString &path, bool names) const;
+    // Calls the C function Fn on this handle, or returns fallback when the
+    // module is closed or the library lacks the function.
+    template<auto Fn, class R, class... A>
+    R call(R fallback, A... args) const;
+    // The same for functions returning a string the caller must free.
+    template<auto Fn, class... A>
+    QString text(A... args) const;
     const OpenMPTLib *lib_ = nullptr;
     void *handle_ = nullptr;
     friend class OpenMPTLib;
@@ -111,7 +115,6 @@ public:
     // Load once; nullptr + error message when libopenmpt cannot be found.
     static OpenMPTLib *instance(QString *errorOut = nullptr);
 
-    const Api &api() const { return *api_; }
     QString versionString() const { return versionString_; }
     QString libraryPath() const { return library_.fileName(); }   // the file that was loaded
     bool extensionSupported(const QByteArray &extLower) const;
@@ -124,9 +127,6 @@ public:
                            const QVector<QPair<QByteArray, QByteArray>> &ctls = {},
                            QString *errorOut = nullptr) const;
 
-    // Analyzer helper (thread safe: opens its own handle): metadata only.
-    static bool analyzeFile(const QString &path, ModuleInfo *out, QString *errorOut);
-
 private:
     OpenMPTLib();
     ~OpenMPTLib();
@@ -136,3 +136,7 @@ private:
     QStringList extensions_;
     friend class OpenMPTModule;
 };
+
+// File extensions a library scan looks for: libopenmpt's own list, or a fixed
+// default when the library is missing.
+QStringList libraryExtensions();

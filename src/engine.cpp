@@ -1,14 +1,10 @@
 #include "engine.h"
 
-#include <QAudioDevice>
-#include <QAudioFormat>
-#include <QAudioSink>
-#include <QDateTime>
-#include <QMediaDevices>
+#include "audiooutput.h"
+
 #include <QFileInfo>
 #include <QMetaObject>
 #include <QQueue>
-#include <QTimer>
 #include <QThread>
 
 #include <algorithm>
@@ -22,20 +18,19 @@ namespace {
 
 struct Command {
     enum Kind { Load, Pause, Seek, SeekOrderRow, Subsong, AllSubsongs, Interpolation, Tempo,
-                Unload, RequestSong, RequestPattern, Quit } kind = Unload;
-    quint64 transportSerial = 0;
+                Unload } kind = Unload;
+    quint64 transportSerial = 0;    // 0: not a transport request
     quint64 generation = 0;
-    quint64 loadEpoch = 0;
-    QString path;
-    double position = 0.0;
-    double factor = 1.0;
-    int index = 0;
-    int order = 0, row = 0;
-    bool paused = false;
-    bool preserveBufferedTail = false;
-    int subsong = 0;
-    int token = 0;
-    int interpLen = 0;
+    quint64 loadEpoch = 0;          // 0: the current epoch when posted
+    QString path;                   // Load
+    double position = 0.0;          // Load, Seek
+    double factor = 1.0;            // Tempo
+    int order = 0, row = 0;         // SeekOrderRow
+    int subsong = 0;                // Load, Subsong
+    int interpLen = 0;              // Load, Interpolation
+    bool paused = false;            // Load, Pause
+    bool enabled = false;           // AllSubsongs
+    bool preserveBufferedTail = false; // Load
 };
 
 // Render at most this many frames per lock acquisition (~23 ms at 44.1 kHz)
@@ -43,31 +38,24 @@ struct Command {
 constexpr size_t kChunkFrames = 1024;
 constexpr int kSeekRampMs = 6;
 
-int interpolationLength(const QString &mode)
+// Seeking to or past the end would end the song at once; land just before it.
+double clampSeekTarget(double seconds, bool bounded, double duration)
 {
-    const QString text = mode.trimmed().toLower();
-    if (text == QLatin1String("off") || text == QLatin1String("1"))
-        return 1;
-    if (text == QLatin1String("linear") || text == QLatin1String("2"))
-        return 2;
-    if (text == QLatin1String("cubic") || text == QLatin1String("4"))
-        return 4;
-    if (text == QLatin1String("sinc") || text == QLatin1String("8"))
-        return 8;
-    return -1;
+    const double target = std::max(0.0, seconds);
+    return bounded && target >= duration ? std::max(0.0, duration - 0.05) : target;
 }
 
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// RenderDevice: a sequential-access QIODevice the QAudioSink pulls from.
+// RenderDevice: the live PCM source the audio output pulls from.
 // Playback decoder calls stay on the audio thread. File preparation and
 // commands run on its event loop; readData() does PCM work, not file IO.
 // ---------------------------------------------------------------------------
-class RenderDevice : public QIODevice {
+class RenderDevice : public AudioSource {
 public:
     RenderDevice(Engine *engine, QObject *parent)
-        : QIODevice(parent), engine_(engine)
+        : AudioSource(parent), engine_(engine)
     {
         // QIODevice's default read-ahead can retain PCM from before a seek
         // and render ahead of the actual sink request (even in the null backend).
@@ -87,103 +75,47 @@ public:
     // an unbuffered live stream, not a file: transport seeks use commands.
     bool reset() override { return true; }
 
+    void setFormat(int sampleRate, bool int16) override
+    {
+        int16Out_ = int16;
+        sampleRate_ = sampleRate;
+    }
+
     void post(Command command)
     {
         if (!command.loadEpoch) command.loadEpoch = engine_->loadEpoch_.loadAcquire();
         {
             QMutexLocker lock(&cmdMutex_);
-            if (command.kind == Command::Load || command.kind == Command::Unload) {
-                // A new file supersedes queued transport for the old one. Keep
-                // global mixer/policy changes, in order, for the new decoder.
-                commands_.erase(std::remove_if(commands_.begin(), commands_.end(), [](const Command &c) {
-                    return c.kind == Command::Load || c.kind == Command::Unload || c.kind == Command::Pause
-                        || c.kind == Command::Seek || c.kind == Command::SeekOrderRow || c.kind == Command::Subsong;
-                }), commands_.end());
-            }
             commands_.enqueue(std::move(command));
             if (wakePosted_) return;
             wakePosted_ = true;
         }
         // Do not wait for free space / the next backend pull to process Load.
         // Commands run on the owning audio event loop, OUTSIDE readData().
-        QMetaObject::invokeMethod(this, [this] {
-            QQueue<Command> pending;
-            { QMutexLocker lock(&cmdMutex_); pending.swap(commands_); wakePosted_ = false; }
-            bool newFile = false, discardOldAudio = false;
-            for (const auto &c : std::as_const(pending)) {
-                const bool global = c.kind == Command::AllSubsongs || c.kind == Command::Interpolation || c.kind == Command::Tempo;
-                if (!global && c.loadEpoch != engine_->loadEpoch_.loadAcquire()) continue;
-                if (c.kind == Command::Load) {
-                    if (applyLoad(c)) { newFile = true; discardOldAudio = !c.preserveBufferedTail; }
-                    continue;
-                }
-                QMutexLocker lock(&engine_->stateMutex_);
-                applyCommand(c);
-            }
-            // Discard the previous file's device queue on explicit file switches
-            // only. Never reset on seeks, metadata requests or subsong traversal.
-            // Outside the read stack, reset/start cannot re-enter the decoder while
-            // it owns the snapshot lock. Open the replacement BEFORE closing
-            // the old stream: a close/open gap can send PulseAudio devices into
-            // idle/suspend and cause multi-second wake delays. Only one source
-            // can pull at a time on this event loop; old buffered PCM is discarded
-            // as soon as the replacement is ready. Seeks never enter this path.
-            if (newFile && discardOldAudio && engine_->sink_) {
-                auto *old = engine_->sink_;
-                auto *next = new QAudioSink(engine_->outputDevice_, old->format(), engine_->audioContext_);
-                next->setBufferSize(engine_->outputBufferBytes_);
-                next->start(this);
-                if (next->error() == QAudio::NoError) {
-                    engine_->sink_ = next;
-                    engine_->watchSink(next);
-                    old->reset();
-                    delete old;
-                } else {
-                    delete next; // retain the working old stream rather than lose playback
-                    engine_->postLog(QStringLiteral("warn"), QStringLiteral("Could not refresh the audio queue; continuing on the existing output stream."));
-                }
-            } else if (newFile && engine_->pumpTimer_ && engine_->pumpTimer_->isActive()) {
-                QMetaObject::invokeMethod(engine_->pumpTimer_, "timeout", Qt::DirectConnection);
-                engine_->pumpTimer_->start(10);
-            }
-            emit readyRead();
-        }, Qt::QueuedConnection);
+        QMetaObject::invokeMethod(this, [this] { drain(); }, Qt::QueuedConnection);
     }
-
-    void setSampleRate(int rate) { sampleRate_ = rate; }
-    int sampleRate() const { return sampleRate_; }
-    // Devices without float output get stereo 16-bit, converted here.
-    void setInt16Output(bool on) { int16Out_ = on; }
 
 protected:
     qint64 readData(char *data, qint64 maxlen) override
     {
-        if (int16Out_) {
-            qint64 written = 0;
-            auto *out = reinterpret_cast<qint16 *>(data);
-            while (written < maxlen) {
-                const size_t wanted = std::min<qint64>((maxlen - written) / (2 * qint64(sizeof(qint16))),
-                                                       qint64(kChunkFrames));
-                if (wanted == 0)
-                    break;
-                conv_.resize(int(wanted * 2));
-                renderChunk(conv_.data(), wanted);
-                qint16 *dst = out + written / qint64(sizeof(qint16));
-                for (size_t i = 0; i < wanted * 2; ++i)
-                    dst[i] = qint16(std::lround(std::clamp(conv_[int(i)], -1.0f, 1.0f) * 32767.0f));
-                written += qint64(wanted) * 2 * qint64(sizeof(qint16));
-            }
-            return written;
-        }
+        const qint64 frameBytes = 2 * qint64(int16Out_ ? sizeof(qint16) : sizeof(float));
         qint64 written = 0;
-        auto *out = reinterpret_cast<float *>(data);
         while (written < maxlen) {
-            const qint64 space = maxlen - written;
-            const size_t wanted = std::min<qint64>(space / (2 * qint64(sizeof(float))), qint64(kChunkFrames));
+            const size_t wanted = std::min<qint64>((maxlen - written) / frameBytes, qint64(kChunkFrames));
             if (wanted == 0)
                 break;
-            renderChunk(out + written / qint64(sizeof(float)), size_t(wanted));
-            written += qint64(wanted) * 2 * qint64(sizeof(float));
+            float *pcm = reinterpret_cast<float *>(data + written);
+            if (int16Out_) {
+                conv_.resize(int(wanted * 2));
+                pcm = conv_.data();
+            }
+            renderChunk(pcm, wanted);
+            if (int16Out_) {
+                auto *dst = reinterpret_cast<qint16 *>(data + written);
+                for (size_t i = 0; i < wanted * 2; ++i)
+                    dst[i] = qint16(std::lround(std::clamp(pcm[i], -1.0f, 1.0f) * 32767.0f));
+            }
+            written += qint64(wanted) * frameBytes;
         }
         return written;
     }
@@ -191,17 +123,41 @@ protected:
     qint64 writeData(const char *, qint64) override { return 0; }
 
 private:
+    void drain()
+    {
+        QQueue<Command> pending;
+        { QMutexLocker lock(&cmdMutex_); pending.swap(commands_); wakePosted_ = false; }
+        bool newFile = false, discardOldAudio = false;
+        for (const auto &c : std::as_const(pending)) {
+            // All commands are posted from the GUI thread, which bumps
+            // loadEpoch_ before it posts a Load/Unload. Queued transport for
+            // the old file therefore carries an older epoch and is dropped;
+            // global mixer/policy changes apply, in order, to the new decoder.
+            const bool global = c.kind == Command::AllSubsongs || c.kind == Command::Interpolation || c.kind == Command::Tempo;
+            if (!global && c.loadEpoch != engine_->loadEpoch_.loadAcquire()) continue;
+            if (c.kind == Command::Load) {
+                if (applyLoad(c)) { newFile = true; discardOldAudio = !c.preserveBufferedTail; }
+                continue;
+            }
+            QMutexLocker lock(&engine_->stateMutex_);
+            applyCommand(c);
+        }
+        // Discard the previous file's device queue on explicit file switches
+        // only. Never reset on seeks, metadata requests or subsong traversal.
+        // Outside the read stack, reset/start cannot re-enter the decoder while
+        // it owns the snapshot lock.
+        if (newFile)
+            engine_->output_->refresh(discardOldAudio);
+        emit readyRead();
+    }
+
     void renderChunk(float *out, size_t frames)
     {
         Engine *e = engine_;
         EngineSnapshot &state = e->state_;
         QMutexLocker lock(&e->stateMutex_);
         syncRepeat();
-        if (!module_.isOpen() || state.paused || state.loading) {
-            std::memset(out, 0, frames * 2 * sizeof(float));
-            return;
-        }
-        if (state.ended) {
+        if (!module_.isOpen() || state.paused || state.loading || state.ended) {
             std::memset(out, 0, frames * 2 * sizeof(float));
             return;
         }
@@ -209,8 +165,7 @@ private:
         // Fade in after a seek/load removes most clicks at chunk boundaries.
         // The ramp continues across pulls (a backend may pull fewer frames
         // than the ramp is long), so its length is fixed when it starts.
-        if (rampTotal_ > 0)
-            rampStep_ = 1.0f / float(rampTotal_);
+        const float rampStep = rampTotal_ > 0 ? 1.0f / float(rampTotal_) : 1.0f;
         float ramp = rampFrames_ > 0 && rampTotal_ > 0
                          ? std::clamp(1.0f - float(rampFrames_) / float(rampTotal_), 0.0f, 1.0f)
                          : 1.0f;
@@ -218,47 +173,38 @@ private:
         size_t got = 0;
         int transitions = 0;
         while (got < frames) {
-            const size_t count = module_.readFloatStereo(sampleRate_, frames-got, out+got*2);
-            got += count;
+            got += module_.readFloatStereo(sampleRate_, frames - got, out + got * 2);
             if (got == frames) break;
+            if (!state.playAllSubsongs || state.numSubsongs <= 1) { handleEnd(); break; }
             // A transport command (pause/play/seek) is still pending: let it
             // apply first instead of ending the file here; the next pull
             // traverses to the next subsong (or ends) as usual.
-            if (state.playAllSubsongs && state.numSubsongs > 1 && renderSerial_ != e->transportSerial_)
-                break;
+            if (renderSerial_ != e->transportSerial_) break;
             if (!advanceSubsong()) { handleEnd(); break; }
             // Bound work for pathological/empty subsongs; continue next pull.
             if (++transitions >= 8) break;
         }
-        float *buf = out;
         float peakL = 0.f, peakR = 0.f;
         const float gain = currentGain();
         for (size_t i = 0; i < got * 2; i += 2) {
-            float l = buf[i] * gain, r = buf[i + 1] * gain;
+            float l = out[i] * gain, r = out[i + 1] * gain;
             if (rampFrames_ > 0) {
                 l *= ramp;
                 r *= ramp;
-                ramp = std::min(1.0f, ramp + rampStep_);
+                ramp = std::min(1.0f, ramp + rampStep);
             }
-            buf[i] = l;
-            buf[i + 1] = r;
+            out[i] = l;
+            out[i + 1] = r;
             peakL = std::max(peakL, std::abs(l));
             peakR = std::max(peakR, std::abs(r));
         }
         if (rampFrames_ > 0)
             rampFrames_ = size_t(std::max(qint64(0), qint64(rampFrames_) - qint64(got)));
-        if (got < frames) {
+        if (got < frames)
             std::memset(out + got * 2, 0, (frames - got) * 2 * sizeof(float));
-        }
 
         // Telemetry for the UI.
-        state.position = module_.positionSeconds();
-        state.order = module_.currentOrder();
-        state.pattern = module_.currentPattern();
-        state.row = module_.currentRow();
-        state.speed = module_.currentSpeed();
-        state.tempo = module_.currentTempo();
-        state.playingChannels = module_.playingChannels();
+        publishPosition();
         state.levelL = peakL;
         state.levelR = peakR;
         if (got > 0) {
@@ -282,10 +228,7 @@ private:
 
     void startRamp()
     {
-        const size_t frames = size_t(double(sampleRate_) * kSeekRampMs / 1000.0);
-        rampFrames_ = frames;
-        rampTotal_ = frames;
-        rampStep_ = frames ? 1.0f / float(frames) : 1.0f;
+        rampFrames_ = rampTotal_ = size_t(double(sampleRate_) * kSeekRampMs / 1000.0);
     }
 
     bool applyLoad(const Command &command)
@@ -307,8 +250,8 @@ private:
             if (tempoFactor_ != 1.0)
                 next.setTempoFactor(tempoFactor_);
             const int count = std::max(1, next.numSubsongs());
-            validSubsong = command.index >= 0 && command.index < count;
-            subsong = validSubsong ? command.index : 0;
+            validSubsong = command.subsong >= 0 && command.subsong < count;
+            subsong = validSubsong ? command.subsong : 0;
             if (!next.selectSubsong(subsong)) {
                 error = QStringLiteral("Cannot select subsong %1").arg(subsong);
                 next.close();
@@ -316,12 +259,8 @@ private:
                 // Read full metadata once, AFTER explicit subsong selection.
                 info = next.info(command.path);
                 const double initial = validSubsong ? command.position : 0.0;
-                if (initial > 0.0 || subsong > 0) {
-                    double target = std::max(0.0, initial);
-                    if (info.durationValid() && !info.endless() && target >= info.duration)
-                        target = std::max(0.0, info.duration - 0.05);
-                    next.seekSeconds(target);
-                }
+                if (initial > 0.0 || subsong > 0)
+                    next.seekSeconds(clampSeekTarget(initial, info.durationValid() && !info.endless(), info.duration));
             }
         }
         if (command.loadEpoch != e->loadEpoch_.loadAcquire()) return false;
@@ -333,7 +272,7 @@ private:
         if (renderSerial_ == e->transportSerial_) state.seekPending = false;
         state.loading = false; state.loaded = module_.isOpen();
         state.path = command.path; state.songGeneration = command.generation;
-        state.orders.clear(); state.paused = command.paused; state.ended = false;
+        state.paused = command.paused; state.ended = false;
         state.failed = !state.loaded; state.loadError.clear();
         state.vu.clear(); state.levelL = state.levelR = 0.f; state.position = 0.0;
         state.playing = state.loaded && !state.paused;
@@ -369,7 +308,7 @@ private:
         }
         switch (command.kind) {
         case Command::Load:
-            break; // prepared/published by applyLoad, never inside a PCM pull
+            break; // applyLoad: file IO must not hold the snapshot lock
         case Command::Pause:
             if (command.paused) {
                 state.paused = true;
@@ -382,7 +321,8 @@ private:
                     endReported_ = false;
                     if (state.playAllSubsongs)
                         selectSubsong(0, ++e->songGeneration_, true);
-                    else applySeek(0.0);
+                    else
+                        seekTo(0.0, true);
                 }
                 state.paused = false;
                 state.playing = state.loaded && !state.ended && !state.failed;
@@ -390,26 +330,21 @@ private:
             }
             break;
         case Command::Seek:
-            applySeek(command.position);
+            seekTo(command.position, true);
             break;
         case Command::SeekOrderRow:
             if (module_.isOpen()) {
                 module_.seekOrderRow(command.order, command.row);
-                publishPosition();
-                state.ended = false;
-                endReported_ = false;
-                if (!state.paused)
-                    state.playing = true;
-                startRamp();
+                playheadMoved(true);
             }
             break;
         case Command::Subsong:
-            if (module_.isOpen() && command.index >= 0 && command.index < state.numSubsongs)
-                selectSubsong(command.index, command.generation, true);
+            if (module_.isOpen() && command.subsong >= 0 && command.subsong < state.numSubsongs)
+                selectSubsong(command.subsong, command.generation, true);
             state.loading = false;
             break;
         case Command::AllSubsongs:
-            playAll_ = command.index != 0;
+            playAll_ = command.enabled;
             syncRepeat();
             if (state.playAllSubsongs && module_.isOpen())
                 selectSubsong(0, command.generation, true);
@@ -432,12 +367,6 @@ private:
             state = EngineSnapshot{};
             syncRepeat();
             break;
-        case Command::RequestSong:
-        case Command::RequestPattern:
-            break; // handled on the separate metadata worker
-        case Command::Quit:
-            module_.close();
-            break;
         }
     }
 
@@ -452,21 +381,26 @@ private:
         state.tempo = module_.currentTempo();
     }
 
-    void applySeek(double seconds)
+    void seekTo(double seconds, bool ramp)
     {
-        EngineSnapshot &state = engine_->state_;
+        const EngineSnapshot &state = engine_->state_;
         if (!module_.isOpen())
             return;
-        double target = std::max(0.0, seconds);
-        if (state.durationValid && !state.info.endless() && target >= state.duration)
-            target = std::max(0.0, state.duration - 0.05);
-        module_.seekSeconds(target);
+        module_.seekSeconds(clampSeekTarget(seconds, state.durationValid && !state.info.endless(), state.duration));
+        playheadMoved(ramp);
+    }
+
+    // After a jump: playing on from the new position, optionally fading in.
+    void playheadMoved(bool ramp)
+    {
+        auto &state = engine_->state_;
         publishPosition();
         state.ended = false;
         endReported_ = false;
         if (!state.paused)
             state.playing = true;
-        startRamp();
+        if (ramp)
+            startRamp();
     }
 
     void syncRepeat()
@@ -481,6 +415,7 @@ private:
         }
     }
 
+    // ramp = false continues a fade-in already in progress (automatic traversal).
     bool selectSubsong(int index, quint64 generation, bool ramp)
     {
         auto &state = engine_->state_;
@@ -492,25 +427,16 @@ private:
         state.numOrders = state.info.orders = module_.numOrders();
         state.duration = state.info.duration = module_.durationSeconds();
         state.durationValid = state.info.durationValid() || state.info.endless();
-        state.orders.clear();
         state.songGeneration = generation;
-        const auto previousRamp = rampFrames_;
-        const auto previousTotal = rampTotal_;
-        applySeek(0.0);
-        if (!ramp) {
-            rampFrames_ = previousRamp;
-            rampTotal_ = previousTotal;
-        }
+        seekTo(0.0, ramp);
         return true;
     }
 
+    // Play-all-subsongs traversal at the end of a subsong, with no transport
+    // command pending (the caller checks both).
     bool advanceSubsong()
     {
         auto &state = engine_->state_;
-        // A user transport request wins over automatic EOF traversal. Do not
-        // wait for the GUI to keep playing the remainder of this file.
-        if (!state.playAllSubsongs || state.numSubsongs <= 1
-            || renderSerial_ != engine_->transportSerial_) return false;
         int next = state.subsong + 1;
         if (next >= state.numSubsongs) {
             if (!state.loop) return false;
@@ -541,131 +467,15 @@ private:
     QQueue<Command> commands_;
     bool wakePosted_ = false;
     int sampleRate_ = 44100;
+    bool int16Out_ = false;              // devices without float output get stereo 16-bit
+    QVector<float> conv_;                // float chunk before the 16-bit conversion
     int nativeRepeat_ = 2;
     bool playAll_ = false;
-    size_t rampFrames_ = 0;
+    size_t rampFrames_ = 0;              // left of the fade-in
     size_t rampTotal_ = 0;
-    float rampStep_ = 1.0f;
     double tempoFactor_ = 1.0;
-    bool int16Out_ = false;
-    QVector<float> conv_;
     bool endReported_ = false;
     quint64 renderSerial_ = 0;
-};
-
-// Tracker formatting can involve thousands of native calls. Never run it
-// on the output thread or under the playback snapshot lock.
-class MetadataWorker : public QObject {
-public:
-    explicit MetadataWorker(Engine *owner) : owner_(owner) {}
-    void request(const Command &command)
-    {
-        Engine *e = owner_;
-        if (command.token != e->metadataToken_.loadRelaxed()) return;
-        if (path_ != command.path || loadEpoch_ != command.loadEpoch || !module_.isOpen()) {
-            path_ = command.path;
-            loadEpoch_ = command.loadEpoch;
-            module_.close();
-            if (auto *lib = OpenMPTLib::instance())
-                module_ = lib->openFile(path_, {{"load.skip_samples", "1"}}, nullptr);
-        }
-        subsong_ = command.subsong;
-        generation_ = command.generation;
-        if (module_.isOpen() && !module_.selectSubsong(subsong_)) module_.close();
-        if (command.token != e->metadataToken_.loadRelaxed() || command.loadEpoch != e->loadEpoch_.loadAcquire()) return;
-        switch (command.kind) {
-        case Command::RequestSong: {
-            SongDataReply reply;
-            reply.token = command.token;
-            reply.path = path_;
-            reply.generation = command.generation;
-            reply.subsong = command.subsong;
-            if (module_.isOpen()) {
-                const int orders = module_.numOrders();
-                for (int i = 0; i < orders; ++i) {
-                    const int pattern = module_.orderPattern(i);
-                    reply.orders << pattern;
-                    if (pattern >= 0 && !reply.rows.contains(pattern))
-                        reply.rows.insert(pattern, module_.patternRows(pattern));
-                }
-                reply.channels = module_.numChannels();
-                reply.numPatterns = module_.numPatterns();
-            }
-            SongDataReply captured = reply;
-            const int subsong = command.subsong;
-            QMetaObject::invokeMethod(e, [e, captured, subsong] {
-                if (captured.token != e->metadataToken_.loadRelaxed()) return;
-                {
-                    QMutexLocker lock(&e->stateMutex_);
-                    if (!e->state_.loaded || e->state_.loading || e->state_.path != captured.path
-                        || e->state_.subsong != subsong || e->state_.songGeneration != captured.generation)
-                        return;
-                    e->state_.orders = captured.orders;
-                }
-                emit e->songDataReady(captured);
-            }, Qt::QueuedConnection);
-            break;
-        }
-        case Command::RequestPattern: {
-            PatternDataReply reply;
-            reply.token = command.token;
-            reply.pattern = command.index;
-            if (!module_.isOpen()) {
-                reply.error = QStringLiteral("no module");
-            } else {
-                reply.rows = module_.patternRows(command.index);
-                reply.channels = command.order > 0 ? command.order : module_.numChannels();
-                reply.cells.resize(reply.rows);
-                for (int row = 0; row < reply.rows; ++row) {
-                    if (command.token != e->metadataToken_.loadRelaxed()) return;
-                    auto &cells = reply.cells[row];
-                    cells.resize(reply.channels);
-                    for (int ch = 0; ch < reply.channels; ++ch) {
-                        using CT = OpenMPTModule::CommandType;
-                        auto take = [&](CT t, const char *fallback) {
-                            QString value = module_.formatCommand(command.index, row, ch, t).trimmed();
-                            if (value.isEmpty() || value.startsWith(QLatin1Char('.')))
-                                return QString::fromLatin1(fallback);
-                            return value;
-                        };
-                        PatternDataReply::Cell cell;
-                        cell.note = take(CT::Note, "...");
-                        cell.instrument = take(CT::Instrument, "");
-                        QString volLetter = take(CT::VolColEffect, "");
-                        QString volValue = take(CT::Volume, "");
-                        if (volValue.isEmpty() && volLetter.isEmpty())
-                            cell.volume.clear();
-                        else
-                            cell.volume = (volLetter.isEmpty() ? QStringLiteral("v") : volLetter)
-                                          + (volValue.isEmpty() ? QStringLiteral("..") : volValue);
-                        QString effLetter = take(CT::Effect, "");
-                        QString effParam = take(CT::Parameter, "");
-                        if (effLetter.isEmpty())
-                            cell.effect.clear();
-                        else
-                            cell.effect = effLetter + (effParam.isEmpty() ? QStringLiteral("00") : effParam);
-                        cells[ch] = cell;
-                    }
-                }
-            }
-            PatternDataReply captured = reply;
-            QMetaObject::invokeMethod(e, [e, captured, epoch = command.loadEpoch] {
-                if (captured.token == e->metadataToken_.loadRelaxed() && epoch == e->loadEpoch_.loadAcquire())
-                    emit e->patternDataReady(captured);
-            },
-                                      Qt::QueuedConnection);
-            break;
-        }
-        default: break;
-        }
-    }
-private:
-    Engine *owner_;
-    QString path_;
-    int subsong_ = 0;
-    quint64 generation_ = 0;
-    quint64 loadEpoch_ = 0;
-    OpenMPTModule module_;
 };
 
 // ---------------------------------------------------------------------------
@@ -678,22 +488,38 @@ Engine::Engine(QObject *parent) : QObject(parent)
     qRegisterMetaType<PatternDataReply>("PatternDataReply");
     audioThread_ = new QThread(this);
     audioThread_->setObjectName(QStringLiteral("Audio output"));
-    audioContext_ = new QObject;
-    device_ = new RenderDevice(this, audioContext_);
-    audioContext_->moveToThread(audioThread_);
-    connect(audioThread_, &QThread::finished, audioContext_, &QObject::deleteLater);
+    output_ = new AudioOutput([this](const QString &level, const QString &text) { postLog(level, text); });
+    device_ = new RenderDevice(this, output_);
+    output_->setSource(device_);
+    output_->moveToThread(audioThread_);
+    connect(audioThread_, &QThread::finished, output_, &QObject::deleteLater);
     audioThread_->start();
+
     metadataThread_ = new QThread(this);
     metadataThread_->setObjectName(QStringLiteral("Tracker metadata"));
-    metadataWorker_ = new MetadataWorker(this);
-    metadataWorker_->moveToThread(metadataThread_);
-    connect(metadataThread_, &QThread::finished, metadataWorker_, &QObject::deleteLater);
+    metadata_ = new MetadataWorker(&metadataToken_, &loadEpoch_);
+    connect(metadata_, &MetadataWorker::songReady, this, [this](const SongDataReply &reply) {
+        if (reply.token != metadataToken_.loadRelaxed()) return;
+        {
+            QMutexLocker lock(&stateMutex_);
+            if (!state_.loaded || state_.loading || state_.path != reply.path
+                || state_.subsong != reply.subsong || state_.songGeneration != reply.generation)
+                return;
+        }
+        emit songDataReady(reply);
+    });
+    connect(metadata_, &MetadataWorker::patternReady, this, [this](const PatternDataReply &reply, quint64 epoch) {
+        if (reply.token == metadataToken_.loadRelaxed() && epoch == loadEpoch_.loadAcquire())
+            emit patternDataReady(reply);
+    });
+    metadata_->moveToThread(metadataThread_);
+    connect(metadataThread_, &QThread::finished, metadata_, &QObject::deleteLater);
     metadataThread_->start();
 }
 
 Engine::~Engine()
 {
-    stopOutput();
+    QMetaObject::invokeMethod(output_, [this] { output_->stop(); }, Qt::BlockingQueuedConnection);
     metadataToken_.fetchAndAddRelaxed(1);
     metadataThread_->quit();
     metadataThread_->wait();
@@ -701,7 +527,19 @@ Engine::~Engine()
     audioThread_->wait();
 }
 
-int Engine::interpolationLength(const QString &mode) { return ::interpolationLength(mode); }
+int Engine::interpolationLength(const QString &mode)
+{
+    const QString text = mode.trimmed().toLower();
+    if (text == QLatin1String("off") || text == QLatin1String("1"))
+        return 1;
+    if (text == QLatin1String("linear") || text == QLatin1String("2"))
+        return 2;
+    if (text == QLatin1String("cubic") || text == QLatin1String("4"))
+        return 4;
+    if (text == QLatin1String("sinc") || text == QLatin1String("8"))
+        return 8;
+    return -1;
+}
 
 QString Engine::interpolationName(int length)
 {
@@ -715,194 +553,23 @@ QString Engine::interpolationName(int length)
     return QString();
 }
 
-QString Engine::interpolationLabel(const QString &mode)
-{
-    if (mode == QLatin1String("off"))
-        return tr("no interpolation");
-    if (mode.isEmpty())
-        return QString();
-    return mode;
-}
-
 void Engine::applySettings(const Settings &settings)
 {
     settings_ = settings;
     setPlayAllSubsongs(settings.playAllSubsongs);
-    volume_.storeRelaxed(settings.volume);
-    muted_.storeRelaxed(settings.muted ? 1 : 0);
-    loopTrack_.storeRelaxed(settings.loopTrack ? 1 : 0);
+    setVolume(settings.volume);
+    setMuted(settings.muted);
+    setLoopTrack(settings.loopTrack);
     // Inspect output ownership only on its thread (manual file changes can
     // replace the sink). Rate/buffer/backend changes still need a rebuild.
     const Settings config = settings;
-    QMetaObject::invokeMethod(audioContext_, [this, config] {
-        if (sink_ || silent_) { stopOutputOnAudioThread(); startOutputOnAudioThread(config); }
+    QMetaObject::invokeMethod(output_, [this, config] {
+        if (output_->isRunning()) { output_->stop(); output_->start(config); }
     }, Qt::BlockingQueuedConnection);
-    if (device_)
-        device_->post(Command{.kind = Command::Interpolation, .interpLen = interpolationLength(settings.interpolation)});
-}
-
-bool Engine::startOutput()
-{
-    bool ok = false;
-    const Settings config = settings_;
-    QMetaObject::invokeMethod(audioContext_, [this, config, &ok] {
-        ok = startOutputOnAudioThread(config);
-    }, Qt::BlockingQueuedConnection);
-    return ok;
-}
-
-bool Engine::startSilentOnAudioThread(const Settings &config, const QString &why)
-{
-    {
-        QMutexLocker lock(&stateMutex_);
-        silent_ = true;
-        outputName_ = QStringLiteral("null");
-        samplerate_ = config.samplerate > 0 ? config.samplerate : 44100;
-    }
-    device_->setInt16Output(false);
-    device_->setSampleRate(samplerate_);
-    // Null output uses the same dedicated thread, independent of the GUI.
-    if (!pumpTimer_) {
-        pumpTimer_ = new QTimer(audioContext_);
-        pumpTimer_->setTimerType(Qt::PreciseTimer);
-        connect(pumpTimer_, &QTimer::timeout, audioContext_, [this] {
-            const int frames = std::max(16, samplerate_ / 100);       // ~10 ms
-            scratch_.resize(frames * 2);
-            device_->read(reinterpret_cast<char *>(scratch_.data()), frames * 2 * int(sizeof(float)));
-        });
-    }
-    pumpTimer_->start(10);
-    emit logMessage(why.isEmpty() ? QStringLiteral("info") : QStringLiteral("warn"),
-                    (why.isEmpty() ? QString() : why + QStringLiteral(" "))
-                        + QStringLiteral("Silent output (%1 Hz) — no audio device in use").arg(samplerate_));
-    return true;
-}
-
-void Engine::watchSink(QAudioSink *sink)
-{
-    // A device that fails to open, or disappears mid-play on a backend that
-    // doesn't move the stream, stops the sink with an error and no further
-    // pulls: playback would freeze without ever reaching its end.
-    connect(sink, &QAudioSink::stateChanged, audioContext_, [this, sink](QAudio::State st) {
-        if (st != QAudio::StoppedState || sink != sink_ || sink->error() == QAudio::NoError)
-            return;
-        const QAudio::Error err = sink->error();
-        QMetaObject::invokeMethod(audioContext_, [this, sink, err] {
-            if (sink != sink_)
-                return;   // already replaced or stopped
-            sink_ = nullptr;
-            sink->deleteLater();
-            recoverOutput(err == QAudio::OpenError ? QStringLiteral("Audio device could not be opened.")
-                                                   : QStringLiteral("Audio device lost."));
-        }, Qt::QueuedConnection);
-    });
-}
-
-void Engine::recoverOutput(const QString &why)
-{
-    // Retry on the current default device; after repeated failures within a
-    // short time, keep playing silently so the position and queue go on.
-    const qint64 now = QDateTime::currentMSecsSinceEpoch();
-    if (now - recoverWindowStart_ > 10000) {
-        recoverWindowStart_ = now;
-        recoverCount_ = 0;
-    }
-    if (++recoverCount_ > 3) {
-        startSilentOnAudioThread(outputConfig_, why);
-        return;
-    }
-    emit logMessage(QStringLiteral("warn"), why + QStringLiteral(" Reopening the audio output."));
-    startOutputOnAudioThread(outputConfig_);
-}
-
-bool Engine::startOutputOnAudioThread(const Settings &config)
-{
-    if (sink_ || silent_)
-        return sink_ != nullptr || silent_;
-    outputConfig_ = config;
-
-    const bool wantNull = config.backend == QLatin1String("null");
-    QAudioDevice audioDevice;
-    if (!wantNull)
-        audioDevice = QMediaDevices::defaultAudioOutput();
-    if (audioDevice.isNull())
-        return startSilentOnAudioThread(config, QString());
-
-    // The renderer produces stereo float; 16-bit stereo is converted.
-    // Anything else (other channel counts, 32-bit int) would be noise.
-    const int preferredRate = audioDevice.preferredFormat().sampleRate() > 0
-                                  ? audioDevice.preferredFormat().sampleRate() : 44100;
-    const int wantRate = config.samplerate > 0 ? config.samplerate : preferredRate;
-    QAudioFormat chosen;
-    auto tryFormat = [&](int rate, QAudioFormat::SampleFormat sampleFormat) {
-        QAudioFormat f;
-        f.setChannelCount(2);
-        f.setSampleFormat(sampleFormat);
-        f.setSampleRate(rate);
-        if (!audioDevice.isFormatSupported(f))
-            return false;
-        chosen = f;
-        return true;
-    };
-    if (!tryFormat(wantRate, QAudioFormat::Float) && !tryFormat(preferredRate, QAudioFormat::Float)
-        && !tryFormat(wantRate, QAudioFormat::Int16) && !tryFormat(preferredRate, QAudioFormat::Int16))
-        return startSilentOnAudioThread(
-            config, QStringLiteral("%1 offers no stereo float or 16-bit format.").arg(audioDevice.description()));
-    const int rate = chosen.sampleRate();
-    if (config.samplerate > 0 && rate != config.samplerate)
-        emit logMessage(QStringLiteral("warn"),
-                        QStringLiteral("Output rate %1 Hz unavailable, using %2 Hz")
-                            .arg(config.samplerate).arg(rate));
-    const bool int16 = chosen.sampleFormat() == QAudioFormat::Int16;
-
-    outputDevice_ = audioDevice;
-    sink_ = new QAudioSink(audioDevice, chosen, audioContext_);
-    const qint64 bytesPerSecond = qint64(rate) * 2 * (int16 ? 2 : 4);
-    outputBufferBytes_ = std::max<qint64>(bytesPerSecond * config.bufferMs / 1000,
-                                          bytesPerSecond * 25 / 1000);
-    sink_->setBufferSize(outputBufferBytes_);
-    {
-        QMutexLocker lock(&stateMutex_);
-        samplerate_ = rate;
-        outputName_ = QStringLiteral("qtaudio");
-        silent_ = false;
-    }
-    device_->setInt16Output(int16);
-    device_->setSampleRate(rate);
-    watchSink(sink_);
-    sink_->start(device_);
-    if (sink_->error() != QAudio::NoError) {
-        delete sink_;
-        sink_ = nullptr;
-        return startSilentOnAudioThread(
-            config, QStringLiteral("Audio device %1 could not be opened.").arg(audioDevice.description()));
-    }
-    if (pumpTimer_)
-        pumpTimer_->stop();
-    emit logMessage(QStringLiteral("info"),
-                    QStringLiteral("Audio: %1 @ %2 Hz%3").arg(audioDevice.description(), QString::number(rate),
-                                                            int16 ? QStringLiteral(", 16-bit") : QString()));
-    return true;
-}
-
-void Engine::stopOutput()
-{
-    QMetaObject::invokeMethod(audioContext_, [this] { stopOutputOnAudioThread(); },
-                              Qt::BlockingQueuedConnection);
-}
-
-void Engine::stopOutputOnAudioThread()
-{
-    if (sink_) {
-        sink_->stop();
-        delete sink_;
-        sink_ = nullptr;
-    }
-    if (pumpTimer_) {
-        pumpTimer_->stop();
-    }
-    QMutexLocker lock(&stateMutex_);
-    silent_ = false;
+    Command command;
+    command.kind = Command::Interpolation;
+    command.interpLen = interpolationLength(settings.interpolation);
+    device_->post(command);
 }
 
 void Engine::playPath(const QString &path, double position, bool paused, int subsong, bool preserveBufferedTail)
@@ -915,14 +582,13 @@ void Engine::playPath(const QString &path, double position, bool paused, int sub
     command.path = path;
     command.position = position;
     command.paused = paused;
-    command.index = subsong;
+    command.subsong = subsong;
     command.interpLen = interpolationLength(settings_.interpolation);
     {
         QMutexLocker lock(&stateMutex_);
         command.transportSerial = ++transportSerial_;
         state_.seekPending = false;
         command.generation = state_.songGeneration = ++songGeneration_;
-        state_.orders.clear();
         state_.info = {}; state_.duration = 0.0; state_.durationValid = false;
         state_.channels = 0; state_.numSubsongs = 1; state_.vu.clear();
         state_.numOrders = 0;
@@ -942,9 +608,7 @@ void Engine::playPath(const QString &path, double position, bool paused, int sub
     // Opening an output device can itself block; do not put a blocking call
     // behind the asynchronous file load on the GUI thread's first playback.
     const Settings config = settings_;
-    QMetaObject::invokeMethod(audioContext_, [this, config] {
-        if (!sink_ && !silent_) startOutputOnAudioThread(config);
-    }, Qt::QueuedConnection);
+    QMetaObject::invokeMethod(output_, [this, config] { output_->start(config); }, Qt::QueuedConnection);
     device_->post(command);
 }
 
@@ -1004,13 +668,11 @@ void Engine::seek(double seconds)
 {
     Command command;
     command.kind = Command::Seek;
-    command.position = std::max(0.0, seconds);
     {
         QMutexLocker lock(&stateMutex_);
         if (!state_.loaded && !state_.loading)
             return;
-        if (state_.durationValid && command.position >= state_.duration)
-            command.position = std::max(0.0, state_.duration - 0.05);
+        command.position = clampSeekTarget(seconds, state_.durationValid, state_.duration);
         command.transportSerial = ++transportSerial_;
         state_.seekTarget = command.position;
         state_.seekPending = true;
@@ -1067,7 +729,7 @@ void Engine::setPlayAllSubsongs(bool enabled)
     if (allSubsongsRequested_.fetchAndStoreRelaxed(enabled ? 1 : 0) == int(enabled)) return;
     Command command;
     command.kind = Command::AllSubsongs;
-    command.index = enabled ? 1 : 0;
+    command.enabled = enabled;
     {
         QMutexLocker lock(&stateMutex_);
         command.transportSerial = ++transportSerial_;
@@ -1080,7 +742,7 @@ void Engine::setSubsong(int index)
 {
     Command command;
     command.kind = Command::Subsong;
-    command.index = index;
+    command.subsong = index;
     {
         QMutexLocker lock(&stateMutex_);
         // During queued loads/changes validate on the worker, not against the
@@ -1104,18 +766,6 @@ void Engine::setTempoFactor(double factor)
     device_->post(command);
 }
 
-void Engine::setInterpolation(const QString &mode)
-{
-    const int length = interpolationLength(mode);
-    if (length < 0)
-        return;
-    settings_.interpolation = mode;
-    Command command;
-    command.kind = Command::Interpolation;
-    command.interpLen = length;
-    device_->post(command);
-}
-
 void Engine::setVolume(int percent)
 {
     volume_.storeRelaxed(std::clamp(percent, 0, 100));
@@ -1133,62 +783,46 @@ void Engine::setLoopTrack(bool loop)
 
 void Engine::requestSongData(int token)
 {
-    Command command;
-    command.kind = Command::RequestSong;
-    command.token = token;
     metadataToken_.storeRelaxed(token);
-    const auto snap = snapshot();
-    command.path = snap.path;
-    command.subsong = snap.subsong;
-    command.generation = snap.songGeneration;
-    command.loadEpoch = loadEpoch_.loadAcquire();
-    QMetaObject::invokeMethod(metadataWorker_, [this, command] {
-        static_cast<MetadataWorker *>(metadataWorker_)->request(command);
+    QString path;
+    int subsong = 0;
+    quint64 generation = 0;
+    {
+        QMutexLocker lock(&stateMutex_);
+        path = state_.path;
+        subsong = state_.subsong;
+        generation = state_.songGeneration;
+    }
+    const quint64 epoch = loadEpoch_.loadAcquire();
+    QMetaObject::invokeMethod(metadata_, [w = metadata_, token, path, subsong, generation, epoch] {
+        w->requestSong(token, path, subsong, generation, epoch);
     }, Qt::QueuedConnection);
 }
 
 void Engine::requestPattern(int token, int pattern, int channels)
 {
-    Command command;
-    command.kind = Command::RequestPattern;
-    command.token = token;
-    command.index = pattern;
-    command.order = channels;   // reused as "channel limit" (0 = all)
-    const auto snap = snapshot();
-    command.path = snap.path;
-    command.subsong = snap.subsong;
-    command.generation = snap.songGeneration;
-    command.loadEpoch = loadEpoch_.loadAcquire();
-    QMetaObject::invokeMethod(metadataWorker_, [this, command] {
-        static_cast<MetadataWorker *>(metadataWorker_)->request(command);
+    QString path;
+    int subsong = 0;
+    {
+        QMutexLocker lock(&stateMutex_);
+        path = state_.path;
+        subsong = state_.subsong;
+    }
+    const quint64 epoch = loadEpoch_.loadAcquire();
+    QMetaObject::invokeMethod(metadata_, [w = metadata_, token, path, subsong, epoch, pattern, channels] {
+        w->requestPattern(token, path, subsong, epoch, pattern, channels);
     }, Qt::QueuedConnection);
 }
 
 EngineSnapshot Engine::snapshot() const
 {
     QMutexLocker lock(&stateMutex_);
-    EngineSnapshot copy = state_;
-    return copy;
-}
-
-int Engine::samplerate() const
-{
-    QMutexLocker lock(&stateMutex_);
-    return samplerate_;
-}
-
-bool Engine::isSilentBackend() const
-{
-    QMutexLocker lock(&stateMutex_);
-    return silent_;
+    return state_;
 }
 
 QString Engine::outputDescription() const
 {
-    QMutexLocker lock(&stateMutex_);
-    QString name = silent_ ? QStringLiteral("null") : outputName_;
-    QString rate = QString::number(samplerate_ / 1000.0, 'g', 4) + QStringLiteral("kHz");
-    return QStringLiteral("%1 %2, buf %3 ms").arg(name, rate).arg(settings_.bufferMs);
+    return QStringLiteral("%1, buf %2 ms").arg(output_->description(), QString::number(settings_.bufferMs));
 }
 
 void Engine::postLog(const QString &level, const QString &text)
@@ -1204,8 +838,6 @@ void Engine::handleFinished(quint64 transportSerial)
         // it, never to a later seek/restart/load (even of the same file).
         if (transportSerial != transportSerial_ || !state_.ended)
             return;
-        state_.playing = false;
-        state_.ended = true;
     }
     emit finished();
 }

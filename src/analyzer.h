@@ -8,14 +8,17 @@
 #include <QObject>
 #include <QString>
 #include <QThread>
-#include <QVector>
 #include <atomic>
 
-class QMutex;
+class OpenMPTLib;
 
 // (alias so the comma in QMap<...,...> does not break Q_DECLARE_METATYPE)
 using AnalysisResults = QMap<QString, CachedModule>;
 Q_DECLARE_METATYPE(AnalysisResults)
+
+// One module file's library record, with the file's size and mtime; broken is
+// set when libopenmpt cannot load it.
+CachedModule analyzeModule(const OpenMPTLib &lib, const QString &path);
 
 class Analyzer : public QObject {
     Q_OBJECT
@@ -37,8 +40,7 @@ signals:
     void finished(const QString &error, bool canceled);
 
 private:
-    class Worker;
-    Worker *worker_ = nullptr;
+    QString run(const QStringList &paths, bool useCache);   // on thread_; returns the error
     QThread *thread_ = nullptr;
     std::atomic_bool cancel_{false};
     QString error_;

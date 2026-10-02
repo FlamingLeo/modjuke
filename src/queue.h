@@ -15,7 +15,7 @@ class QueueModel : public QAbstractTableModel {
     Q_OBJECT
 public:
     enum Column { Module = 0, Folder, Length, Format, Channels, Subsongs, COLUMN_COUNT };
-    enum Role { PathRole = Qt::UserRole, KindRole, BrokenRole };
+    enum Role { PathRole = Qt::UserRole };
     enum Kind { TrackRow, DirRow };
 
     explicit QueueModel(QObject *parent = nullptr);
@@ -47,13 +47,12 @@ public:
     void toggleDirectory(const QModelIndex &index);
 
     void setReorderFlags(bool on) { reorderFlags_ = on; }
-    bool reorderFlags_ = false;
 
     void setPlayingPath(const QString &path);
     void setMissingPaths(const QSet<QString> &missing);
     // the playing row: its own colors, so it stays distinct from the selection
     void setPlayingColors(const QColor &background, const QColor &foreground);
-    void setColors(const QColor &stripe, const QColor &dim, const QColor &red);
+    void setColors(const QColor &dim, const QColor &red);
     void setDirectoryColor(const QColor &color) { directoryColor_ = color; }
 
 signals:
@@ -74,7 +73,8 @@ private:
     QVector<Track> queue_;
     QSet<QString> missing_;
     QString playingPath_;
-    QColor playingBg_, playingFg_, stripe_, dim_, red_, directoryColor_;
+    QColor playingBg_, playingFg_, dim_, red_, directoryColor_;
+    bool reorderFlags_ = false;   // drops accepted (saved playlist order)
     void rebuildRows(bool showDirectoryRows);
 };
 
@@ -104,6 +104,7 @@ protected:
     QModelIndex currentIndexAtSelected();
 
 private:
+    QueueModel *queueModel() const;   // null for any other model
     void startRowDrag();
     bool widthUpdatePending_ = false;
     void scheduleWidthUpdate();

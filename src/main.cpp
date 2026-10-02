@@ -9,6 +9,7 @@
 #include "config.h"
 #include "library.h"
 #include "mainwindow.h"
+#include "sessionoptions.h"
 #include "openmptapi.h"
 #include "theme.h"
 
@@ -51,61 +52,21 @@ static void attachParentConsole()
 }
 #endif
 
-static QStringList defaultExtensions()
-{
-    return {QStringLiteral("669"), QStringLiteral("amf"), QStringLiteral("ams"),
-            QStringLiteral("dbm"), QStringLiteral("dmf"), QStringLiteral("dsm"),
-            QStringLiteral("dtm"), QStringLiteral("far"), QStringLiteral("gdm"),
-            QStringLiteral("it"), QStringLiteral("j2b"), QStringLiteral("med"),
-            QStringLiteral("mdl"), QStringLiteral("mod"), QStringLiteral("mptm"),
-            QStringLiteral("mt2"), QStringLiteral("mtm"), QStringLiteral("noiser"),
-            QStringLiteral("okta"), QStringLiteral("pt3"), QStringLiteral("s3m"),
-            QStringLiteral("sfx"), QStringLiteral("stm"), QStringLiteral("stx"),
-            QStringLiteral("ult"), QStringLiteral("wow"), QStringLiteral("xm")};
-}
-
-static QStringList supportedExtensions()
-{
-    OpenMPTLib *lib = OpenMPTLib::instance();
-    if (lib) {
-        const QStringList exts = lib->supportedExtensions();
-        if (!exts.isEmpty())
-            return exts;
-    }
-    return defaultExtensions();
-}
-
 static int runScan(const QString &root, bool ordered, bool analyze)
 {
     QTextStream out(stdout);
-    ScanResult result = scanLibrary(root, supportedExtensions());
+    ScanResult result = scanLibrary(root, libraryExtensions());
     QVector<Track> tracks = result.tracks;
     if (analyze) {
         QString loadError;
-        if (!OpenMPTLib::instance(&loadError)) {
+        const OpenMPTLib *lib = OpenMPTLib::instance(&loadError);
+        if (!lib) {
             // an unanalyzed listing with exit 0 looked like a successful run
             QTextStream(stderr) << "libopenmpt: NOT FOUND (" << loadError << ")\n";
             return 1;
         }
         for (Track &track : tracks) {
-            OpenMPTLib *lib = OpenMPTLib::instance();
-            if (!lib)
-                break;
-            OpenMPTModule module = lib->openFile(track.path, {}, nullptr);
-            if (!module.isOpen()) {
-                track.broken = QStringLiteral("could not load module");
-                track.analyzed = true;
-                continue;
-            }
-            const ModuleInfo info = module.info(track.path);
-            track.analyzed = true;
-            track.duration = info.duration;
-            track.fmt = info.format;
-            track.channels = info.channels;
-            track.subsongs = std::max(1, info.subsongs);
-            track.title = info.title;
-            if (!info.ok)
-                track.broken = QStringLiteral("could not load module");
+            track.applyAnalysis(analyzeModule(*lib, track.path));
         }
     }
     if (ordered)
@@ -238,13 +199,13 @@ int main(int argc, char **argv)
         QTextStream(stderr) << "modjuke: " << message << "\n";
         return 2;
     };
-    QHash<QString, QString> overrides;
+    SessionOptions session;
     if (parser.isSet(volumeOption)) {
         bool ok = false;
         const int volume = parser.value(volumeOption).trimmed().toInt(&ok);
         if (!ok || volume < 0 || volume > 100)
             return fail(QStringLiteral("--volume takes a number from 0 to 100"));
-        overrides.insert(QStringLiteral("volume"), QString::number(volume));
+        session.volume = volume;
     }
     if (parser.isSet(themeOption)) {
         const QString theme = parser.value(themeOption);
@@ -253,28 +214,27 @@ int main(int argc, char **argv)
             && folded != QLatin1String("dark") && folded != QLatin1String("default"))
             return fail(QStringLiteral("unknown theme \"%1\" (built in: %2, or a custom theme's name)")
                             .arg(theme, Palette::builtinThemes().join(QStringLiteral(", "))));
-        overrides.insert(QStringLiteral("theme"), theme);
+        session.theme = theme;
     }
     if (parser.isSet(speedOption)) {
         bool ok = false;
         const double speed = parser.value(speedOption).trimmed().toDouble(&ok);
         if (!ok || !(speed >= 0.05 && speed <= 20.0))
             return fail(QStringLiteral("--speed takes a factor from 0.05 to 20"));
-        overrides.insert(QStringLiteral("speed"), parser.value(speedOption).trimmed());
+        session.speed = speed;
     }
     if (parser.isSet(interpOption)) {
         const QString mode = parser.value(interpOption).trimmed().toLower();
         if (Engine::interpolationLength(mode) <= 0)
             return fail(QStringLiteral("--interpolation takes off, linear, cubic or sinc"));
         // stored by name ("8" would be reset to sinc by the settings loader anyway)
-        overrides.insert(QStringLiteral("interpolation"),
-                         Engine::interpolationName(Engine::interpolationLength(mode)));
+        session.interpolation = Engine::interpolationName(Engine::interpolationLength(mode));
     }
     if (parser.isSet(backendOption)) {
         const QString backend = parser.value(backendOption).trimmed().toLower();
         if (backend != QLatin1String("auto") && backend != QLatin1String("null"))
             return fail(QStringLiteral("--backend takes auto or null"));
-        overrides.insert(QStringLiteral("backend"), backend);
+        session.backend = backend;
     }
     QString dir = parser.value(dirOption);
     if (dir.isEmpty() && !parser.positionalArguments().isEmpty())
@@ -286,7 +246,7 @@ int main(int argc, char **argv)
                         : QStringLiteral("folder not found: %1").arg(dir));
 
     MainWindow window;
-    window.applyCliOverrides(overrides);
+    window.applySessionOptions(session);
     if (!dir.isEmpty())
         window.openDirectory(dir);
 

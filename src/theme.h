@@ -38,8 +38,20 @@ struct Palette {
     static Palette resolve(const QString &themeKey, const QJsonObject &customThemes);
 
     // mirrors modjuke/theme.py: keeps valid custom palettes (full colors merged
-    // onto dark, hex lowercased) and drops the rest; caps at 100 entries.
+    // onto dark, hex lowercased) and drops the rest; caps at kMaxCustomThemes.
     static QJsonObject cleanCustomThemes(const QJsonObject &raw);
+
+    // custom themes: "custom:<id>" -> {"name", "colours"}, at most this many
+    static constexpr int kMaxCustomThemes = 100;
+    static QString customThemeName(const QJsonObject &customThemes, const QString &id);
+    // "My theme", or "My theme N" when taken (case-insensitive)
+    static QString suggestCustomThemeName(const QJsonObject &customThemes);
+    static QString newCustomThemeId();                // "custom:<uuid>"
+    // customThemes with id set to definition, cleaned. *ok is false (and
+    // customThemes comes back unchanged) when cleaning would drop any entry:
+    // an invalid or clashing name.
+    static QJsonObject withCustomTheme(const QJsonObject &customThemes, const QString &id,
+                                       const QJsonObject &definition, bool *ok);
     // mirrors theme.normalise(): resolves aliases, case, and custom display
     // names to a canonical key ("dark" fallback).
     static QString normalizeTheme(const QString &name, const QJsonObject &customThemes);

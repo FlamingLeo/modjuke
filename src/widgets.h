@@ -13,9 +13,11 @@
 #include <QPushButton>
 #include <QCache>
 #include <QPixmap>
+#include <QLabel>
 #include <QTimer>
 
 struct Palette;   // struct, as in theme.h: MSVC encodes the keyword in link names
+class QPainter;
 
 // Text-only toggle button that reserves the styled space needed by every label.
 // Measurements remain font/DPI/style-aware rather than fixing a pixel width.
@@ -31,6 +33,23 @@ private:
 
 // Absolute left-click positioning without Qt's page-step/repeat behavior.
 // A press requests immediately; a drag previews and requests again on release.
+// A one-line label that shortens its text with "…" when it doesn't fit,
+// instead of cutting a letter in half; the tooltip shows all of it.
+class ElidedLabel : public QLabel {
+public:
+    using QLabel::QLabel;
+    void setFullText(const QString &text);
+    QString fullText() const { return full_; }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override;
+    void changeEvent(QEvent *event) override;   // the stylesheet font arrives late
+
+private:
+    void elide();
+    QString full_;
+};
+
 class JumpSlider : public QSlider {
     Q_OBJECT
 public:
@@ -59,9 +78,6 @@ public:
     QSize sizeHint() const override { return QSize(330, 74); }
     QSize minimumSizeHint() const override { return QSize(60, 74); }
     void setChannels(int count);
-    int channelCount() const { return channels_.size(); }
-    float channelLevel(int index) const { return channels_.value(index).level; }
-    float leftLevel() const { return masterL_; }
     void updateValues(const QVector<float> &vu, float levelL, float levelR);
     void applyPalette(const Palette *palette);
 
@@ -97,7 +113,7 @@ public:
     void setFollowing(bool following);
     bool following() const { return following_; }
     void scrollToPlaying();
-    int selectedPattern() const;      // -1: follow the song
+    void setSmoothScrolling(bool smooth);
     void focusVisible();              // ensure the current line is on screen
 
     enum PatternJump { PrevPattern = -1, NextPattern = 1 };
@@ -117,7 +133,6 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
-    friend class TestTracker;
     enum Layout { Full, NoInstrument, Shared, Notes };
     void requestVisiblePatterns();
     double centeredTop(int line) const;
@@ -145,10 +160,12 @@ private:
         bool empty = false;   // placeholder for an empty pattern
     };
 
+    // one body row at y 0 (paintEvent rasterizes and caches it)
+    void paintRow(QPainter &p, const Line &line, bool highlight, int startChannel, int endChannel,
+                  const Palette &pal) const;
     void rebuildLines();
     void relayout();
     int visibleRows() const;
-    int lineHeight() const { return lineHeight_; }
     void updateScrollBars();
     QColor effectColor(const QString &effect) const;
     int playingLine() const;
@@ -167,10 +184,7 @@ private:
     double topRow_ = 0.0;                     // float for smooth scrolling
     bool smoothScroll_ = false;
     QString family_;                 // module format family for effect colors
-public:
-    void setSmoothScrolling(bool smooth);
     int lineHeight_ = 16, rowNumberWidth_ = 44, channelWidth_ = 130, headerHeight_ = 20;
-    int selectedPattern_ = -1;
     const Palette *palette_ = nullptr;
     QFont monoFont_;
 };

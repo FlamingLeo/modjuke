@@ -15,7 +15,7 @@ public:
     explicit ThemePreview(QWidget *parent = nullptr);
     void setColors(const Palette &palette);
     void setSelectedRole(Palette::Role role);
-    QSize sizeHint() const override { return QSize(520, 400); }
+    QSize sizeHint() const override { return kCanvas; }
 signals:
     void roleSelected(Palette::Role role);
 protected:
@@ -24,8 +24,10 @@ protected:
     void mouseMoveEvent(QMouseEvent *) override;
     void keyPressEvent(QKeyEvent *) override;
 private:
+    static constexpr QSize kCanvas{520, 400};   // the sample's own coordinates, scaled to fit
     struct Hit { QRectF rect; Palette::Role role; };
-    QVector<Hit> hits_;
+    const Hit *hitAt(const QPointF &pos) const;   // pos in widget coordinates
+    QVector<Hit> hits_;   // rebuilt by every paint, with the samples' text widths
     Palette palette_ = Palette::builtin(QStringLiteral("dark"));
     Palette::Role selected_ = Palette::BG;
     QTransform transform_;

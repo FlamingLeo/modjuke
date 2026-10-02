@@ -1,88 +1,52 @@
 #include "shuffles.h"
 
+#include <QRandomGenerator>
+
+#include <algorithm>
+
 #include "casefold.h"
 #include "config.h"
-#include "stores.h"
+#include "jsonfile.h"
 
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
 #include <QJsonArray>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QSaveFile>
-
-namespace {
-
-QString cleanAbs(const QString &path)
-{
-    if (path.isEmpty())
-        return QString();
-    const QFileInfo info(path);
-    return QDir::cleanPath(info.absoluteFilePath());
-}
-
-}   // namespace
 
 ShuffleStore::ShuffleStore(const QString &path)
     : path_(path.isEmpty() ? shufflesPath() : path)
 {
-    QFile file(path_);
-    if (!file.exists())
+    const JsonRead file = readJsonObject(path_, 0, 1);
+    if (file.status == JsonRead::Missing)
         return;
-    if (!file.open(QIODevice::ReadOnly)) {
+    if (file.status == JsonRead::OpenFailed) {
         error = QStringLiteral("Could not read saved shuffle orders (could not open the file), "
                                "new ones will be drawn");
         return;
     }
-    QJsonParseError parseError{};
-    const QByteArray bytes = file.readAll();
-    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
-    file.close();
-    const QJsonObject root = doc.isObject() ? doc.object() : QJsonObject{};
-    if (parseError.error != QJsonParseError::NoError || root.isEmpty()
-        || root.value(QStringLiteral("version")).toInt() != 1
-        || !root.value(QStringLiteral("orders")).isObject()) {
-        orders_.clear();
-        keyOrder_.clear();
+    if (!file.ok() || !file.root.value(QStringLiteral("orders")).isObject()) {
         error = QStringLiteral("Could not read saved shuffle orders (unknown format), "
                                "new ones will be drawn");
         return;
     }
-    const QJsonObject orders = root.value(QStringLiteral("orders")).toObject();
     // least recently drawn first: the file's own key order (QJsonObject would
     // iterate alphabetically, and pruning would drop the wrong orders)
-    QStringList fileOrder = jsonMemberKeyOrder(bytes, QStringLiteral("orders"));
-    for (auto it = orders.constBegin(); it != orders.constEnd(); ++it)
-        if (!fileOrder.contains(it.key()))
-            fileOrder << it.key();
-    for (const QString &key : std::as_const(fileOrder)) {
-        const auto it = orders.constFind(key);
-        if (it == orders.constEnd() || !it.value().isArray())
+    for (const auto &[key, value] : jsonMemberEntries(file, QStringLiteral("orders"))) {
+        if (!value.isArray())
             continue;
-        QStringList paths;
-        const QJsonArray array = it.value().toArray();
-        for (const QJsonValue &value : array) {
-            if (value.isString())
-                paths << value.toString();
-            if (paths.size() >= kMaxPaths)
-                break;
-        }
+        const QStringList paths = jsonStringsStrict(value, kMaxPaths);
         if (!paths.isEmpty()) {
-            keyOrder_ << it.key();
-            orders_.insert(it.key(), paths);
+            keyOrder_ << key;
+            orders_.insert(key, paths);
         }
     }
 }
 
 QString ShuffleStore::shufflesPath()
 {
-    return QDir(modjukeConfigDir()).filePath(QStringLiteral("shuffles.json"));
+    return modjukeConfigFile(QStringLiteral("shuffles.json"));
 }
 
 QString ShuffleStore::libraryKey(const QString &directory)
 {
-    return QStringLiteral("library:") + cleanAbs(directory);
+    return QStringLiteral("library:") + absolutePathKey(directory, HomeTilde::Keep);
 }
 
 QString ShuffleStore::playlistKey(const QString &name)
@@ -97,12 +61,7 @@ QStringList ShuffleStore::get(const QString &key) const
 
 bool ShuffleStore::put(const QString &key, const QStringList &paths)
 {
-    QStringList clean;
-    for (const QString &path : paths) {
-        clean << path;
-        if (clean.size() >= kMaxPaths)
-            break;
-    }
+    const QStringList clean = paths.mid(0, kMaxPaths);
     if (clean.isEmpty())
         return false;
     if (orders_.value(key) == clean)
@@ -147,27 +106,39 @@ bool ShuffleStore::save()
 {
     // keys in least-recently-drawn order, like the Python writer (a QJsonObject
     // would sort them and lose the order pruning relies on)
-    QByteArray data = "{\"orders\":{";
-    bool first = true;
-    for (const QString &key : std::as_const(keyOrder_)) {
-        if (!first)
-            data += ',';
-        first = false;
-        data += jsonStringLiteral(key) + ':'
-                + QJsonDocument(QJsonArray::fromStringList(orders_.value(key))).toJson(QJsonDocument::Compact);
-    }
-    data += "},\"version\":1}\n";
-    QDir().mkpath(QFileInfo(path_).absolutePath());
-    QSaveFile file(path_);
-    if (!file.open(QIODevice::WriteOnly)) {
-        error = QStringLiteral("Could not save the shuffle order: %1").arg(file.errorString());
-        return false;
-    }
-    file.write(data);
-    if (!file.commit()) {
-        error = QStringLiteral("Could not save the shuffle order: %1").arg(file.error());
+    JsonEntries entries;
+    entries.reserve(keyOrder_.size());
+    for (const QString &key : std::as_const(keyOrder_))
+        entries.append({key, QJsonArray::fromStringList(orders_.value(key))});
+    WriteFailure why;
+    if (!writeFileAtomic(path_, versionedMemberJson(QStringLiteral("orders"), entries) + '\n', &why)) {
+        // a failed commit has always been reported by its error code
+        error = QStringLiteral("Could not save the shuffle order: %1")
+                    .arg(why.opened ? QString::number(why.code) : why.text);
         return false;
     }
     error.clear();
     return true;
+}
+
+QStringList ShuffleStore::mergeIntoPlan(const QStringList &plan, const QStringList &fresh,
+                                        QRandomGenerator *rng)
+{
+    // each new song gets a random slot; one merge pass keeps it O(n)
+    QVector<QPair<int, QString>> places;
+    places.reserve(fresh.size());
+    for (const QString &path : fresh)
+        places.append({int(rng->bounded(plan.size() + 1)), path});
+    std::sort(places.begin(), places.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    QStringList merged;
+    merged.reserve(plan.size() + places.size());
+    int s = 0;
+    for (int i = 0; i <= plan.size(); ++i) {
+        while (s < places.size() && places[s].first == i)
+            merged << places[s++].second;
+        if (i < plan.size())
+            merged << plan[i];
+    }
+    return merged;
 }

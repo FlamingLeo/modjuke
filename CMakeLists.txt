@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(modjuke VERSION 1.0.1 LANGUAGES CXX)
+project(modjuke VERSION 1.1.0 LANGUAGES CXX)
 
 # Targets Qt 6.4.2 (Linux Mint 22 / Ubuntu 24.04); builds against newer too,
 # and on Windows and macOS (packaging/ and .github/workflows/build.yml).
@@ -20,20 +20,46 @@ add_library(modjuke_core STATIC
     src/reveal.cpp
     src/openmptapi.cpp
     src/config.cpp
-    src/stores.cpp
+    src/jsonfile.cpp
+    src/analysiscache.cpp
+    src/playliststore.cpp
+    src/statsstore.cpp
+    src/ignorestore.cpp
     src/shuffles.cpp
     src/library.cpp
+    src/playbackqueue.cpp
+    src/queuebuilder.cpp
+    src/queueplayer.cpp
+    src/settingskeeper.cpp
+    src/listeningstats.cpp
+    src/infopanel.cpp
+    src/transportbar.cpp
+    src/trackerpage.cpp
+    src/queuepanel.cpp
+    src/songactions.cpp
+    src/musiclibrary.cpp
     src/theme.cpp
     src/themeeditor.cpp
     resources/arrows.qrc
+    src/audiooutput.cpp
+    src/trackerdata.cpp
     src/engine.cpp
     src/analyzer.cpp
     src/widgets.cpp
     src/queue.cpp
-    src/dialogs.cpp
+    src/filterdialog.cpp
+    src/playlistsdialog.cpp
+    src/settingsdialog.cpp
+    src/infodialogs.cpp
     src/mainwindow.cpp
 )
 target_include_directories(modjuke_core PUBLIC src)
+# documentation screenshots (MODJUKE_SHOTS=dir, see src/shotdriver.cpp)
+option(MODJUKE_SHOT_DRIVER "Build the screenshot driver into the player" OFF)
+if(MODJUKE_SHOT_DRIVER)
+    target_sources(modjuke_core PRIVATE src/shotdriver.cpp)
+    target_compile_definitions(modjuke_core PUBLIC MODJUKE_SHOT_DRIVER)
+endif()
 # the one place the version is set: --version, About, the Windows and macOS file info
 target_compile_definitions(modjuke_core PUBLIC MODJUKE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(modjuke_core PUBLIC

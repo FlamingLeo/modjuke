@@ -1,5 +1,7 @@
 #include "library.h"
 
+#include "analysiscache.h"
+
 #if defined(Q_OS_WIN)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -150,6 +152,17 @@ const QStringList &skipDirs()
 }  // namespace
 
 bool naturalLess(const QString &a, const QString &b) { return compareNatural(NaturalKey(a), NaturalKey(b)) < 0; }
+
+void Track::applyAnalysis(const CachedModule &entry)
+{
+    analyzed = true;
+    duration = entry.duration;
+    fmt = entry.fmt;
+    channels = entry.channels;
+    subsongs = entry.subsongs;   // copied as is (a Track starts at 0, a CachedModule at 1)
+    title = entry.title;
+    broken = entry.broken;
+}
 
 QString Track::durationText() const
 {

@@ -52,9 +52,8 @@ void QueueModel::setPlayingColors(const QColor &background, const QColor &foregr
     playingFg_ = foreground;
 }
 
-void QueueModel::setColors(const QColor &stripe, const QColor &dim, const QColor &red)
+void QueueModel::setColors(const QColor &dim, const QColor &red)
 {
-    stripe_ = stripe;
     dim_ = dim;
     red_ = red;
 }
@@ -154,8 +153,6 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
             return directoryColor_.isValid() ? directoryColor_ : QColor("#5aa9ff");
         if (role == Qt::DecorationRole && index.column() == Module)
             return QApplication::style()->standardIcon(QStyle::SP_DirIcon);
-        if (role == KindRole)
-            return int(DirRow);
         return {};
     }
     const Track &track = queue_[row.queueIndex];
@@ -182,10 +179,6 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
         return track.path;
     if (role == PathRole)
         return track.path;
-    if (role == KindRole)
-        return int(TrackRow);
-    if (role == BrokenRole)
-        return !track.broken.isEmpty();
     const bool playing = !playingPath_.isEmpty() && track.path == playingPath_;
     if (playing) {
         if (role == Qt::BackgroundRole)
@@ -388,25 +381,19 @@ bool QueueModel::dropMimeData(const QMimeData *data, Qt::DropAction action, int 
     }
     insertAt = std::clamp(insertAt, 0, int(rest.size()));
 
-    QVector<Track> newQueue;
+    // Only report the new order: the owner saves it and rebuilds the queue
+    // (the model used to reorder itself too, and could show an order that
+    // was never saved)
+    QStringList paths;
     for (int i = 0; i < rest.size(); ++i) {
         if (i == insertAt)
             for (int m : movedSorted)
-                newQueue << queue_[m];
-        newQueue << queue_[rest[i]];
+                paths << queue_[m].path;
+        paths << queue_[rest[i]].path;
     }
     if (insertAt == rest.size())
         for (int m : movedSorted)
-            newQueue << queue_[m];
-
-    const bool showDirs = rows_.size() != queue_.size();
-    beginResetModel();
-    queue_ = newQueue;
-    rebuildRows(showDirs);
-    endResetModel();
-    QStringList paths;
-    for (const Track &track : queue_)
-        paths << track.path;
+            paths << queue_[m].path;
     emit orderEdited(paths);
     return true;
 }
@@ -422,20 +409,17 @@ bool QueueModel::moveRows(const QModelIndex &sourceParent, int start, int count,
         || destination < 0 || destination > queue_.size()
         || (destination >= start && destination <= start + count))
         return false;
-    if (!beginMoveRows({}, start, start + count - 1, {}, destination))
-        return false;
-    const QVector<Track> chunk = queue_.mid(start, count);
-    queue_.remove(start, count);
-    const int target = destination > start ? destination - count : destination;
-    for (int i = 0; i < chunk.size(); ++i)
-        queue_.insert(target + i, chunk[i]);
-    rebuildRows(false);
-    endMoveRows();
+    // as for drops: report the order, the owner saves it and rebuilds
     QStringList paths;
     for (const Track &track : queue_)
         paths << track.path;
+    const QStringList chunk = paths.mid(start, count);
+    paths.remove(start, count);
+    const int target = destination > start ? destination - count : destination;
+    for (int i = 0; i < chunk.size(); ++i)
+        paths.insert(target + i, chunk[i]);
     emit orderEdited(paths);
-    return true;
+    return false;   // nothing moved in the model itself
 }
 
 // ---------------------------------------------------------------------------
@@ -528,20 +512,19 @@ void QueueTableView::changeEvent(QEvent *event)
 void QueueTableView::setReorderEnabled(bool enabled)
 {
     reorderEnabled_ = enabled;
-    auto *model = qobject_cast<QueueModel *>(this->model());
-    // enable internal move drag & drop (the model exposes reorderFlags_)
+    // internal move drag & drop; the model accepts drops only while enabled
     setDragEnabled(enabled);
     setDragDropMode(enabled ? QAbstractItemView::InternalMove : QAbstractItemView::NoDragDrop);
     setDefaultDropAction(enabled ? Qt::MoveAction : Qt::IgnoreAction);
-    if (model)
-        model->reorderFlags_ = enabled;
+    if (auto *model = queueModel())
+        model->setReorderFlags(enabled);
 }
 
 void QueueTableView::mouseDoubleClickEvent(QMouseEvent *event)
 {
     const QModelIndex hit = indexAt(event->pos());
     if (hit.isValid()) {
-        if (auto *model = qobject_cast<QueueModel *>(this->model())) {
+        if (auto *model = queueModel()) {
             const QString path = model->pathAt(hit);
             if (!path.isEmpty()) {
                 emit activatedPath(path);
@@ -554,12 +537,9 @@ void QueueTableView::mouseDoubleClickEvent(QMouseEvent *event)
 
 void QueueTableView::keyPressEvent(QKeyEvent *event)
 {
-    if (event->matches(QKeySequence::Paste)) {
-        // unused; Enter activation below
-    }
     if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
         const QModelIndex current = currentIndex();
-        if (auto *model = qobject_cast<QueueModel *>(this->model())) {
+        if (auto *model = queueModel()) {
             const QModelIndex use = current.isValid() ? current : currentIndexAtSelected();
             const QString path = model->pathAt(use);
             if (!path.isEmpty()) {
@@ -576,13 +556,18 @@ void QueueTableView::contextMenuEvent(QContextMenuEvent *event)
 {
     const QModelIndex hit = indexAt(event->pos());
     QString path;
-    if (auto *model = qobject_cast<QueueModel *>(this->model()))
+    if (auto *model = queueModel())
         path = model->pathAt(hit);
     if (path.isEmpty()) {
         event->accept();
         return; // directory headers and empty space have no song menu
     }
     emit contextMenuFor(event->globalPos(), path);
+}
+
+QueueModel *QueueTableView::queueModel() const
+{
+    return qobject_cast<QueueModel *>(model());
 }
 
 QModelIndex QueueTableView::currentIndexAtSelected()
@@ -595,7 +580,7 @@ void QueueTableView::mousePressEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton) {
         const QModelIndex hit = indexAt(event->pos());
-        if (auto *model = qobject_cast<QueueModel *>(this->model()); model && model->isDirectory(hit)) {
+        if (auto *model = queueModel(); model && model->isDirectory(hit)) {
             model->toggleDirectory(hit);
             event->accept();
             return;

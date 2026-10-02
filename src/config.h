@@ -9,14 +9,8 @@
 #include <QVector>
 
 QString modjukeConfigDir();          // $XDG_CONFIG_HOME/modjuke or ~/.config/modjuke
+QString modjukeConfigFile(const QString &name);   // <dir>/<name>
 
-struct Settings;
-// Command-line options are session-only: a field that still holds its
-// command-line value (`session`, by option name: volume, theme,
-// interpolation, backend) gets the value saved before (`saved`) back. A field
-// changed in the app since keeps the new value.
-Settings withoutSessionOverrides(const Settings &s, const QHash<QString, QString> &saved,
-                                 const QHash<QString, QString> &session);
 QString modjukeConfigPath();         // <dir>/config.json
 
 struct Settings {
@@ -31,7 +25,6 @@ struct Settings {
     QString windowTitleMode = QStringLiteral("track");   // track|title|filename|none
     QString queueMode = QStringLiteral("by directory");  // order for the library source
     QString queueSource;              // "" = Library, otherwise a playlist name
-    QString activePlaylist;
     QStringList filterFormats;
     double filterMin = 0.0;
     double filterMax = 0.0;
@@ -78,7 +71,8 @@ struct Settings {
     QString lastPath;
     double lastPosition = 0.0;
 
-    // unknown keys read from the file are preserved on save
+    // the loaded file; save() writes it back with the known keys updated, so
+    // keys this version does not know survive
     QJsonObject extras;
 
     static Settings load(const QString &path = QString());

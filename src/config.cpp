@@ -1,6 +1,6 @@
 #include "config.h"
 
-#include <algorithm>
+#include "jsonfile.h"
 #include "theme.h"
 
 #include <QDir>
@@ -9,8 +9,10 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
+
+#include <algorithm>
 #include <cmath>
-#include <QStandardPaths>
+#include <initializer_list>
 
 QString modjukeConfigDir()
 {
@@ -21,9 +23,14 @@ QString modjukeConfigDir()
     return QDir(base).filePath(QStringLiteral("modjuke"));
 }
 
+QString modjukeConfigFile(const QString &name)
+{
+    return QDir(modjukeConfigDir()).filePath(name);
+}
+
 QString modjukeConfigPath()
 {
-    return QDir(modjukeConfigDir()).filePath(QStringLiteral("config.json"));
+    return modjukeConfigFile(QStringLiteral("config.json"));
 }
 
 const QVector<int> &Settings::sampleRateChoices()
@@ -42,17 +49,9 @@ QString Settings::sampleRateLabel(int rate)
 
 int Settings::normalizeSampleRate(const QJsonValue &value)
 {
-    if (value.isBool())
-        return 0;
-    if (!value.isDouble())
-        return 0;
-    const double number = value.toDouble();
-    if (std::isfinite(number) && number == std::trunc(number)) {
-        const int rate = int(number);
-        if (sampleRateChoices().contains(rate))
-            return rate;
-    }
-    return 0;
+    const double number = jsonNumber(value, 0.0);
+    const int rate = clampedInt(number, 0, 1 << 30);
+    return rate == number && sampleRateChoices().contains(rate) ? rate : 0;
 }
 
 int Settings::clampUiFps(const QJsonValue &value)
@@ -71,6 +70,7 @@ int Settings::clampUiFps(const QJsonValue &value)
 
 namespace {
 
+// coercing, like Python's str(): numbers and bools become text; null or missing: fallback
 QString asString(const QJsonObject &raw, const QString &key, const QString &fallback)
 {
     const QJsonValue v = raw.value(key);
@@ -83,16 +83,12 @@ QString asString(const QJsonObject &raw, const QString &key, const QString &fall
 
 double asDouble(const QJsonObject &raw, const QString &key, double fallback)
 {
-    const QJsonValue v = raw.value(key);
-    if (v.isDouble() && qIsFinite(v.toDouble()))
-        return v.toDouble();
-    return fallback;
+    return jsonNumber(raw.value(key), fallback);
 }
 
 int asInt(const QJsonObject &raw, const QString &key, int fallback)
 {
-    // clamped first: casting a huge double (1e300) to int is undefined
-    return int(std::clamp(asDouble(raw, key, double(fallback)), -2.0e9, 2.0e9));
+    return clampedInt(asDouble(raw, key, fallback), -2000000000, 2000000000);
 }
 
 bool asBool(const QJsonObject &raw, const QString &key, bool fallback)
@@ -105,20 +101,13 @@ bool asBool(const QJsonObject &raw, const QString &key, bool fallback)
     return fallback;
 }
 
-QStringList asStringList(const QJsonObject &raw, const QString &key, int maxCount)
+// `value` when it is one of `allowed`, else the fallback
+QString oneOf(const QString &value, std::initializer_list<const char *> allowed, const char *fallback)
 {
-    QStringList out;
-    const QJsonValue v = raw.value(key);
-    if (!v.isArray())
-        return out;
-    for (const QJsonValue &item : v.toArray()) {
-        const QString text = item.toVariant().toString();
-        if (!text.isEmpty())
-            out << text;
-        if (maxCount > 0 && out.size() >= maxCount)
-            break;
-    }
-    return out;
+    for (const char *choice : allowed)
+        if (value == QLatin1String(choice))
+            return value;
+    return QString::fromLatin1(fallback);
 }
 
 // Stable IDs only; an empty/missing list means all columns are visible.
@@ -135,44 +124,27 @@ QStringList cleanHiddenQueueColumns(const QJsonArray &array)
 
 }  // namespace
 
-Settings withoutSessionOverrides(const Settings &s, const QHash<QString, QString> &saved,
-                                 const QHash<QString, QString> &session)
-{
-    Settings out = s;
-    auto same = [&session](const char *key, const QString &current) {
-        const QString k = QString::fromLatin1(key);
-        return session.contains(k) && session.value(k) == current;
-    };
-    if (same("volume", QString::number(s.volume)))
-        out.volume = saved.value(QStringLiteral("volume")).toInt();
-    if (same("theme", s.theme))
-        out.theme = saved.value(QStringLiteral("theme"));
-    if (same("interpolation", s.interpolation))
-        out.interpolation = saved.value(QStringLiteral("interpolation"));
-    if (same("backend", s.backend))
-        out.backend = saved.value(QStringLiteral("backend"));
-    return out;
-}
-
 Settings Settings::load(const QString &pathIn)
 {
     Settings s;
     const QString path = pathIn.isEmpty() ? modjukeConfigPath() : pathIn;
     // Keep Qt-only preferences outside shared config.json: Python drops
     // unknown config keys when saving, which must not re-enable this prompt.
-    QFile uiFile(QFileInfo(path).dir().filePath(QStringLiteral("qt-ui.json")));
-    if (uiFile.open(QIODevice::ReadOnly)) {
-        const QJsonObject ui = QJsonDocument::fromJson(uiFile.readAll()).object();
-        s.hiddenQueueColumns = cleanHiddenQueueColumns(ui.value("hidden_queue_columns").toArray());
-        if (ui.value("play_all_subsongs").isBool())
-            s.playAllSubsongs = ui.value("play_all_subsongs").toBool();
-        if (ui.value("confirm_ignore").isBool())
-            s.confirmIgnore = ui.value("confirm_ignore").toBool();
-    }
-    QFile file(path);
-    // A damaged config.json would load as defaults and be overwritten by the
-    // next save: keep a copy beside it and say so.
-    auto keepDamaged = [&](const QString &reason) {
+    const QJsonObject ui = readJsonObject(QFileInfo(path).dir().filePath(QStringLiteral("qt-ui.json"))).root;
+    s.hiddenQueueColumns = cleanHiddenQueueColumns(ui.value("hidden_queue_columns").toArray());
+    if (ui.value("play_all_subsongs").isBool())
+        s.playAllSubsongs = ui.value("play_all_subsongs").toBool();
+    if (ui.value("confirm_ignore").isBool())
+        s.confirmIgnore = ui.value("confirm_ignore").toBool();
+
+    const JsonRead file = readJsonObject(path);
+    if (file.status == JsonRead::Missing)
+        return s;
+    if (!file.ok()) {
+        // A damaged config.json would load as defaults and be overwritten by
+        // the next save: keep a copy beside it and say so.
+        const QString reason = file.status == JsonRead::BadShape ? QObject::tr("not a settings object")
+                                                                 : file.reason;
         const QString backup = path + QStringLiteral(".bad");
         QFile::remove(backup);
         const bool copied = QFile::copy(path, backup);
@@ -181,18 +153,8 @@ Settings Settings::load(const QString &pathIn)
                                : QObject::tr("Could not read %1 (%2). Default settings are in use.")
                                      .arg(path, reason);
         return s;
-    };
-    if (!file.exists())
-        return s;
-    if (!file.open(QIODevice::ReadOnly))
-        return keepDamaged(file.errorString());
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError)
-        return keepDamaged(parseError.errorString());
-    if (!doc.isObject())
-        return keepDamaged(QObject::tr("not a settings object"));
-    const QJsonObject raw = doc.object();
+    }
+    const QJsonObject &raw = file.root;
 
     s.lastDirectory = asString(raw, "last_directory", s.lastDirectory);
     s.lastPickerDir = asString(raw, "last_picker_dir", s.lastPickerDir);
@@ -200,26 +162,23 @@ Settings Settings::load(const QString &pathIn)
     s.uiFps = clampUiFps(raw.value("ui_fps").isUndefined() ? QJsonValue(s.uiFps) : raw.value("ui_fps"));
     s.smoothTrackerScrolling = asBool(raw, "smooth_tracker_scrolling", s.smoothTrackerScrolling);
     s.windowTitleMode = asString(raw, "window_title", s.windowTitleMode);
-    s.queueMode = asString(raw, "queue_mode", s.queueMode);
-    if (s.queueMode == QLatin1String("alpha"))
-        s.queueMode = QStringLiteral("alphabetical");
-    if (s.queueMode == QLatin1String("saved"))
-        s.queueMode = QStringLiteral("playlist");   // early C++ files; Python spells it "playlist"
-    if (s.queueMode != QLatin1String("alphabetical") && s.queueMode != QLatin1String("by directory")
-        && s.queueMode != QLatin1String("shuffle") && s.queueMode != QLatin1String("playlist"))
-        s.queueMode = QStringLiteral("by directory");
+    QString queueMode = asString(raw, "queue_mode", s.queueMode);
+    if (queueMode == QLatin1String("alpha"))
+        queueMode = QStringLiteral("alphabetical");
+    if (queueMode == QLatin1String("saved"))
+        queueMode = QStringLiteral("playlist");   // early C++ files; Python spells it "playlist"
+    s.queueMode = oneOf(queueMode, {"alphabetical", "by directory", "shuffle", "playlist"}, "by directory");
     // Python stores queue_source as a *type* marker ("library"/"playlist") and the
     // playlist name in active_playlist. Internally queueSource holds the name
     // ("" = library), so that is the mapping direction that matters here.
     const QString sourceValue = asString(raw, "queue_source", QString());
-    s.activePlaylist = asString(raw, "active_playlist", s.activePlaylist);
+    s.queueSource = asString(raw, "active_playlist", s.queueSource);
     if (sourceValue != QLatin1String("library") && sourceValue != QLatin1String("playlist")
-        && s.activePlaylist.isEmpty())
-        s.activePlaylist = sourceValue;   // older C++ files kept the name in queue_source
-    s.queueSource = s.activePlaylist;
+        && s.queueSource.isEmpty())
+        s.queueSource = sourceValue;   // older C++ files kept the name in queue_source
 
-    for (const QJsonValue &item : raw.value("filter_formats").toArray()) {
-        const QString fmt = item.toVariant().toString().trimmed().toLower();
+    for (const QString &item : jsonStringsCoerced(raw.value("filter_formats"))) {
+        const QString fmt = item.trimmed().toLower();
         if (!fmt.isEmpty())
             s.filterFormats << fmt;
     }
@@ -227,7 +186,7 @@ Settings Settings::load(const QString &pathIn)
     s.filterMax = std::clamp(asDouble(raw, "filter_max", 0.0), 0.0, 1e7);
     s.filterHideBroken = asBool(raw, "filter_hide_broken", s.filterHideBroken);
     s.shuffleSeed = qint64(std::clamp(asDouble(raw, "shuffle_seed", 0.0), -9.0e15, 9.0e15));
-    s.shufflePaths = asStringList(raw, "shuffle_paths", 5000);
+    s.shufflePaths = jsonStringsCoerced(raw.value("shuffle_paths"), 5000);
 
     s.volume = qBound(0, asInt(raw, "volume", 80), 100);
     s.muted = asBool(raw, "muted", s.muted);
@@ -236,10 +195,7 @@ Settings Settings::load(const QString &pathIn)
     s.autoAdvance = asBool(raw, "auto_advance", s.autoAdvance);
     s.subsong = qMax(0, asInt(raw, "subsong", 0));
 
-    s.backend = asString(raw, "backend", s.backend);
-    if (s.backend != QLatin1String("auto") && s.backend != QLatin1String("sounddevice")
-        && s.backend != QLatin1String("soundcard") && s.backend != QLatin1String("null"))
-        s.backend = QStringLiteral("auto");
+    s.backend = oneOf(asString(raw, "backend", s.backend), {"auto", "sounddevice", "soundcard", "null"}, "auto");
     if (raw.contains("samplerate"))
         s.samplerate = normalizeSampleRate(raw.value("samplerate"));
     s.bufferMs = qBound(20, asInt(raw, "buffer_ms", 220), 5000);
@@ -249,10 +205,8 @@ Settings Settings::load(const QString &pathIn)
     // revision key that still holds the old 120ms default gets the 20ms one once.
     if (!raw.contains("latency_revision") && s.latencyMs == 120)
         s.latencyMs = 20;
-    s.interpolation = asString(raw, "interpolation", s.interpolation);
-    if (s.interpolation != QLatin1String("off") && s.interpolation != QLatin1String("linear")
-        && s.interpolation != QLatin1String("cubic") && s.interpolation != QLatin1String("sinc"))
-        s.interpolation = QStringLiteral("sinc");
+    s.interpolation = oneOf(asString(raw, "interpolation", s.interpolation),
+                            {"off", "linear", "cubic", "sinc"}, "sinc");
 
     s.stallTimeout = asDouble(raw, "stall_timeout", s.stallTimeout);
     s.silenceStallTimeout = asDouble(raw, "silence_stall_timeout", s.silenceStallTimeout);
@@ -274,28 +228,16 @@ Settings Settings::load(const QString &pathIn)
     s.lastPath = asString(raw, "last_path", s.lastPath);
     s.lastPosition = asDouble(raw, "last_position", 0.0);
 
-    const QStringList known = raw.keys();
-    static const QStringList handled = {
-        "last_directory", "last_picker_dir", "folder_picker", "ui_fps", "smooth_tracker_scrolling",
-        "window_title", "queue_mode", "queue_source", "active_playlist", "filter_formats",
-        "filter_min", "filter_max", "filter_hide_broken", "shuffle_seed", "shuffle_paths",
-        "volume", "muted", "loop_track", "loop_queue", "auto_advance", "subsong", "backend",
-        "samplerate", "buffer_ms", "latency_ms", "latency_revision", "interpolation",
-        "stall_timeout", "silence_stall_timeout", "hang_timeout", "max_restarts", "auto_skip_broken",
-        "overrun_guard", "window_geometry", "show_metadata", "theme", "custom_themes",
-        "remember_position", "cache_analysis", "auto_analyze", "track_listening_stats",
-        "last_path", "last_position"};
-    for (const QString &key : known) {
-        if (!handled.contains(key))
-            s.extras.insert(key, raw.value(key));
-    }
+    // save() writes the file back with its own keys on top, so keys this
+    // version doesn't know (a newer one's, Python-only ones) survive
+    s.extras = raw;
     return s;
 }
 
 bool Settings::save(const QString &pathIn) const
 {
     const QString path = pathIn.isEmpty() ? modjukeConfigPath() : pathIn;
-    QJsonObject raw;
+    QJsonObject raw = extras;   // the loaded file: unknown keys are kept
     // mirrors config.py fields (asdict order does not matter; keys sort)
     raw.insert("last_directory", lastDirectory);
     raw.insert("last_picker_dir", lastPickerDir);
@@ -304,8 +246,8 @@ bool Settings::save(const QString &pathIn) const
     raw.insert("smooth_tracker_scrolling", smoothTrackerScrolling);
     raw.insert("window_title", windowTitleMode);
     raw.insert("queue_mode", queueMode);
-    raw.insert("queue_source", activePlaylist.isEmpty() ? QString() : QStringLiteral("playlist"));
-    raw.insert("active_playlist", activePlaylist);
+    raw.insert("queue_source", queueSource.isEmpty() ? QString() : QStringLiteral("playlist"));
+    raw.insert("active_playlist", queueSource);
     QJsonArray formats;
     for (const QString &fmt : filterFormats)
         formats.append(fmt);
@@ -346,27 +288,19 @@ bool Settings::save(const QString &pathIn) const
     raw.insert("track_listening_stats", trackListeningStats);
     raw.insert("last_path", lastPath);
     raw.insert("last_position", lastPosition);
-    for (auto it = extras.constBegin(); it != extras.constEnd(); ++it)
-        raw.insert(it.key(), it.value());
 
     QDir().mkpath(QFileInfo(path).absolutePath());
     const QString uiPath = QFileInfo(path).dir().filePath(QStringLiteral("qt-ui.json"));
     QJsonObject ui;
-    QFile oldUi(uiPath);
-    if (oldUi.exists()) {
-        QJsonParseError error{};
-        const bool opened = oldUi.open(QIODevice::ReadOnly);
-        const auto doc = opened ? QJsonDocument::fromJson(oldUi.readAll(), &error) : QJsonDocument();
-        oldUi.close();
-        if (opened && error.error == QJsonParseError::NoError && doc.isObject()) {
-            ui = doc.object();
-        } else {
-            // An unreadable Qt preference file used to fail every save, so no
-            // setting was saved anymore: keep it aside and write a fresh one.
-            QFile::remove(uiPath + QStringLiteral(".bad"));
-            if (!QFile::rename(uiPath, uiPath + QStringLiteral(".bad")))
-                return false;
-        }
+    const JsonRead oldUi = readJsonObject(uiPath);
+    if (oldUi.ok()) {
+        ui = oldUi.root;
+    } else if (oldUi.status != JsonRead::Missing) {
+        // An unreadable Qt preference file used to fail every save, so no
+        // setting was saved anymore: keep it aside and write a fresh one.
+        QFile::remove(uiPath + QStringLiteral(".bad"));
+        if (!QFile::rename(uiPath, uiPath + QStringLiteral(".bad")))
+            return false;
     }
     ui.insert("confirm_ignore", confirmIgnore);
     ui.insert("play_all_subsongs", playAllSubsongs);
