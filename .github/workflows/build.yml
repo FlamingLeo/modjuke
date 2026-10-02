@@ -1,0 +1,139 @@
+# Builds modjuke for Linux (AppImage), Windows (zip) and macOS (dmg), with
+# Qt and libopenmpt included. Every run keeps the three packages as artifacts
+# (Actions tab > the run > Artifacts). A tag v* also creates a draft release
+# with the packages attached; publish it on GitHub when it looks right.
+name: Build
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  QT_VERSION: '6.8.3'
+
+jobs:
+  linux:
+    # the AppImage runs on systems with this glibc (2.35) or newer
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libgl1-mesa-dev libegl1 libfontconfig1 \
+            libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1 \
+            libpulse0 libdbus-1-3
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtmultimedia
+          cache: true
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Package
+        run: sh packaging/appimage.sh build
+      - name: Check the package
+        timeout-minutes: 10
+        run: |
+          APPIMAGE_EXTRACT_AND_RUN=1 XDG_CONFIG_HOME=$RUNNER_TEMP ./dist/modjuke.AppImage --check | tee check.txt
+          grep -q '^libopenmpt: 0\.8.*lib/libopenmpt\.so\.0' check.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: modjuke-linux
+          path: dist/modjuke.AppImage
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ilammy/msvc-dev-cmd@v1   # MSVC, Ninja and the runtime DLLs' location
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          modules: qtmultimedia
+          cache: true
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - name: Package
+        run: pwsh packaging/windows.ps1 -BuildDir build
+      - name: Check the package
+        timeout-minutes: 10
+        run: |
+          $env:XDG_CONFIG_HOME = $env:RUNNER_TEMP
+          Start-Process (Resolve-Path dist\modjuke\modjuke.exe) -ArgumentList '--check' -Wait -NoNewWindow `
+            -RedirectStandardOutput check.txt
+          Get-Content check.txt
+          if (-not (Select-String -Path check.txt -Pattern '^libopenmpt: 0\.8.*modjuke[\\/]libopenmpt\.dll')) { exit 1 }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: modjuke-windows
+          path: dist/modjuke.zip
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'   # Qt 6.8's minimum
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          modules: qtmultimedia
+          cache: true
+      - name: Build (Apple silicon and Intel)
+        run: |
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build --parallel
+      - name: Package
+        run: sh packaging/macos.sh build
+      - name: Check the package
+        timeout-minutes: 10
+        run: |
+          APP=dist/dmg/modjuke.app
+          lipo -archs $APP/Contents/MacOS/modjuke
+          lipo -archs $APP/Contents/Frameworks/libopenmpt.0.dylib
+          XDG_CONFIG_HOME=$RUNNER_TEMP $APP/Contents/MacOS/modjuke --check | tee check.txt
+          grep -q '^libopenmpt: 0\.8.*Frameworks/libopenmpt\.0\.dylib' check.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: modjuke-macos
+          path: dist/modjuke.dmg
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against the version
+        run: |
+          version=$(sed -n 's/^project(modjuke VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the version in CMakeLists.txt ($version)"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --title "modjuke $GITHUB_REF_NAME" --generate-notes

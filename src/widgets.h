@@ -15,7 +15,7 @@
 #include <QPixmap>
 #include <QTimer>
 
-class Palette;
+struct Palette;   // struct, as in theme.h: MSVC encodes the keyword in link names
 
 // Text-only toggle button that reserves the styled space needed by every label.
 // Measurements remain font/DPI/style-aware rather than fixing a pixel width.

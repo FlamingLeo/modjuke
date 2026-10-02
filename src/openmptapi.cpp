@@ -1,5 +1,6 @@
 #include "openmptapi.h"
 
+#include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
 #include <QMutex>
@@ -7,6 +8,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // C API prototypes + resolved pointers
@@ -102,14 +104,31 @@ constexpr qint64 kMaxModuleBytes = qint64(1) << 30;
 
 OpenMPTLib::OpenMPTLib()
 {
-    // Resolve through QLibrary so the same discovery order as the Python
-    // version applies: explicit env override first, then plain soname.
+    // Resolve through QLibrary: explicit env override first, then a copy
+    // bundled with the program (AppImage, Windows zip, macOS app), then the
+    // system's library.
     const QByteArray env = qgetenv("MODJUKE_LIBOPENMPT");
     QStringList candidates;
     if (!env.isEmpty())
         candidates << QString::fromLocal8Bit(env);
+    const QString appDir = QCoreApplication::applicationDirPath();
+#if defined(Q_OS_WIN)
+    if (!appDir.isEmpty())
+        candidates << appDir + QStringLiteral("/libopenmpt.dll");
+    candidates << QStringLiteral("libopenmpt") << QStringLiteral("openmpt");
+#elif defined(Q_OS_MACOS)
+    if (!appDir.isEmpty())
+        candidates << appDir + QStringLiteral("/../Frameworks/libopenmpt.0.dylib")
+                   << appDir + QStringLiteral("/libopenmpt.0.dylib");
+    candidates << QStringLiteral("/opt/homebrew/lib/libopenmpt.0.dylib")   // Homebrew, Apple silicon
+               << QStringLiteral("/usr/local/lib/libopenmpt.0.dylib")      // Homebrew, Intel
+               << QStringLiteral("libopenmpt.0.dylib") << QStringLiteral("openmpt");
+#else
+    if (!appDir.isEmpty())
+        candidates << appDir + QStringLiteral("/../lib/libopenmpt.so.0");
     // Runtime packages ship the versioned SONAME, not the development symlink.
     candidates << QStringLiteral("libopenmpt.so.0") << QStringLiteral("openmpt");
+#endif
     for (const QString &cand : candidates) {
         library_.setFileName(cand);
         if (library_.load())
@@ -242,10 +261,17 @@ OpenMPTLib *OpenMPTLib::instance(QString *errorOut)
     auto *candidate = new OpenMPTLib;
     if (!candidate->library_.isLoaded() || !candidate->api_
         || !candidate->api_->module_create_from_memory2) {
-        g_loadError = QStringLiteral(
-            "libopenmpt could not be found or is too old.\n"
-            "  Linux:  sudo apt install libopenmpt0t64   (older releases: libopenmpt0)\n"
-            "You can also set MODJUKE_LIBOPENMPT=/path/to/libopenmpt.so");
+        // (no #if inside the QStringLiteral macro: MSVC rejects that)
+#if defined(Q_OS_WIN)
+        const char *hint = "  Put libopenmpt.dll (and its openmpt-*.dll files) next to modjuke.exe.\n";
+#elif defined(Q_OS_MACOS)
+        const char *hint = "  macOS:  brew install libopenmpt\n";
+#else
+        const char *hint = "  Linux:  sudo apt install libopenmpt0t64   (older releases: libopenmpt0)\n";
+#endif
+        g_loadError = QStringLiteral("libopenmpt could not be found or is too old.\n")
+                      + QLatin1String(hint)
+                      + QStringLiteral("You can also set MODJUKE_LIBOPENMPT to the library's full path");
         if (errorOut)
             *errorOut = g_loadError;
         delete candidate;

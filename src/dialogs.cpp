@@ -22,6 +22,7 @@
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <functional>
+#include <algorithm>
 
 namespace {
 
@@ -909,10 +910,11 @@ AboutDialog::AboutDialog(QWidget *parent, const QString &libopenmptVersion, bool
     aboutLabel->setWordWrap(true);
     root->addWidget(aboutLabel);
     const QString qtVersion = QString::fromLatin1(qVersion());
+    const QString version = tr("modjuke %1 (MIT License)<br/>").arg(QStringLiteral(MODJUKE_VERSION));
     auto *libLabel = new QLabel(
-        libLoaded ? tr("libopenmpt %1<br/>Qt %2").arg(libopenmptVersion, qtVersion)
-                  : tr("libopenmpt was not found - install libopenmpt0<br/>"
-                       "or set MODJUKE_LIBOPENMPT.<br/>Qt %1").arg(qtVersion),
+        version + (libLoaded ? tr("libopenmpt %1<br/>Qt %2").arg(libopenmptVersion, qtVersion)
+                             : tr("libopenmpt was not found - install libopenmpt0<br/>"
+                                  "or set MODJUKE_LIBOPENMPT.<br/>Qt %1").arg(qtVersion)),
         this);
     libLabel->setTextFormat(Qt::RichText);
     libLabel->setWordWrap(true);

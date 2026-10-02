@@ -18,6 +18,38 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 #include <QTextStream>
+#include <algorithm>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <cstdio>
+
+// The Windows build is a GUI program and has no console of its own. With
+// arguments (--check, --scan, --version, an invalid option) the output goes
+// to the console it was started from, unless it is redirected to a file or
+// pipe already. cmd doesn't wait for GUI programs, so it appears after the
+// prompt; redirect it (modjuke --check > check.txt) for scripts.
+static void attachParentConsole()
+{
+    auto usable = [](DWORD id) {
+        const HANDLE h = GetStdHandle(id);
+        return h != nullptr && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN;
+    };
+    const bool out = usable(STD_OUTPUT_HANDLE);
+    const bool err = usable(STD_ERROR_HANDLE);
+    if ((out && err) || !AttachConsole(ATTACH_PARENT_PROCESS))
+        return;
+    if (!out)
+        std::freopen("CONOUT$", "w", stdout);
+    if (!err)
+        std::freopen("CONOUT$", "w", stderr);
+    SetConsoleOutputCP(CP_UTF8);   // QTextStream writes UTF-8
+}
+#endif
 
 static QStringList defaultExtensions()
 {
@@ -97,7 +129,7 @@ static int runCheck()
     QString error;
     OpenMPTLib *lib = OpenMPTLib::instance(&error);
     if (lib) {
-        out << "libopenmpt: " << lib->versionString() << "\n";
+        out << "libopenmpt: " << lib->versionString() << " (" << lib->libraryPath() << ")\n";
         out << "formats: " << lib->supportedExtensions().size() << " extensions\n";
     } else {
         out << "libopenmpt: NOT FOUND (" << error << ")\n";
@@ -112,6 +144,10 @@ static int runCheck()
 
 int main(int argc, char **argv)
 {
+#ifdef _WIN32
+    if (argc > 1)
+        attachParentConsole();
+#endif
     // headless subcommands run without a display
     auto isArg = [argc, argv](const char *name) {
         for (int i = 1; i < argc; ++i)
@@ -130,14 +166,14 @@ int main(int argc, char **argv)
     if (headless) {
         QCoreApplication app(argc, argv);
         QCoreApplication::setApplicationName(QStringLiteral("modjuke"));
-        QCoreApplication::setApplicationVersion(QStringLiteral("1.0-qt"));
+        QCoreApplication::setApplicationVersion(QStringLiteral(MODJUKE_VERSION));
         if (isArg("--version") || isArg("-v")) {
             QTextStream(stdout) << QStringLiteral("modjuke %1\n").arg(QCoreApplication::applicationVersion());
             return 0;
         }
-        QStringList args;
-        for (int i = 1; i < argc; ++i)
-            args << QString::fromLocal8Bit(argv[i]);
+        // arguments() also gets non-ASCII paths right on Windows (argv is in
+        // the ANSI code page there)
+        const QStringList args = QCoreApplication::arguments().mid(1);
         if (isArg("--check"))
             return runCheck();
         // --scan DIR [--order] [--analyze]   (also --scan=DIR)
@@ -175,7 +211,7 @@ int main(int argc, char **argv)
     QApplication app(argc, argv);
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/modjuke/icon.png")));
     QApplication::setApplicationName(QStringLiteral("modjuke"));
-    QApplication::setApplicationVersion(QStringLiteral("1.0-qt"));
+    QApplication::setApplicationVersion(QStringLiteral(MODJUKE_VERSION));
     QApplication::setOrganizationName(QStringLiteral("modjuke"));
 
     QCommandLineParser parser;
