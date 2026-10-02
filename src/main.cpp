@@ -166,7 +166,7 @@ int main(int argc, char **argv)
     if (headless) {
         QCoreApplication app(argc, argv);
         QCoreApplication::setApplicationName(QStringLiteral("modjuke"));
-        QCoreApplication::setApplicationVersion(QStringLiteral("1.0-qt"));
+        QCoreApplication::setApplicationVersion(QStringLiteral(MODJUKE_VERSION));
         if (isArg("--version") || isArg("-v")) {
             QTextStream(stdout) << QStringLiteral("modjuke %1\n").arg(QCoreApplication::applicationVersion());
             return 0;
@@ -211,7 +211,7 @@ int main(int argc, char **argv)
     QApplication app(argc, argv);
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/modjuke/icon.png")));
     QApplication::setApplicationName(QStringLiteral("modjuke"));
-    QApplication::setApplicationVersion(QStringLiteral("1.0-qt"));
+    QApplication::setApplicationVersion(QStringLiteral(MODJUKE_VERSION));
     QApplication::setOrganizationName(QStringLiteral("modjuke"));
 
     QCommandLineParser parser;

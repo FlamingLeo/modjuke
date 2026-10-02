@@ -34,6 +34,8 @@ add_library(modjuke_core STATIC
     src/mainwindow.cpp
 )
 target_include_directories(modjuke_core PUBLIC src)
+# the one place the version is set: --version, About, the Windows and macOS file info
+target_compile_definitions(modjuke_core PUBLIC MODJUKE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(modjuke_core PUBLIC
     Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Multimedia)
 if(UNIX AND NOT APPLE)
@@ -46,7 +48,9 @@ endif()
 
 set(MODJUKE_PLATFORM_SOURCES)
 if(WIN32)
-    list(APPEND MODJUKE_PLATFORM_SOURCES resources/modjuke.rc)
+    # icon and version information (Explorer > Properties > Details)
+    configure_file(resources/modjuke.rc.in "${CMAKE_CURRENT_BINARY_DIR}/modjuke.rc" @ONLY)
+    list(APPEND MODJUKE_PLATFORM_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/modjuke.rc")
 elseif(APPLE)
     # modjuke.icns from modjuke.png with Apple's tools
     set(MODJUKE_ICONSET "${CMAKE_CURRENT_BINARY_DIR}/modjuke.iconset")

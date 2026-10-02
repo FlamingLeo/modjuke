@@ -4,14 +4,13 @@
 #   packaging/appimage.sh [BUILD_DIR]      (default: build)
 #
 # Needs a Release build of modjuke in BUILD_DIR, Qt's qmake on PATH (or
-# QMAKE=/path/to/qmake) and curl. Writes dist/modjuke-VERSION-x86_64.AppImage.
+# QMAKE=/path/to/qmake) and curl. Writes dist/modjuke.AppImage.
 # The AppImage runs on systems at least as new as the one it was built on
 # (glibc), so build on an older distribution for wider reach.
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 BUILD=$(cd "${1:-build}" && pwd)
-VERSION=${VERSION:-$(git describe --tags --always 2>/dev/null || echo dev)}
 DIST=$ROOT/dist
 APPDIR=$DIST/AppDir
 TOOLS=$DIST/tools
@@ -36,8 +35,10 @@ done
 
 rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/share/doc/modjuke"
-cp -r "$DIST/libopenmpt/licenses" "$APPDIR/usr/share/doc/modjuke/"
-cp packaging/THIRD-PARTY.txt "$APPDIR/usr/share/doc/modjuke/"
+DOC=$APPDIR/usr/share/doc/modjuke
+cp LICENSE packaging/THIRD-PARTY.txt "$DOC/"
+cp -r "$DIST/libopenmpt/licenses" "$DOC/"
+cp packaging/licenses/* "$DOC/licenses/"
 cat > "$DIST/modjuke.desktop" <<EOD
 [Desktop Entry]
 Type=Application
@@ -53,8 +54,7 @@ cp resources/modjuke.png "$DIST/modjuke.png"
 
 export PATH="$TOOLS:$PATH"            # linuxdeploy finds its Qt plugin here
 export APPIMAGE_EXTRACT_AND_RUN=1     # the tools run without FUSE
-export LINUXDEPLOY_OUTPUT_VERSION="$VERSION"
-export OUTPUT="$DIST/modjuke-$VERSION-x86_64.AppImage"
+export OUTPUT="$DIST/modjuke.AppImage"
 rm -f "$OUTPUT"
 # libopenmpt is loaded at run time (dlopen), so it's named explicitly (-l);
 # modjuke looks for it in usr/lib next to its usr/bin.

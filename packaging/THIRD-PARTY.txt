@@ -1,21 +1,23 @@
-modjuke packages include these third-party components.
+modjuke is licensed under the MIT License (LICENSE). Its packages include
+these third-party components, each under its own license; the texts are in
+the licenses folder.
 
 Qt 6 (https://www.qt.io/)
-  Licensed under the GNU Lesser General Public License v3 (LGPLv3).
+  GNU Lesser General Public License v3: licenses/LGPL-3.0.txt, which
+  builds on the GNU GPL v3: licenses/GPL-3.0.txt.
   Qt's libraries are included as separate shared libraries / frameworks /
   DLLs and can be replaced with other builds of the same Qt version.
   Source: https://download.qt.io/official_releases/qt/
-  License text: https://www.gnu.org/licenses/lgpl-3.0.html
-  Qt Multimedia may include FFmpeg libraries (LGPL v2.1 or later):
-  https://ffmpeg.org/legal.html
+  The Linux and macOS packages also contain Qt Multimedia's FFmpeg plugin
+  and FFmpeg libraries (LGPL 2.1 or later): https://ffmpeg.org/legal.html
 
 libopenmpt (https://lib.openmpt.org/)
-  BSD 3-Clause license; see licenses/libopenmpt.txt.
+  BSD 3-Clause license: licenses/libopenmpt.txt.
   The Linux and macOS packages build it from the official source release
   with its bundled miniz (MIT), minimp3 (CC0) and stb_vorbis (MIT or public
-  domain); see licenses/. The Windows package uses the official DLLs, which
-  include mpg123 (LGPL 2.1), libogg, libvorbis (BSD) and zlib; their license
-  texts are in licenses/.
+  domain): licenses/miniz.txt, minimp3.txt, stb_vorbis.txt. The Windows
+  package uses the official DLLs, which include mpg123 (LGPL 2.1), libogg,
+  libvorbis (BSD) and zlib: licenses/License.*.txt.
 
 Microsoft Visual C++ runtime (Windows package only)
   msvcp140*.dll, vcruntime140*.dll: redistributable files of Microsoft

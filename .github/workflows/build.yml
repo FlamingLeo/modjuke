@@ -20,8 +20,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0   # tags, for the version in the file names
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -39,24 +37,22 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
       - name: Package
-        run: VERSION=$(git describe --tags --always) sh packaging/appimage.sh build
+        run: sh packaging/appimage.sh build
       - name: Check the package
         timeout-minutes: 10
         run: |
-          APPIMAGE_EXTRACT_AND_RUN=1 XDG_CONFIG_HOME=$RUNNER_TEMP ./dist/modjuke-*-x86_64.AppImage --check | tee check.txt
+          APPIMAGE_EXTRACT_AND_RUN=1 XDG_CONFIG_HOME=$RUNNER_TEMP ./dist/modjuke.AppImage --check | tee check.txt
           grep -q '^libopenmpt: 0\.8.*lib/libopenmpt\.so\.0' check.txt
       - uses: actions/upload-artifact@v7
         with:
           name: modjuke-linux
-          path: dist/*.AppImage
+          path: dist/modjuke.AppImage
           if-no-files-found: error
 
   windows:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: ilammy/msvc-dev-cmd@v1   # MSVC, Ninja and the runtime DLLs' location
       - uses: jurplel/install-qt-action@v4
         with:
@@ -69,7 +65,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build --parallel
       - name: Package
-        run: pwsh packaging/windows.ps1 -BuildDir build -Version (git describe --tags --always)
+        run: pwsh packaging/windows.ps1 -BuildDir build
       - name: Check the package
         timeout-minutes: 10
         run: |
@@ -81,7 +77,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: modjuke-windows
-          path: dist/*.zip
+          path: dist/modjuke.zip
           if-no-files-found: error
 
   macos:
@@ -90,8 +86,6 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: '12.0'   # Qt 6.8's minimum
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
       - uses: jurplel/install-qt-action@v4
         with:
           version: ${{ env.QT_VERSION }}
@@ -103,7 +97,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
           cmake --build build --parallel
       - name: Package
-        run: VERSION=$(git describe --tags --always) sh packaging/macos.sh build
+        run: sh packaging/macos.sh build
       - name: Check the package
         timeout-minutes: 10
         run: |
@@ -115,7 +109,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: modjuke-macos
-          path: dist/*.dmg
+          path: dist/modjuke.dmg
           if-no-files-found: error
 
   release:
@@ -125,6 +119,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag against the version
+        run: |
+          version=$(sed -n 's/^project(modjuke VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match the version in CMakeLists.txt ($version)"
+            exit 1
+          fi
       - uses: actions/download-artifact@v8
         with:
           path: dist

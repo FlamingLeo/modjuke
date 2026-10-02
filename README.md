@@ -26,13 +26,9 @@ Ready-made packages for Linux, Windows and macOS are on the [releases page](http
 
 | System | Package | First start |
 | --- | --- | --- |
-| Linux (x86-64, glibc 2.35+: Ubuntu 22.04, Debian 12, Mint 21 or newer) | `modjuke-VERSION-x86_64.AppImage` | `chmod +x` the file, then run it |
-| Windows 10/11 (x64) | `modjuke-VERSION-windows-x64.zip` | Extract the folder and run `modjuke.exe`. SmartScreen may warn about an unknown publisher: **More info → Run anyway** |
-| macOS 12+ (Apple silicon and Intel) | `modjuke-VERSION-macos.dmg` | Drag modjuke to Applications. The app isn't notarized: on first start, confirm in **System Settings → Privacy & Security → Open Anyway** |
-
-Settings and data are shared with a source build (see [Local data](#local-data)). On Windows, `modjuke.exe --check` and `--scan` print to the console they were started from; cmd shows the output after its prompt, so redirect it for scripts (`modjuke.exe --check > check.txt`).
-
-The packages are built by GitHub Actions (`.github/workflows/build.yml`) on every push to `master` and kept as artifacts of the run. A tag `v*` (for example `git tag v1.1 && git push origin v1.1`) also creates a draft release with the three packages attached, to be published on GitHub.
+| Linux (x86-64, glibc 2.35+: Ubuntu 22.04, Debian 12, Mint 21 or newer) | `modjuke.AppImage` | `chmod +x` the file, then run it |
+| Windows 10/11 (x64) | `modjuke.zip` | Extract the folder and run `modjuke.exe`. SmartScreen may warn about an unknown publisher: **More info → Run anyway** |
+| macOS 12+ (Apple silicon and Intel) | `modjuke.dmg` | Drag modjuke to Applications. The app isn't notarized, so on first start, confirm in **System Settings → Privacy & Security → Open Anyway** |
 
 ## Requirements
 
@@ -362,3 +358,6 @@ Check terminal diagnostics and try the file in another libopenmpt-based player. 
 
 The archive contains application source and resources only—not build outputs or historical verification captures.
 
+## License
+
+modjuke is released under the [MIT License](LICENSE). The packages also contain Qt (LGPLv3) and libopenmpt (BSD 3-Clause); `THIRD-PARTY.txt` in each package lists them, with their license texts in its `licenses` folder.
