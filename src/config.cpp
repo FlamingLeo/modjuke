@@ -1,4 +1,6 @@
 #include "config.h"
+
+#include <algorithm>
 #include "theme.h"
 
 #include <QDir>
@@ -89,7 +91,8 @@ double asDouble(const QJsonObject &raw, const QString &key, double fallback)
 
 int asInt(const QJsonObject &raw, const QString &key, int fallback)
 {
-    return int(asDouble(raw, key, double(fallback)));
+    // clamped first: casting a huge double (1e300) to int is undefined
+    return int(std::clamp(asDouble(raw, key, double(fallback)), -2.0e9, 2.0e9));
 }
 
 bool asBool(const QJsonObject &raw, const QString &key, bool fallback)
@@ -132,6 +135,25 @@ QStringList cleanHiddenQueueColumns(const QJsonArray &array)
 
 }  // namespace
 
+Settings withoutSessionOverrides(const Settings &s, const QHash<QString, QString> &saved,
+                                 const QHash<QString, QString> &session)
+{
+    Settings out = s;
+    auto same = [&session](const char *key, const QString &current) {
+        const QString k = QString::fromLatin1(key);
+        return session.contains(k) && session.value(k) == current;
+    };
+    if (same("volume", QString::number(s.volume)))
+        out.volume = saved.value(QStringLiteral("volume")).toInt();
+    if (same("theme", s.theme))
+        out.theme = saved.value(QStringLiteral("theme"));
+    if (same("interpolation", s.interpolation))
+        out.interpolation = saved.value(QStringLiteral("interpolation"));
+    if (same("backend", s.backend))
+        out.backend = saved.value(QStringLiteral("backend"));
+    return out;
+}
+
 Settings Settings::load(const QString &pathIn)
 {
     Settings s;
@@ -148,12 +170,28 @@ Settings Settings::load(const QString &pathIn)
             s.confirmIgnore = ui.value("confirm_ignore").toBool();
     }
     QFile file(path);
-    if (!file.open(QIODevice::ReadOnly))
+    // A damaged config.json would load as defaults and be overwritten by the
+    // next save: keep a copy beside it and say so.
+    auto keepDamaged = [&](const QString &reason) {
+        const QString backup = path + QStringLiteral(".bad");
+        QFile::remove(backup);
+        const bool copied = QFile::copy(path, backup);
+        s.loadWarning = copied ? QObject::tr("Could not read %1 (%2). Default settings are in use; "
+                                             "the old file was kept as %3.").arg(path, reason, backup)
+                               : QObject::tr("Could not read %1 (%2). Default settings are in use.")
+                                     .arg(path, reason);
         return s;
+    };
+    if (!file.exists())
+        return s;
+    if (!file.open(QIODevice::ReadOnly))
+        return keepDamaged(file.errorString());
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
-        return s;
+    if (parseError.error != QJsonParseError::NoError)
+        return keepDamaged(parseError.errorString());
+    if (!doc.isObject())
+        return keepDamaged(QObject::tr("not a settings object"));
     const QJsonObject raw = doc.object();
 
     s.lastDirectory = asString(raw, "last_directory", s.lastDirectory);
@@ -185,10 +223,10 @@ Settings Settings::load(const QString &pathIn)
         if (!fmt.isEmpty())
             s.filterFormats << fmt;
     }
-    s.filterMin = qMax(0.0, asDouble(raw, "filter_min", 0.0));
-    s.filterMax = qMax(0.0, asDouble(raw, "filter_max", 0.0));
+    s.filterMin = std::clamp(asDouble(raw, "filter_min", 0.0), 0.0, 1e7);
+    s.filterMax = std::clamp(asDouble(raw, "filter_max", 0.0), 0.0, 1e7);
     s.filterHideBroken = asBool(raw, "filter_hide_broken", s.filterHideBroken);
-    s.shuffleSeed = qint64(asDouble(raw, "shuffle_seed", 0.0));
+    s.shuffleSeed = qint64(std::clamp(asDouble(raw, "shuffle_seed", 0.0), -9.0e15, 9.0e15));
     s.shufflePaths = asStringList(raw, "shuffle_paths", 5000);
 
     s.volume = qBound(0, asInt(raw, "volume", 80), 100);
@@ -316,14 +354,19 @@ bool Settings::save(const QString &pathIn) const
     QJsonObject ui;
     QFile oldUi(uiPath);
     if (oldUi.exists()) {
-        if (!oldUi.open(QIODevice::ReadOnly))
-            return false;
-        QJsonParseError error;
-        const auto doc = QJsonDocument::fromJson(oldUi.readAll(), &error);
-        if (error.error != QJsonParseError::NoError || !doc.isObject())
-            return false; // don't overwrite an unreadable preference file
-        ui = doc.object();
+        QJsonParseError error{};
+        const bool opened = oldUi.open(QIODevice::ReadOnly);
+        const auto doc = opened ? QJsonDocument::fromJson(oldUi.readAll(), &error) : QJsonDocument();
         oldUi.close();
+        if (opened && error.error == QJsonParseError::NoError && doc.isObject()) {
+            ui = doc.object();
+        } else {
+            // An unreadable Qt preference file used to fail every save, so no
+            // setting was saved anymore: keep it aside and write a fresh one.
+            QFile::remove(uiPath + QStringLiteral(".bad"));
+            if (!QFile::rename(uiPath, uiPath + QStringLiteral(".bad")))
+                return false;
+        }
     }
     ui.insert("confirm_ignore", confirmIgnore);
     ui.insert("play_all_subsongs", playAllSubsongs);

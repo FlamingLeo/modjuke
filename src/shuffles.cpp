@@ -2,6 +2,7 @@
 
 #include "casefold.h"
 #include "config.h"
+#include "stores.h"
 
 #include <QDir>
 #include <QFile>
@@ -35,7 +36,8 @@ ShuffleStore::ShuffleStore(const QString &path)
         return;
     }
     QJsonParseError parseError{};
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    const QByteArray bytes = file.readAll();
+    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
     file.close();
     const QJsonObject root = doc.isObject() ? doc.object() : QJsonObject{};
     if (parseError.error != QJsonParseError::NoError || root.isEmpty()
@@ -48,8 +50,15 @@ ShuffleStore::ShuffleStore(const QString &path)
         return;
     }
     const QJsonObject orders = root.value(QStringLiteral("orders")).toObject();
-    for (auto it = orders.constBegin(); it != orders.constEnd(); ++it) {
-        if (!it.value().isArray())
+    // least recently drawn first: the file's own key order (QJsonObject would
+    // iterate alphabetically, and pruning would drop the wrong orders)
+    QStringList fileOrder = jsonMemberKeyOrder(bytes, QStringLiteral("orders"));
+    for (auto it = orders.constBegin(); it != orders.constEnd(); ++it)
+        if (!fileOrder.contains(it.key()))
+            fileOrder << it.key();
+    for (const QString &key : std::as_const(fileOrder)) {
+        const auto it = orders.constFind(key);
+        if (it == orders.constEnd() || !it.value().isArray())
             continue;
         QStringList paths;
         const QJsonArray array = it.value().toArray();
@@ -112,6 +121,7 @@ bool ShuffleStore::rename(const QString &oldKey, const QString &newKey)
         return true;
     orders_.insert(newKey, orders_.take(oldKey));
     keyOrder_.removeAll(oldKey);
+    keyOrder_.removeAll(newKey);   // a stale order under the new name is replaced
     keyOrder_ << newKey;
     return save();
 }
@@ -135,15 +145,18 @@ void ShuffleStore::prune()
 
 bool ShuffleStore::save()
 {
-    QJsonObject orders;
-    for (const QString &key : keyOrder_)
-        orders.insert(key, QJsonArray::fromStringList(orders_.value(key)));
-    QJsonObject payload;
-    payload.insert(QStringLiteral("version"), 1);
-    payload.insert(QStringLiteral("orders"), orders);
-    QByteArray data = QJsonDocument(payload).toJson(QJsonDocument::Compact);
-    if (!data.endsWith('\n'))
-        data.append('\n');
+    // keys in least-recently-drawn order, like the Python writer (a QJsonObject
+    // would sort them and lose the order pruning relies on)
+    QByteArray data = "{\"orders\":{";
+    bool first = true;
+    for (const QString &key : std::as_const(keyOrder_)) {
+        if (!first)
+            data += ',';
+        first = false;
+        data += jsonStringLiteral(key) + ':'
+                + QJsonDocument(QJsonArray::fromStringList(orders_.value(key))).toJson(QJsonDocument::Compact);
+    }
+    data += "},\"version\":1}\n";
     QDir().mkpath(QFileInfo(path_).absolutePath());
     QSaveFile file(path_);
     if (!file.open(QIODevice::WriteOnly)) {

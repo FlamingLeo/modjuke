@@ -312,6 +312,24 @@ bool validHexColor(const QJsonValue &value)
     return value.toString().size() == 7 && hex.match(value.toString()).hasMatch();
 }
 
+// "#rrggbb" (lower case) from a stored color; the short "#rgb" form is
+// expanded; anything else gives an empty string
+QString cleanHexColor(const QJsonValue &value)
+{
+    if (validHexColor(value))
+        return value.toString().toLower();
+    if (!value.isString())
+        return QString();
+    static const QRegularExpression shortHex(QStringLiteral("^#[0-9a-fA-F]{3}$"));
+    const QString text = value.toString();
+    if (text.size() != 4 || !shortHex.match(text).hasMatch())
+        return QString();
+    QString out = QStringLiteral("#");
+    for (int i = 1; i < 4; ++i)
+        out += QString(2, text.at(i));
+    return out.toLower();
+}
+
 }   // namespace
 
 QJsonObject Palette::cleanCustomThemes(const QJsonObject &raw)
@@ -356,15 +374,9 @@ QJsonObject Palette::cleanCustomThemes(const QJsonObject &raw)
         const QString alias = aliasTheme(noDash) == noDash ? aliasTheme(dashKey) : aliasTheme(noDash);
         if (themes.contains(alias))
             continue;   // shadows a built-in palette name
-        bool bad = false;
-        for (auto cit = colors.constBegin(); cit != colors.constEnd(); ++cit) {
-            bool known = false;
-            roleFromName(cit.key(), &known);
-            if (known && !validHexColor(cit.value()))
-                bad = true;
-        }
-        if (bad)
-            continue;
+        // An invalid color only loses that role (it falls back to the dark
+        // palette's value below); it used to drop the whole theme, which the
+        // next save then deleted from config.json.
         QJsonObject palette;
         const Palette dark = builtin(QStringLiteral("dark"));
         for (int role = BG; role < NUM_ROLES; ++role)
@@ -372,9 +384,10 @@ QJsonObject Palette::cleanCustomThemes(const QJsonObject &raw)
                            dark[Palette::Role(role)].name(QColor::HexRgb).toLower());
         for (auto cit = colors.constBegin(); cit != colors.constEnd(); ++cit) {
             bool known = false;
-            const Role role = roleFromName(cit.key(), &known);
-            if (known && validHexColor(cit.value()))
-                palette.insert(cit.key(), cit.value().toString().toLower());
+            roleFromName(cit.key(), &known);
+            const QString hex = known ? cleanHexColor(cit.value()) : QString();
+            if (!hex.isEmpty())
+                palette.insert(cit.key(), hex);
         }
         QJsonObject cleaned;
         cleaned.insert(QStringLiteral("name"), name);

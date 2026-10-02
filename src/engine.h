@@ -143,6 +143,9 @@ private:
     friend class MetadataWorker;
     friend class TestEngine; // thread-affinity/stream-contract regressions
     bool startOutputOnAudioThread(const Settings &config);
+    bool startSilentOnAudioThread(const Settings &config, const QString &why);
+    void watchSink(QAudioSink *sink);
+    void recoverOutput(const QString &why);
     void stopOutputOnAudioThread();
     QThread *audioThread_ = nullptr;
     QObject *audioContext_ = nullptr;
@@ -161,6 +164,9 @@ private:
     QAudioSink *sink_ = nullptr;
     QAudioDevice outputDevice_;             // audio-thread owned
     qint64 outputBufferBytes_ = 0;
+    Settings outputConfig_;                  // audio-thread copy for reopening
+    qint64 recoverWindowStart_ = 0;
+    int recoverCount_ = 0;
     QTimer *pumpTimer_ = nullptr;            // silent backend: pump on the audio thread
     QVector<float> scratch_;                 // pump buffer
 

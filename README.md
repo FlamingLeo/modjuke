@@ -235,7 +235,7 @@ Custom definitions are stored under `custom_themes` in `config.json`, with a sta
 | --- | --- |
 | Space | Play / pause |
 | Enter in the queue | Play the selected track |
-| Page Up / Page Down | Previous / next file. Previous restarts the current song when past 3 seconds |
+| Page Up / Page Down | Previous / next file. Previous restarts the current song when past 3 seconds, and at the start of the queue (wrapping to the end only with Repeat queue) |
 | Left / Right | Seek backward / forward 5 seconds |
 | Ctrl+Left / Ctrl+Right | Seek backward / forward 30 seconds |
 | Up / Down in the queue | Move selection |
@@ -284,7 +284,7 @@ modjuke --help
 
 For the headless scanner, **`--order` is a flag** that requests alphabetical sorting. it does not take `alphabetical` as an argument. Scanning prints a text listing, not JSON. `--scan`, `--check`, and `--version` do not need a display. GUI commands and `--help` initialize Qt Widgets.
 
-Other options include `--dir PATH`, `--interpolation off|linear|cubic|sinc`, `--track FILE`, and `--speed N`. `--track FILE` requests that file at startup without replacing the selected library/playlist source. It takes precedence over autoplay and session restoration.
+Other options include `--dir PATH`, `--interpolation off|linear|cubic|sinc`, `--track FILE`, and `--speed N` (a tempo factor from 0.05 to 20). `--theme`, `--volume`, `--interpolation`, `--backend` and `--speed` apply to that session only. `--track FILE` requests that file at startup without replacing the selected library/playlist source. It takes precedence over autoplay and session restoration. Invalid values (an unknown theme, `--volume 70%`, a folder that doesn't exist) are reported and nothing starts. `--scan` without a folder lists the last library folder.
 
 ## Local data
 
@@ -328,10 +328,10 @@ Increase Buffer, lower UI refresh, or temporarily disable automatic analysis. Ch
 Use Rescan or F5. Automatic analysis processes discovered library files. it does not continuously monitor filesystem changes.
 
 **A custom theme is hard to read**  
-Restart with `modjuke --theme dark` or `--theme light`, then edit the custom palette in Settings. Unsaved preview changes affect only the editor.
+Restart with `modjuke --theme dark` or `--theme light` (for that session), then edit the custom palette in Settings. Unsaved preview changes affect only the editor. A color in `config.json` that isn't a valid `#RRGGBB` value (or the short `#RGB`) falls back to the dark theme's color for that role; the rest of the theme is kept.
 
 **Settings cannot be saved**  
-Check permissions and free space in the configuration directory. An unreadable or malformed `qt-ui.json` is not overwritten silently. back it up and repair or move it aside if appropriate. The Settings dialog keeps its drafts open for retry after a failed save.
+Check permissions and free space in the configuration directory. An unreadable or malformed `qt-ui.json` is renamed to `qt-ui.json.bad` and a fresh one is written (it only holds the column, play-all-subsongs and ignore-confirmation choices). A damaged `config.json` is kept as `config.json.bad`, and the player starts with defaults and says so. A damaged `playlists.json` is never overwritten, playlist changes aren't saved until it is fixed or moved aside. The Settings dialog keeps its drafts open for retry after a failed save.
 
 **A module is unreadable or behaves unexpectedly**  
 Check terminal diagnostics and try the file in another libopenmpt-based player. Format support and subsong detection depend on the installed library. Damaged files may not load, and the player cannot repair them.

@@ -220,8 +220,10 @@ QVariant QueueModel::headerData(int section, Qt::Orientation orientation, int ro
 
 Qt::ItemFlags QueueModel::flags(const QModelIndex &index) const
 {
+    // The root must accept drops too: Qt checks it for drops between rows
+    // and below the last one (otherwise a row could never move to the end).
     if (!index.isValid())
-        return Qt::NoItemFlags;
+        return reorderFlags_ ? Qt::ItemIsDropEnabled : Qt::NoItemFlags;
     Qt::ItemFlags base = QAbstractTableModel::flags(index);
     if (rows_[index.row()].kind == DirRow)
         return Qt::ItemIsEnabled | Qt::ItemIsDropEnabled;
@@ -306,13 +308,15 @@ QMimeData *QueueModel::mimeData(const QModelIndexList &indexes) const
     QMimeData *mime = new QMimeData;
     QByteArray bytes;
     QDataStream stream(&bytes, QIODevice::WriteOnly);
-    QList<int> selected;
+    // paths, not queue indexes: an analysis update can rebuild the queue
+    // while the drag is in progress
+    QStringList selected;
     for (const QModelIndex &index : indexes) {
         if (index.column() != Module)
             continue;
         const int queueIndex = queueIndexAt(index);
-        if (queueIndex >= 0 && !selected.contains(queueIndex))
-            selected << queueIndex;
+        if (queueIndex >= 0 && !selected.contains(queue_[queueIndex].path))
+            selected << queue_[queueIndex].path;
     }
     stream << selected;
     mime->setData(QLatin1String(kMimeType), bytes);
@@ -328,7 +332,16 @@ bool QueueModel::dropMimeData(const QMimeData *data, Qt::DropAction action, int 
     {
         QByteArray bytes = data->data(QLatin1String(kMimeType));
         QDataStream stream(&bytes, QIODevice::ReadOnly);
-        stream >> moved;
+        QStringList paths;
+        stream >> paths;
+        QHash<QString, int> at;
+        for (int i = 0; i < queue_.size(); ++i)
+            at.insert(queue_[i].path, i);
+        for (const QString &path : std::as_const(paths)) {
+            const auto it = at.constFind(path);
+            if (it != at.constEnd())
+                moved << it.value();
+        }
     }
     if (moved.isEmpty())
         return false;

@@ -1,6 +1,7 @@
 // Settings mirroring modjuke/config.py: the same JSON file, keys and defaults.
 #pragma once
 
+#include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QString>
@@ -8,6 +9,14 @@
 #include <QVector>
 
 QString modjukeConfigDir();          // $XDG_CONFIG_HOME/modjuke or ~/.config/modjuke
+
+struct Settings;
+// Command-line options are session-only: a field that still holds its
+// command-line value (`session`, by option name: volume, theme,
+// interpolation, backend) gets the value saved before (`saved`) back. A field
+// changed in the app since keeps the new value.
+Settings withoutSessionOverrides(const Settings &s, const QHash<QString, QString> &saved,
+                                 const QHash<QString, QString> &session);
 QString modjukeConfigPath();         // <dir>/config.json
 
 struct Settings {
@@ -73,6 +82,7 @@ struct Settings {
     QJsonObject extras;
 
     static Settings load(const QString &path = QString());
+    QString loadWarning;   // not saved: why config.json couldn't be used (shown at startup)
     bool save(const QString &path = QString()) const;
 
     // value normalization helpers

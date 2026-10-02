@@ -11,6 +11,14 @@
 #include <QStringList>
 #include <QVector>
 
+// --- JSON key order -----------------------------------------------------------
+// QJsonObject sorts its keys, but the Python files keep insertion order and the
+// stores use it for least-recently-used pruning. These read the keys of a
+// top-level member object in file order, and write a JSON string literal for
+// building an object in a chosen order.
+QStringList jsonMemberKeyOrder(const QByteArray &json, const QString &member);
+QByteArray jsonStringLiteral(const QString &text);
+
 // --- path helpers -----------------------------------------------------------
 QString analysisCachePath();
 QString playlistsPath();
@@ -43,9 +51,11 @@ public:
     static QString pathFor(const QString &dir);
 
 private:
+    void touch(const QString &path) { used_[path] = ++clock_; }
     QString path_;
     QHash<QString, CachedModule> entries_;
-    QStringList order_;              // LRU order for pruning
+    QHash<QString, quint64> used_;   // recency stamp per entry (LRU pruning)
+    quint64 clock_ = 0;
     bool dirty_ = false;
 };
 
@@ -71,6 +81,7 @@ public:
     static bool isFavorites(const QString &name);
 
     QString error;
+    bool readError() const { return readError_; }   // the file exists but couldn't be read
 
     bool create(const QString &name, const QStringList &paths, const QString &root = QString());
     bool replace(const QString &name, const QStringList &paths, const QString &root = QString());
@@ -83,10 +94,15 @@ public:
     bool clearFavorites();
 
     static QString normalizeName(const QString &name, QString *errorOut = nullptr);
+    // A free name from `base`: base itself, or base + suffix (e.g. " %1" or
+    // " (%1)") counting from 2, shortened so it stays within 80 characters.
+    // Empty (with errorOut) when base isn't a valid name.
+    QString uniqueName(const QString &base, const QString &suffix, QString *errorOut = nullptr) const;
 
 private:
-    static QString key(const QString &name) { return caseFold(name); }
+    static QString key(const QString &name) { return caseFold(name.trimmed()); }
     QString path_;
+    bool readError_ = false;                       // file exists but could not be trusted
     QVector<Playlist> playlists_;                  // insertion order, Favorites first
     QHash<QString, int> index_;                    // key -> index in playlists_
     void reindex();

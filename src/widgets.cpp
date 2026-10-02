@@ -540,11 +540,17 @@ void TrackerView::showEvent(QShowEvent *event)
 void TrackerView::wheelEvent(QWheelEvent *event)
 {
     const double steps = event->angleDelta().y() / 120.0;
-    if (event->modifiers() & Qt::ShiftModifier) {
+    // a sideways touchpad swipe has no vertical part: it scrolls channels
+    // instead of switching Follow off and scrolling nowhere
+    const bool vertical = event->angleDelta().y() != 0 || event->pixelDelta().y() != 0;
+    if (!vertical && event->angleDelta().x() != 0) {
+        horizontalScrollBar()->setValue(horizontalScrollBar()->value()
+                                        - qRound(event->angleDelta().x() / 120.0));
+    } else if (event->modifiers() & Qt::ShiftModifier) {
         horizontalScrollBar()->setValue(horizontalScrollBar()->value() - qRound(steps));
-    } else if (!qFuzzyIsNull(steps) || !event->pixelDelta().isNull()) {
+    } else if (vertical) {
         setFollowing(false);
-        const double delta = !event->pixelDelta().isNull() ? double(event->pixelDelta().y()) / lineHeight_ : steps * 3;
+        const double delta = event->pixelDelta().y() != 0 ? double(event->pixelDelta().y()) / lineHeight_ : steps * 3;
         topRow_ = std::clamp(topRow_ - delta, centeredTop(0), centeredTop(std::max(0, int(lines_.size())-1)));
         updateScrollBars(); requestVisiblePatterns(); viewport()->update();
     }

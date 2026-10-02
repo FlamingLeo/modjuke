@@ -87,16 +87,19 @@ QStringList scanExtensions(OpenMPTLib *lib)
 
 QRect parseGeometry(const QString &text)
 {
+    // Tk geometry: "+X" is a position (X may be negative: "+-1920" on a
+    // monitor left of the primary one, which the old pattern rejected);
+    // "-X" counts from the far edge (approximated as before)
     static const QRegularExpression re(
-        QStringLiteral("^(\\d+)x(\\d+)([+-]\\d+)([+-]\\d+)$"));
+        QStringLiteral("^(\\d+)x(\\d+)([+-])(-?\\d+)([+-])(-?\\d+)$"));
     const QRegularExpressionMatch m = re.match(text);
     if (!m.hasMatch())
         return QRect();
-    int x = m.captured(3).toInt(), y = m.captured(4).toInt();
-    if (x < 0)
-        x = 100 + x;
-    if (y < 0)
-        y = 100 + y;
+    int x = m.captured(4).toInt(), y = m.captured(6).toInt();
+    if (m.captured(3) == QLatin1String("-"))
+        x = 100 - x;
+    if (m.captured(5) == QLatin1String("-"))
+        y = 100 - y;
     return QRect(x, y, m.captured(1).toInt(), m.captured(2).toInt());
 }
 
@@ -121,7 +124,10 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     engine_.setLoopTrack(settings_.loopTrack);
     connect(&engine_, &Engine::logMessage, this, &MainWindow::appendLog);
     connect(&engine_, &Engine::finished, this, &MainWindow::onFinished);
-    connect(&engine_, &Engine::loadReady, this, &MainWindow::tick);
+    connect(&engine_, &Engine::loadReady, this, [this] {
+        handleLoadResult();
+        tick();
+    });
     connect(&engine_, &Engine::songDataReady, this, [this](const SongDataReply &reply) {
         if (reply.token != songToken_ || reply.orders.isEmpty())
             return;
@@ -199,7 +205,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         // order and legacy list are dropped), and "playlist" ordering without a
         // playlist resets to "by directory"
         bool changed = false;
-        if (!settings_.queueSource.isEmpty() && !playlists_.get(settings_.queueSource)) {
+        // (an unreadable playlists file isn't "the playlist is gone")
+        if (!settings_.queueSource.isEmpty() && !playlists_.get(settings_.queueSource)
+            && !playlists_.readError()) {
             settings_.queueSource.clear();
             settings_.activePlaylist.clear();
             settings_.shufflePaths.clear();
@@ -212,12 +220,29 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         if (changed)
             commitSettings();
     }
+    {
+        // files that couldn't be used: say so once the window is up
+        QStringList problems;
+        if (!settings_.loadWarning.isEmpty())
+            problems << settings_.loadWarning;
+        if (playlists_.readError())
+            problems << playlists_.error;
+        for (const QString &problem : std::as_const(problems))
+            appendLog(QStringLiteral("error"), problem);
+        if (!problems.isEmpty())
+            QTimer::singleShot(0, this, [this, problems] {
+                QMessageBox::warning(this, tr("modjuke"), problems.join(QStringLiteral("\n\n")));
+            });
+    }
     refreshSourceCombo();
     migrateShuffleOrder();
 
     const QRect geometry = parseGeometry(settings_.windowGeometry);
-    if (geometry.isValid())
+    // only where a screen still is (a disconnected monitor would hide it)
+    if (geometry.isValid() && QGuiApplication::screenAt(geometry.center()))
         setGeometry(geometry);
+    else if (geometry.isValid())
+        resize(geometry.size());
     else
         resize(1180, 720);
     setMinimumSize(760, 460);
@@ -292,8 +317,12 @@ void MainWindow::buildQueueBar()
     filterLabel_->setObjectName(QStringLiteral("dimLabel"));
     // Spare width belongs to the trailing stretch, not to the text labels.
     for (QWidget *widget : std::initializer_list<QWidget *>{static_cast<QWidget *>(sourceLabel), orderLabel, searchLabel,
-                            static_cast<QWidget *>(sourceCombo_), orderCombo_, filterLabel_})
+                            static_cast<QWidget *>(sourceCombo_), orderCombo_})
         widget->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+    // A long filter description must not widen the window's minimum size
+    // (that clipped the transport instead): it's cut, the tooltip has it all.
+    filterLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
+    filterLabel_->setMinimumWidth(40);
     layout->setSpacing(6);
     layout->addWidget(sourceLabel);
     layout->addWidget(sourceCombo_);
@@ -310,6 +339,10 @@ void MainWindow::buildQueueBar()
     connect(sourceCombo_, &QComboBox::activated, this, [this](int) {
         settings_.queueSource = sourceCombo_->currentData().toString();
         settings_.activePlaylist = settings_.queueSource;
+        // Saved order exists only for playlists (README: switching to the
+        // library changes it to By directory)
+        if (settings_.queueSource.isEmpty() && settings_.queueMode == QLatin1String("playlist"))
+            settings_.queueMode = QStringLiteral("by directory");
         commitSettings();
         refreshQueueControls();
         rebuildQueue();
@@ -433,16 +466,16 @@ void MainWindow::buildPages()
                     if (!ok)
                         return;
                     QString err;
-                    QString name = PlaylistStore::normalizeName(base, &err);
-                    int suffix = 2;
-                    while (name.isEmpty() ? false : playlists_.has(name))
-                        name = QStringLiteral("%1 %2").arg(base).arg(suffix++);
+                    const QString name = playlists_.uniqueName(base, QStringLiteral(" %1"), &err);
                     if (name.isEmpty()) {
                         status(err);
                         return;
                     }
                     QStringList paths = selected.isEmpty() ? QStringList{path} : selected;
-                    playlists_.create(name, paths, libraryRoot_);
+                    if (!playlists_.create(name, paths, libraryRoot_)) {
+                        status(playlists_.error);
+                        return;
+                    }
                     refreshSourceCombo();
                     status(tr("Created \"%1\" with %2 songs").arg(name).arg(paths.size()));
                 });
@@ -456,7 +489,6 @@ void MainWindow::buildPages()
                 menu.exec(globalPos);
             });
     connect(queueModel_, &QueueModel::orderEdited, this, &MainWindow::applyOrderEdited);
-    queueView_->viewport()->installEventFilter(this);
 }
 
 void MainWindow::buildPlayerPage()
@@ -511,7 +543,7 @@ void MainWindow::buildPlayerPage()
             const QString key = QueueModel::columnKey(c);
             settings_.hiddenQueueColumns.removeAll(key);
             if (!shown) settings_.hiddenQueueColumns << key;
-            if (!settings_.save()) {
+            if (!saveSettings(settings_)) {
                 settings_.hiddenQueueColumns = previous;
                 const QSignalBlocker blocker(action);
                 action->setChecked(!queueView_->isColumnHidden(c));
@@ -604,6 +636,7 @@ void MainWindow::buildInfoPanel(QWidget *parent)
         grid->addWidget(name, r, 0, Qt::AlignLeft);
         auto *value = new QLabel(QStringLiteral("-"), parent);
         value->setTextFormat(Qt::PlainText);
+        value->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // a long artist is cut, not widening the panel
         grid->addWidget(value, r, 1, Qt::AlignLeft);
         infoLabels_.insert(pair.first, value);
         ++r;
@@ -852,6 +885,7 @@ void MainWindow::buildStatusBar()
     row->setContentsMargins(10, 2, 10, 2);
     statusLabel_ = new QLabel(tr("Ready"), bar);
     statusLabel_->setObjectName(QStringLiteral("dimLabel"));
+    statusLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);   // long messages are cut
     healthLabel_ = new QLabel(bar);
     healthLabel_->setObjectName(QStringLiteral("dimLabel"));
     resetButton_ = new QPushButton(tr("Reset layout"), bar);
@@ -875,11 +909,18 @@ void MainWindow::buildStatusBar()
 
 void MainWindow::bindShortcuts()
 {
+    // Plain keys (Space, letters, arrows, +/-/0) belong to a text field while
+    // one is edited; Ctrl combinations, F-keys and Escape work everywhere.
     auto key = [this](const QKeySequence &sequence, std::function<void()> action) {
         auto *shortcut = new QShortcut(sequence, this);
         shortcut->setContext(Qt::WindowShortcut);
-        connect(shortcut, &QShortcut::activated, this, [this, action = std::move(action)] {
-            if (typing())
+        const QKeyCombination combo = sequence[0];
+        const Qt::Key k = combo.key();
+        const bool textKey = combo.keyboardModifiers() == Qt::NoModifier
+                                 ? !(k >= Qt::Key_F1 && k <= Qt::Key_F35) && k != Qt::Key_Escape
+                                 : (k == Qt::Key_Left || k == Qt::Key_Right);   // word moves
+        connect(shortcut, &QShortcut::activated, this, [this, textKey, action = std::move(action)] {
+            if (textKey && typing())
                 return;
             action();
         });
@@ -923,9 +964,13 @@ void MainWindow::bindShortcuts()
 
 bool MainWindow::typing() const
 {
+    // read-only fields (folder path, log) take no text: shortcuts stay on
     QWidget *focus = QApplication::focusWidget();
-    return qobject_cast<QLineEdit *>(focus) || qobject_cast<QPlainTextEdit *>(focus)
-        || qobject_cast<QSpinBox *>(focus);
+    if (auto *line = qobject_cast<QLineEdit *>(focus))
+        return !line->isReadOnly();
+    if (auto *text = qobject_cast<QPlainTextEdit *>(focus))
+        return !text->isReadOnly();
+    return qobject_cast<QSpinBox *>(focus) != nullptr;
 }
 
 // ============================================================================
@@ -990,8 +1035,11 @@ void MainWindow::rescan()
     QApplication::restoreOverrideCursor();
     countLabel_->setText(QStringLiteral("%1 tracks, %2 folders")
                             .arg(libraryTracks_.size()).arg(libraryDirs_));
-    if (!result.errors.isEmpty())
+    if (!result.errors.isEmpty()) {
         status(tr("Scan finished with %1 problems").arg(result.errors.size()));
+        for (int i = 0; i < std::min(20, int(result.errors.size())); ++i)   // which ones (log)
+            appendLog(QStringLiteral("warn"), result.errors.at(i));
+    }
     else
         status(tr("Scanned %1 tracks in %2").arg(libraryTracks_.size()).arg(libraryRoot_));
     rebuildQueue();
@@ -1066,6 +1114,7 @@ void MainWindow::rebuildQueue()
         // restore the drawn order of this source; a plan is only freshly drawn
         // for a source that never had one
         ensureShufflePlan(base);
+        mergeNewIntoShufflePlan(base);
         ordered = applyPathOrder(base, shufflePaths_);
     } else if (savedMode) {
         ordered = applyPathOrder(base, playlist->paths);
@@ -1092,6 +1141,12 @@ void MainWindow::applyQueueFilters()
     queueTracks_ = filter.select(ordered);
 
     queueModel_->setRows(queueTracks_, mode == OrderMode::ByDirectory);
+    queueIndex_.clear();
+    queueIndex_.reserve(queueTracks_.size());
+    for (int i = 0; i < queueTracks_.size(); ++i)
+        queueIndex_.insert(queueTracks_[i].path, i);
+    if (queueIndex_.contains(currentPath()))
+        playingQueueIndex_ = queueIndex_.value(currentPath());
     QSet<QString> missing;
     for (const Track &track : queueTracks_) {
         if (!QFile::exists(track.path))
@@ -1101,6 +1156,7 @@ void MainWindow::applyQueueFilters()
     queueModel_->setPlayingPath(currentPath());
     queueView_->setReorderEnabled(savedMode);
     filterLabel_->setText(filter.active() ? filter.describe() : QString());
+    filterLabel_->setToolTip(filterLabel_->text());
 
     refreshQueueControls();
     const QStringList context{libraryRoot_, settings_.queueSource, settings_.queueMode};
@@ -1253,6 +1309,46 @@ void MainWindow::ensureShufflePlan(const QVector<Track> &source)
         drawShufflePlan();     // never drawn for this source: draw (and store) one
 }
 
+void MainWindow::mergeNewIntoShufflePlan(const QVector<Track> &source)
+{
+    // Songs added to the source after the order was drawn (a rescan, new
+    // favorites) would otherwise all be appended in alphabetical order.
+    if (shufflePaths_.isEmpty())
+        return;
+    const QSet<QString> planned(shufflePaths_.cbegin(), shufflePaths_.cend());
+    QStringList fresh;
+    for (const Track &track : source) {
+        if (!planned.contains(track.path))
+            fresh << track.path;
+    }
+    if (fresh.isEmpty())
+        return;
+    if (fresh.size() > shufflePaths_.size()) {
+        drawShufflePlan();   // mostly new: a fresh order fits better
+        return;
+    }
+    // each new song gets a random slot; one merge pass keeps it O(n)
+    auto *rng = QRandomGenerator::global();
+    QVector<QPair<int, QString>> places;
+    places.reserve(fresh.size());
+    for (const QString &path : std::as_const(fresh))
+        places.append({int(rng->bounded(shufflePaths_.size() + 1)), path});
+    std::sort(places.begin(), places.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    QStringList merged;
+    merged.reserve(shufflePaths_.size() + places.size());
+    int s = 0;
+    for (int i = 0; i <= shufflePaths_.size(); ++i) {
+        while (s < places.size() && places[s].first == i)
+            merged << places[s++].second;
+        if (i < shufflePaths_.size())
+            merged << shufflePaths_[i];
+    }
+    shufflePaths_ = merged;
+    if (!shuffles_.put(shuffleKey_, shufflePaths_) && !shuffles_.error.isEmpty())
+        appendLog(QStringLiteral("warn"), shuffles_.error);
+}
+
 void MainWindow::migrateShuffleOrder()
 {
     const QStringList legacy = settings_.shufflePaths;
@@ -1286,6 +1382,8 @@ void MainWindow::onPlaylistRemoved(const QString &name)
     if (caseFold(settings_.queueSource) == caseFold(name)) {
         settings_.queueSource.clear();
         settings_.activePlaylist.clear();
+        if (settings_.queueMode == QLatin1String("playlist"))
+            settings_.queueMode = QStringLiteral("by directory");
         commitSettings();
         status(tr("The selected playlist is gone - Library selected (Ctrl+P)"));
     }
@@ -1300,15 +1398,24 @@ void MainWindow::applyOrderEdited(const QStringList &newOrder)
     const Playlist *playlist = playlists_.get(settings_.queueSource);
     if (!playlist)
         return;
-    QStringList kept;
+    // Only the visible entries were reordered: they fill their own slots in
+    // the saved list, and entries hidden by search/filter/ignore stay where
+    // they are (they used to move to the end).
     QSet<QString> queued;
     for (const Track &track : queueTracks_)
         queued.insert(track.path);
+    QStringList result;
+    result.reserve(playlist->paths.size());
+    int next = 0;
     for (const QString &path : playlist->paths) {
-        if (!queued.contains(path))
-            kept << path;
+        if (queued.contains(path) && next < newOrder.size())
+            result << newOrder[next++];
+        else
+            result << path;
     }
-    playlists_.replace(settings_.queueSource, newOrder + kept);
+    while (next < newOrder.size())
+        result << newOrder[next++];
+    playlists_.replace(settings_.queueSource, result);
     rebuildQueue();
     status(tr("Saved the new order to \"%1\"").arg(settings_.queueSource));
 }
@@ -1356,7 +1463,32 @@ QString MainWindow::selectedPath() const
 
 int MainWindow::queueIndexOf(const QString &path) const
 {
-    return queueModel_->queueIndexAt(queueModel_->indexOfPath(path));
+    // all queued tracks, also those inside a collapsed folder (the model's
+    // row lookup only knows visible rows)
+    return queueIndex_.value(path, -1);
+}
+
+int MainWindow::nextQueueIndexAfter(const QString &path) const
+{
+    // The song isn't in the visible queue (search, filter, unfavorited,
+    // removed): continue after its place in the unfiltered order, or after
+    // its last known queue position.
+    const int here = queueIndexOf(path);
+    if (here >= 0)
+        return here + 1;
+    for (int k = 0; k < orderedSource_.size(); ++k) {
+        if (orderedSource_[k].path != path)
+            continue;
+        for (int j = k + 1; j < orderedSource_.size(); ++j) {
+            const int q = queueIndexOf(orderedSource_[j].path);
+            if (q >= 0)
+                return q;
+        }
+        return queueTracks_.size();   // nothing visible after it: end of the queue
+    }
+    if (playingQueueIndex_ >= 0)
+        return std::min(playingQueueIndex_, int(queueTracks_.size()));   // its successor moved up
+    return -1;
 }
 
 void MainWindow::playPath(const QString &path, double position, bool paused, int subsong, bool preserveBufferedTail)
@@ -1380,6 +1512,11 @@ void MainWindow::playPath(const QString &path, double position, bool paused, int
     // generation lets a quick A→B change discard A rather than recording a
     // failed or superseded load, while a paused session is counted on resume.
     const EngineSnapshot requested = engine_.snapshot();
+    skipDirection_ = pendingSkipDirection_;
+    pendingSkipDirection_ = 0;
+    skipGeneration_ = requested.songGeneration;
+    if (skipDirection_ == 0)
+        skipRun_ = 0;   // a song the user picked starts a new count
     if (settings_.trackListeningStats) {
         statsPendingPath_ = path;
         statsPendingGeneration_ = requested.songGeneration;
@@ -1388,9 +1525,15 @@ void MainWindow::playPath(const QString &path, double position, bool paused, int
         statsPendingGeneration_ = 0;
     }
     queueModel_->setPlayingPath(path);
-    if (index >= 0) {
-        queueView_->setCurrentIndex(queueModel_->indexOfPath(path));
-        queueView_->scrollTo(queueModel_->indexOfPath(path));
+    playingQueueIndex_ = index;
+    // Show the row, but don't replace the user's selection: actions like
+    // "Remove from playlist" act on it (a track change used to select the
+    // newly playing row and remove that one instead).
+    const QModelIndex row = queueModel_->indexOfPath(path);
+    if (row.isValid()) {
+        if (!queueView_->selectionModel()->hasSelection())
+            queueView_->setCurrentIndex(row);
+        queueView_->scrollTo(row);
     }
     ++songToken_;
     songTokenKey_.clear();
@@ -1421,8 +1564,10 @@ void MainWindow::togglePlay()
         return;
     }
     QString path = selectedPath();
-    if (path.isEmpty() && !queueTracks_.isEmpty())
+    if (path.isEmpty() && !queueTracks_.isEmpty()) {
         path = queueTracks_.first().path;
+        pendingSkipDirection_ = 1;   // the queue's first song, not a pick
+    }
     if (!path.isEmpty())
         playPath(path);
     else
@@ -1441,7 +1586,15 @@ void MainWindow::playPrevious()
     int index = queueIndexOf(currentPath());
     if (index < 0)
         index = queueIndexOf(selectedPath());
+    if (index == 0 && !settings_.loopQueue) {
+        // like Next at the end: no wrap without Repeat queue
+        if (!snap.path.isEmpty())
+            engine_.seek(0.0);
+        status(tr("Start of the queue"));
+        return;
+    }
     index = (index <= 0) ? queueTracks_.size() - 1 : index - 1;
+    pendingSkipDirection_ = -1;
     playPath(queueTracks_[index].path);
 }
 
@@ -1449,11 +1602,14 @@ void MainWindow::playNext()
 {
     if (queueTracks_.isEmpty())
         return;
-    int index = queueIndexOf(currentPath());
-    if (index < 0)
-        index = queueIndexOf(selectedPath());
-    if (index + 1 < queueTracks_.size()) {
-        playPath(queueTracks_[index + 1].path);
+    int next = currentPath().isEmpty() ? -1 : nextQueueIndexAfter(currentPath());
+    if (next < 0) {
+        const int selected = queueIndexOf(selectedPath());
+        next = selected + 1;   // nothing known: after the selection, or the first
+    }
+    if (next < queueTracks_.size()) {
+        pendingSkipDirection_ = 1;
+        playPath(queueTracks_[next].path);
         return;
     }
     if (!settings_.loopQueue) {
@@ -1485,8 +1641,13 @@ void MainWindow::restartQueueImpl(bool preserveBufferedTail)
     } else {
         status(tr("Queue finished - starting over (R to repeat)"));
     }
-    if (!queueTracks_.isEmpty())
-        playPath(queueTracks_.first().path, 0.0, false, 0, preserveBufferedTail);
+    if (!queueTracks_.isEmpty()) {
+        // the new order avoids the finished song only before search/filters
+        // narrow it: don't open with it again when it is first anyway
+        const int start = queueTracks_.size() > 1 && queueTracks_.first().path == finished ? 1 : 0;
+        pendingSkipDirection_ = 1;
+        playPath(queueTracks_[start].path, 0.0, false, 0, preserveBufferedTail);
+    }
 }
 
 void MainWindow::onFinished()
@@ -1495,11 +1656,12 @@ void MainWindow::onFinished()
     const EngineSnapshot snap = engine_.snapshot();
     if (!settings_.autoAdvance || queueTracks_.isEmpty())
         return;
-    const int index = queueIndexOf(snap.path);
-    if (index < 0)
+    const int next = nextQueueIndexAfter(snap.path);
+    if (next < 0)
         return;
-    if (index + 1 < queueTracks_.size()) {
-        playPath(queueTracks_[index + 1].path, 0.0, false, 0, true);
+    if (next < queueTracks_.size()) {
+        pendingSkipDirection_ = 1;
+        playPath(queueTracks_[next].path, 0.0, false, 0, true);
         return;
     }
     if (settings_.loopQueue) {
@@ -1508,6 +1670,60 @@ void MainWindow::onFinished()
     }
     status(tr("Queue finished - enable 'Repeat queue' (R) to start over "
               "(shuffle then draws new order, Ctrl+S)"));
+}
+
+void MainWindow::handleLoadResult()
+{
+    // A file that can't be loaded (deleted after the scan, damaged) used to
+    // stop the queue. When the app chose the song itself (auto-advance,
+    // Next/Previous, Play on an unselected queue) it skips on in the same
+    // direction; a song the user picked directly keeps the error on screen.
+    const EngineSnapshot snap = engine_.snapshot();
+    if (skipGeneration_ == 0 || snap.songGeneration != skipGeneration_ || snap.loading)
+        return;   // not the load we asked for, or still loading
+    skipGeneration_ = 0;
+    if (!snap.failed) {
+        skipRun_ = 0;
+        return;
+    }
+    if (skipDirection_ == 0 || queueTracks_.isEmpty()) {
+        skipRun_ = 0;
+        return;
+    }
+    appendLog(QStringLiteral("warn"), tr("Skipped %1: %2").arg(QFileInfo(snap.path).fileName(), snap.loadError));
+    // at most one pass over the queue: a queue of only broken files stops
+    if (++skipRun_ >= queueTracks_.size()) {
+        skipRun_ = 0;
+        status(tr("No song in the queue could be loaded"));
+        return;
+    }
+    int next;
+    if (skipDirection_ > 0) {
+        next = nextQueueIndexAfter(snap.path);
+        if (next < 0)
+            return;
+        if (next >= queueTracks_.size()) {
+            if (!settings_.loopQueue) {
+                skipRun_ = 0;
+                status(tr("Queue finished - %1 could not be loaded").arg(QFileInfo(snap.path).fileName()));
+                return;
+            }
+            next = 0;
+        }
+    } else {
+        const int here = queueIndexOf(snap.path);
+        if (here < 0)
+            return;
+        if (here == 0 && !settings_.loopQueue) {
+            skipRun_ = 0;
+            status(tr("Start of the queue - %1 could not be loaded").arg(QFileInfo(snap.path).fileName()));
+            return;
+        }
+        next = here == 0 ? queueTracks_.size() - 1 : here - 1;
+    }
+    pendingSkipDirection_ = skipDirection_;
+    playPath(queueTracks_[next].path);
+    status(tr("Skipped %1 (could not be loaded)").arg(QFileInfo(snap.path).fileName()));
 }
 
 void MainWindow::stopPlayback()
@@ -1556,7 +1772,7 @@ bool MainWindow::confirmIgnorePath(const QString &path)
         return false; // cancellation never changes the preference or playback
     if (skip->isChecked()) {
         settings_.confirmIgnore = false;
-        if (!settings_.save()) {
+        if (!saveSettings(settings_)) {
             settings_.confirmIgnore = true;
             QMessageBox::warning(this, tr("Ignore confirmation"),
                 tr("Could not save this preference. You may be asked again next time."));
@@ -1674,15 +1890,15 @@ void MainWindow::addToPlaylistMenu()
         if (!ok)
             return;
         QString err;
-        QString name = PlaylistStore::normalizeName(base, &err);
-        int suffix = 2;
-        while (!name.isEmpty() && playlists_.has(name))
-            name = QStringLiteral("%1 %2").arg(base).arg(suffix++);
+        const QString name = playlists_.uniqueName(base, QStringLiteral(" %1"), &err);
         if (name.isEmpty()) {
             status(err.isEmpty() ? tr("Invalid playlist name") : err);
             return;
         }
-        playlists_.create(name, paths, libraryRoot_);
+        if (!playlists_.create(name, paths, libraryRoot_)) {
+            status(playlists_.error);
+            return;
+        }
         refreshSourceCombo();
         status(tr("Created \"%1\" with %2 songs").arg(name).arg(paths.size()));
     });
@@ -1713,7 +1929,7 @@ void MainWindow::removeFromPlaylist()
 // ============================================================================
 void MainWindow::openFilterDialog()
 {
-    FilterDialog dialog(this, filterFromSettings(), libraryTracks_);
+    FilterDialog dialog(this, filterFromSettings(), sourceTracks());   // the queue's source
     if (dialog.exec() != QDialog::Accepted)
         return;
     const QueueFilter filter = dialog.criteria();
@@ -1737,10 +1953,13 @@ void MainWindow::openPlaylistsDialog()
             }
             return paths;
         },
-        [this](const QString &name) {
+        [this](const QString &name, bool savedOrder) {
             settings_.queueSource = name;
             settings_.activePlaylist = name;
-            settings_.queueMode = QStringLiteral("playlist");
+            // Load keeps the order choice; a new or imported list opens in
+            // Saved order (README)
+            if (savedOrder)
+                settings_.queueMode = QStringLiteral("playlist");
             commitSettings();
             refreshSourceCombo();
             rebuildQueue();
@@ -1750,7 +1969,25 @@ void MainWindow::openPlaylistsDialog()
             QStringList paths;
             for (const Track &track : queueTracks_)
                 paths << track.path;
-            playlists_.replace(name, paths);
+            const bool exists = playlists_.has(name);
+            if (exists && QMessageBox::question(
+                              this, tr("Save queue as playlist"),
+                              tr("Replace the songs of \"%1\" with the current queue (%2 songs)?")
+                                  .arg(name).arg(paths.size()))
+                              != QMessageBox::Yes)
+                return;
+            const bool ok = exists ? playlists_.replace(name, paths)
+                                   : playlists_.create(name, paths, libraryRoot_);
+            if (!ok) {
+                status(playlists_.error);
+                return;
+            }
+            if (!exists) {   // a new playlist opens in Saved order (README)
+                settings_.queueSource = name;
+                settings_.activePlaylist = name;
+                settings_.queueMode = QStringLiteral("playlist");
+                commitSettings();
+            }
             refreshSourceCombo();
             rebuildQueue();
             status(tr("Saved the queue as \"%1\" (%2 songs)").arg(name).arg(paths.size()));
@@ -1789,7 +2026,7 @@ bool MainWindow::applySettingsFromDialog(SettingsDialog *dialog)
         || updated.samplerate != settings_.samplerate
         || updated.bufferMs != settings_.bufferMs
         || updated.interpolation != settings_.interpolation;
-    if (!updated.save()) {
+    if (!saveSettings(updated)) {
         QMessageBox::warning(this, tr("Settings"),
                              tr("Could not save settings. Check the config folder and qt-ui.json."));
         return false;
@@ -2066,7 +2303,7 @@ void MainWindow::updateInfoPanel(const EngineSnapshot &snap)
         snap.durationValid ? formatTime(snap.duration) : (snap.loaded ? QStringLiteral("\u221E") : QStringLiteral("-")));
     infoLabels_.value(QStringLiteral("position"))->setText(
         snap.loaded ? tr("order %1, pattern %2, row %3")
-                          .arg(snap.order + 1).arg(snap.pattern + 1).arg(snap.row)
+                          .arg(snap.order + 1).arg(snap.pattern).arg(snap.row)   // patterns 0-based, as in the tracker header
                     : QStringLiteral("-"));
     infoLabels_.value(QStringLiteral("sequencer"))->setText(
         snap.loaded ? tr("speed %1, tempo %2").arg(snap.speed).arg(snap.tempo) : QStringLiteral("-"));
@@ -2084,8 +2321,14 @@ void MainWindow::updateInfoPanel(const EngineSnapshot &snap)
     const QSignalBlocker spinBlocker(subsongSpin_);
     const int subsongs = std::max(0, int(meta.subsongs));
     subsongSpin_->setEnabled(subsongs > 1 && snap.loaded);
-    subsongSpin_->setRange(1, std::max(1, subsongs));
-    subsongSpin_->setValue(snap.subsong + 1);
+    // Leave the box alone while the user is typing in it, and only touch it
+    // on a change: every tick's setValue reset the edit text.
+    if (!subsongSpin_->hasFocus()) {
+        if (subsongSpin_->maximum() != std::max(1, subsongs))
+            subsongSpin_->setRange(1, std::max(1, subsongs));
+        if (subsongSpin_->value() != snap.subsong + 1)
+            subsongSpin_->setValue(snap.subsong + 1);
+    }
     subsongCountLabel_->setText(subsongs > 1 ? tr("of %1").arg(subsongs) : tr("of 1"));
     const QString name = snap.loaded ? meta.subsongNames.value(snap.subsong).trimmed() : QString();
     subsongNameLabel_->setText(name);
@@ -2148,6 +2391,8 @@ void MainWindow::saveSession(bool force)
         settings_.lastPosition = snap.position;
         if (snap.loop && std::isfinite(snap.duration) && snap.duration > 0.0)
             settings_.lastPosition = std::fmod(snap.position, snap.duration);
+        if (snap.ended)
+            settings_.lastPosition = 0.0;   // a finished song resumes from its start
     } else if (snap.path.isEmpty()) {
         settings_.lastPath.clear();
         settings_.lastPosition = 0.0;
@@ -2159,7 +2404,7 @@ void MainWindow::saveSession(bool force)
 
 void MainWindow::commitSettings()
 {
-    settings_.save();
+    saveSettings(settings_);
 }
 
 // ============================================================================
@@ -2217,6 +2462,7 @@ void MainWindow::appendLog(const QString &level, const QString &text)
 void MainWindow::status(const QString &text)
 {
     statusLabel_->setText(text);
+    statusLabel_->setToolTip(text);
 }
 
 bool MainWindow::eventFilter(QObject *watched, QEvent *event)
@@ -2228,17 +2474,6 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
             seekSlider_->setValue(0);
             timeLabel_->setText(formatTime(0.0));
             return true;
-        }
-    }
-    if (queueView_ && watched == queueView_->viewport() && event->type() == QEvent::KeyPress) {
-        auto *keyEvent = static_cast<QKeyEvent *>(event);
-        if (keyEvent->key() == Qt::Key_Up || keyEvent->key() == Qt::Key_Down) {
-            // let the view move the caret, then play that row (like the Tk version)
-            QTimer::singleShot(0, this, [this] {
-                const QString path = queueModel_->pathAt(queueView_->currentIndex());
-                if (!path.isEmpty())
-                    playPath(path);
-            });
         }
     }
     return QMainWindow::eventFilter(watched, event);
@@ -2256,23 +2491,45 @@ void MainWindow::closeEvent(QCloseEvent *event)
                                    .arg(rect.width()).arg(rect.height())
                                    .arg(rect.x()).arg(rect.y());
     engine_.stop();
-    settings_.save();
+    saveSettings(settings_);
     QMainWindow::closeEvent(event);
+}
+
+Settings MainWindow::persistedSettings(const Settings &s) const
+{
+    // Command-line options are for this session: a field still holding its
+    // command-line value is saved with the value it had before. A field the
+    // user changed in the app since is saved as usual.
+    return withoutSessionOverrides(s, cliSaved_, cliSession_);
 }
 
 void MainWindow::applyCliOverrides(const QHash<QString, QString> &overrides)
 {
     auto take = [&overrides](const QString &key) { return overrides.value(key); };
+    // remember what was saved, so persistedSettings() can write it back
+    cliSaved_.insert(QStringLiteral("volume"), QString::number(settings_.volume));
+    cliSaved_.insert(QStringLiteral("theme"), settings_.theme);
+    cliSaved_.insert(QStringLiteral("interpolation"), settings_.interpolation);
+    cliSaved_.insert(QStringLiteral("backend"), settings_.backend);
     if (overrides.contains(QStringLiteral("volume"))) {
         settings_.volume = std::clamp(take(QStringLiteral("volume")).toInt(), 0, 100);
+        cliSession_.insert(QStringLiteral("volume"), QString::number(settings_.volume));
         engine_.setVolume(settings_.volume);
+        volumeSlider_->setValue(settings_.volume);   // the slider showed the saved volume
     }
-    if (overrides.contains(QStringLiteral("theme")))
+    if (overrides.contains(QStringLiteral("theme"))) {
         settings_.theme = Palette::normalizeTheme(take(QStringLiteral("theme")), settings_.customThemes);
-    if (overrides.contains(QStringLiteral("interpolation")))
+        cliSession_.insert(QStringLiteral("theme"), settings_.theme);
+        applyTheme();   // the constructor applied the saved theme already
+    }
+    if (overrides.contains(QStringLiteral("interpolation"))) {
         settings_.interpolation = take(QStringLiteral("interpolation"));
-    if (overrides.contains(QStringLiteral("backend")))
+        cliSession_.insert(QStringLiteral("interpolation"), settings_.interpolation);
+    }
+    if (overrides.contains(QStringLiteral("backend"))) {
         settings_.backend = take(QStringLiteral("backend"));
+        cliSession_.insert(QStringLiteral("backend"), settings_.backend);
+    }
     engine_.applySettings(settings_);
     if (overrides.contains(QStringLiteral("speed"))) {
         bool ok = false;
@@ -2361,7 +2618,7 @@ void MainWindow::startShotDriver()
                           QStringLiteral("settings"));
             captureDialog(new PlaylistsDialog(nullptr, &playlists_,
                                               [this] { return queueSelectedPaths(); },
-                                              [](const QString &) {}, [](const QString &) {},
+                                              [](const QString &, bool) {}, [](const QString &) {},
                                               [](const QString &, const QString &) {},
                                               [](const QString &) {}),
                           QStringLiteral("playlists"));

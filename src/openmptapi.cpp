@@ -15,10 +15,12 @@
 struct OpenMPTLib::Api {
     uint32_t (*get_library_version)(void) = nullptr;
     int (*is_extension_supported)(const char *) = nullptr;
+    char *(*get_supported_extensions)(void) = nullptr;
     void (*free_string)(void *) = nullptr;
 
-    void *(*module_create_from_memory2)(const void *, size_t, void *, void *, void *, void *,
-                                        int *, char **, const void *) = nullptr;
+    void *(*module_create_from_memory2)(const void *, size_t, void (*)(const char *, void *),
+                                        void *, void *, void *, int *, char **,
+                                        const void *) = nullptr;
     void (*module_destroy)(void *) = nullptr;
 
     size_t (*read_interleaved_float_stereo)(void *, uint32_t, size_t, float *) = nullptr;
@@ -81,6 +83,17 @@ const char *const kKnownExtensions[] = {
 
 QString g_loadError;
 
+// Loader warnings would go to stderr through libopenmpt's default log
+// function; errors still come back through the create call's message.
+void silentLog(const char *, void *) {}
+
+// Accessors of a closed or moved-from module see an API without functions.
+const OpenMPTLib::Api kNoApi{};
+
+// Real modules are a few MB (rarely a few hundred with huge samples); a
+// misnamed multi-GB file must not be read into memory whole.
+constexpr qint64 kMaxModuleBytes = qint64(1) << 30;
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -111,6 +124,8 @@ OpenMPTLib::OpenMPTLib()
         L.resolve("openmpt_get_library_version"));
     api->is_extension_supported = reinterpret_cast<decltype(api->is_extension_supported)>(
         L.resolve("openmpt_is_extension_supported"));
+    api->get_supported_extensions = reinterpret_cast<decltype(api->get_supported_extensions)>(
+        L.resolve("openmpt_get_supported_extensions"));
     api->free_string = reinterpret_cast<decltype(api->free_string)>(
         L.resolve("openmpt_free_string"));
     api->module_create_from_memory2 = reinterpret_cast<decltype(api->module_create_from_memory2)>(
@@ -186,15 +201,29 @@ OpenMPTLib::OpenMPTLib()
 
     api_ = api;
 
+    // libopenmpt encodes major << 24 | minor << 16 | patch (no pre-release byte)
     const uint32_t v = api->get_library_version ? api->get_library_version() : 0;
-    const int major = int((v >> 24) & 0xFF), minor = int((v >> 16) & 0xFF),
-              patch = int((v >> 8) & 0xFF), pre = int(v & 0xFF);
-    versionString_ = pre ? QStringLiteral("%1.%2.%3-pre.%4").arg(major).arg(minor).arg(patch).arg(pre)
-                         : QStringLiteral("%1.%2.%3").arg(major).arg(minor).arg(patch);
+    versionString_ = QStringLiteral("%1.%2.%3")
+                         .arg(int((v >> 24) & 0xFF)).arg(int((v >> 16) & 0xFF)).arg(int(v & 0xFFFF));
 
-    for (const char *const *ext = kKnownExtensions; *ext; ++ext) {
-        if (extensionSupported(QByteArray(*ext)))
-            extensions_ << QString::fromLatin1(*ext);
+    // The library's own list covers every format it plays (med, mdl, stx,
+    // symmod, packed containers, ...); the fixed table is only a fallback.
+    if (api->get_supported_extensions && api->free_string) {
+        if (char *list = api->get_supported_extensions()) {
+            const QString all = QString::fromUtf8(list);
+            api->free_string(list);
+            for (const QString &ext : all.split(QLatin1Char(';'), Qt::SkipEmptyParts)) {
+                const QString lower = ext.trimmed().toLower();
+                if (!lower.isEmpty() && !extensions_.contains(lower))
+                    extensions_ << lower;
+            }
+        }
+    }
+    if (extensions_.isEmpty()) {
+        for (const char *const *ext = kKnownExtensions; *ext; ++ext) {
+            if (extensionSupported(QByteArray(*ext)))
+                extensions_ << QString::fromLatin1(*ext);
+        }
     }
 }
 
@@ -265,7 +294,7 @@ OpenMPTModule OpenMPTLib::openMemory(const QByteArray &data,
     char *message = nullptr;
     void *handle = api_->module_create_from_memory2(
         data.constData(), size_t(data.size()),
-        nullptr, nullptr, nullptr, nullptr,
+        silentLog, nullptr, nullptr, nullptr,
         &error, &message,
         ctlArray.isEmpty() ? nullptr : reinterpret_cast<const void *>(ctlArray.constData()));
     QString errorMessage = message ? takeString(*api_, message) : QString();
@@ -283,6 +312,19 @@ OpenMPTModule OpenMPTLib::openFile(const QString &path,
                                    const QVector<QPair<QByteArray, QByteArray>> &ctls,
                                    QString *errorOut) const
 {
+    // A FIFO or device would block or never end; a huge file would be read
+    // into memory whole.
+    const QFileInfo fi(path);
+    if (fi.exists() && !fi.isFile()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("Not a regular file");
+        return OpenMPTModule();
+    }
+    if (fi.size() > kMaxModuleBytes) {
+        if (errorOut)
+            *errorOut = QStringLiteral("File too large (%1 MB)").arg(fi.size() >> 20);
+        return OpenMPTModule();
+    }
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
         if (errorOut)
@@ -355,13 +397,13 @@ void OpenMPTModule::close()
 }
 
 #define MJ_REQUIRE(fn)                                                      \
-    const OpenMPTLib::Api &api = *lib_->api_;                                           \
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);                                           \
     if (!handle_ || !api.fn)                                                \
         return {};
 
 size_t OpenMPTModule::readFloatStereo(int sampleRate, size_t frames, float *out) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.read_interleaved_float_stereo)
         return 0;
     return api.read_interleaved_float_stereo(handle_, uint32_t(sampleRate), frames, out);
@@ -369,7 +411,7 @@ size_t OpenMPTModule::readFloatStereo(int sampleRate, size_t frames, float *out)
 
 double OpenMPTModule::durationSeconds() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_duration_seconds)
         return 0.0;
     const double d = api.get_duration_seconds(handle_);
@@ -378,7 +420,7 @@ double OpenMPTModule::durationSeconds() const
 
 double OpenMPTModule::positionSeconds() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_position_seconds)
         return 0.0;
     return api.get_position_seconds(handle_);
@@ -386,7 +428,7 @@ double OpenMPTModule::positionSeconds() const
 
 double OpenMPTModule::seekSeconds(double seconds) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.set_position_seconds)
         return 0.0;
     return api.set_position_seconds(handle_, std::max(0.0, seconds));
@@ -394,7 +436,7 @@ double OpenMPTModule::seekSeconds(double seconds) const
 
 double OpenMPTModule::seekOrderRow(int order, int row) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.set_position_order_row)
         return 0.0;
     return api.set_position_order_row(handle_, int32_t(order), int32_t(row));
@@ -402,43 +444,43 @@ double OpenMPTModule::seekOrderRow(int order, int row) const
 
 int OpenMPTModule::currentOrder() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_order ? int(api.get_current_order(handle_)) : 0;
 }
 
 int OpenMPTModule::currentPattern() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_pattern ? int(api.get_current_pattern(handle_)) : 0;
 }
 
 int OpenMPTModule::currentRow() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_row ? int(api.get_current_row(handle_)) : 0;
 }
 
 int OpenMPTModule::currentSpeed() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_speed ? int(api.get_current_speed(handle_)) : 0;
 }
 
 int OpenMPTModule::currentTempo() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_tempo ? int(api.get_current_tempo(handle_)) : 0;
 }
 
 int OpenMPTModule::playingChannels() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_current_playing_channels ? int(api.get_current_playing_channels(handle_)) : 0;
 }
 
 float OpenMPTModule::channelVu(int channel) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_channel_vu_mono)
         return 0.0f;
     const float v = api.get_channel_vu_mono(handle_, int32_t(channel));
@@ -447,63 +489,67 @@ float OpenMPTModule::channelVu(int channel) const
 
 bool OpenMPTModule::selectSubsong(int index) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.select_subsong && api.select_subsong(handle_, int32_t(index));
 }
 
 int OpenMPTModule::numChannels() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_channels ? int(api.get_num_channels(handle_)) : 0;
 }
 int OpenMPTModule::numOrders() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_orders ? int(api.get_num_orders(handle_)) : 0;
 }
 int OpenMPTModule::numPatterns() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_patterns ? int(api.get_num_patterns(handle_)) : 0;
 }
 int OpenMPTModule::numInstruments() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_instruments ? int(api.get_num_instruments(handle_)) : 0;
 }
 int OpenMPTModule::numSamples() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_samples ? int(api.get_num_samples(handle_)) : 0;
 }
 int OpenMPTModule::numSubsongs() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_num_subsongs ? int(api.get_num_subsongs(handle_)) : 1;
 }
 
 int OpenMPTModule::orderPattern(int order) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
-    return handle_ && api.get_order_pattern ? int(api.get_order_pattern(handle_, int32_t(order))) : -1;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
+    if (!handle_ || !api.get_order_pattern)
+        return -1;
+    // "+++" (skip) and "---" (end) order entries come back as 0xFFFE/0xFFFF
+    const int pattern = int(api.get_order_pattern(handle_, int32_t(order)));
+    return pattern >= 0xFFFE ? -1 : pattern;
 }
 
 int OpenMPTModule::patternRows(int pattern) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.get_pattern_num_rows ? int(api.get_pattern_num_rows(handle_, int32_t(pattern))) : 0;
 }
 
 bool OpenMPTModule::setRepeatCount(int count) const
 {
     if (!handle_ || !lib_) return false;
-    const auto &api = *lib_->api_;
+    const auto &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.set_repeat_count && api.set_repeat_count(handle_, count) != 0;
 }
 
 bool OpenMPTModule::setCtlText(const char *ctl, const QString &value) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.ctl_set_text)
         return false;
     const QByteArray bytes = value.toUtf8();
@@ -512,14 +558,14 @@ bool OpenMPTModule::setCtlText(const char *ctl, const QString &value) const
 
 bool OpenMPTModule::setCtlDouble(const char *ctl, double value) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     return handle_ && api.ctl_set_floatingpoint
         && api.ctl_set_floatingpoint(handle_, ctl, value) != 0;
 }
 
 bool OpenMPTModule::setInterpolationLength(int length) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.set_render_param)
         return false;
     return api.set_render_param(handle_, kRenderInterpolationFilterLength, int32_t(length)) != 0;
@@ -537,7 +583,7 @@ void OpenMPTModule::setAtEndStop() const
 
 QStringList OpenMPTModule::metadataKeys() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_metadata_keys)
         return {};
     const QString all = takeString(api, api.get_metadata_keys(handle_));
@@ -547,7 +593,7 @@ QStringList OpenMPTModule::metadataKeys() const
 
 QString OpenMPTModule::metadata(const QString &key) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_metadata)
         return QString();
     const QByteArray bytes = key.toUtf8();
@@ -556,7 +602,7 @@ QString OpenMPTModule::metadata(const QString &key) const
 
 QString OpenMPTModule::instrumentName(int index) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_instrument_name)
         return QString();
     return takeString(api, api.get_instrument_name(handle_, int32_t(index)));
@@ -564,7 +610,7 @@ QString OpenMPTModule::instrumentName(int index) const
 
 QString OpenMPTModule::sampleName(int index) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_sample_name)
         return QString();
     return takeString(api, api.get_sample_name(handle_, int32_t(index)));
@@ -572,7 +618,7 @@ QString OpenMPTModule::sampleName(int index) const
 
 QStringList OpenMPTModule::subsongNameList() const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.get_subsong_name)
         return {};
     QStringList names;
@@ -583,7 +629,7 @@ QStringList OpenMPTModule::subsongNameList() const
 
 QString OpenMPTModule::formatCommand(int pattern, int row, int channel, CommandType type) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.format_pattern_row_channel_command)
         return QString();
     char *text = api.format_pattern_row_channel_command(
@@ -593,7 +639,7 @@ QString OpenMPTModule::formatCommand(int pattern, int row, int channel, CommandT
 
 QString OpenMPTModule::highlightRow(int pattern, int row, int channel, CommandType type) const
 {
-    const OpenMPTLib::Api &api = *lib_->api_;
+    const OpenMPTLib::Api &api = (lib_ ? *lib_->api_ : kNoApi);
     if (!handle_ || !api.highlight_pattern_row_channel_command)
         return QString();
     char *text = api.highlight_pattern_row_channel_command(

@@ -36,6 +36,7 @@ private:
     QLineEdit *maxEdit_ = nullptr;
     QCheckBox *hideBroken_ = nullptr;
     QLabel *countLabel_ = nullptr;
+    QPushButton *applyBtn_ = nullptr;
     QueueFilter base_;
 };
 
@@ -45,7 +46,7 @@ class PlaylistsDialog : public QDialog {
 public:
     PlaylistsDialog(QWidget *parent, PlaylistStore *store,
                     std::function<QStringList()> queuePaths,
-                    std::function<void(const QString &)> loadAsSource,
+                    std::function<void(const QString &, bool savedOrder)> loadAsSource,
                     std::function<void(const QString &)> saveQueueAs,
                     std::function<void(const QString &, const QString &)> onRenamed = {},
                     std::function<void(const QString &)> onDeleted = {});
@@ -66,7 +67,7 @@ private:
 
     PlaylistStore *store_;
     std::function<QStringList()> queuePaths_;
-    std::function<void(const QString &)> loadAsSource_;
+    std::function<void(const QString &, bool)> loadAsSource_;
     std::function<void(const QString &)> saveQueueAs_;
     std::function<void(const QString &, const QString &)> onRenamed_;
     std::function<void(const QString &)> onDeleted_;

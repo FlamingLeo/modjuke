@@ -61,11 +61,11 @@ QString secondsText(double seconds)
 // formats_in(): (format, count) sorted by count desc, then name.
 QVector<QPair<QString, int>> formatsIn(const QVector<Track> &tracks)
 {
+    // unanalyzed tracks count under "" (shown as "unknown"): the filter
+    // compares against the track's format, which is "" for them
     QHash<QString, int> counts;
-    for (const Track &track : tracks) {
-        const QString fmt = track.fmt.isEmpty() ? QObject::tr("unknown") : track.fmt;
-        counts[fmt] += 1;
-    }
+    for (const Track &track : tracks)
+        counts[track.fmt.toLower().trimmed()] += 1;
     QVector<QPair<QString, int>> out;
     for (auto it = counts.constBegin(); it != counts.constEnd(); ++it)
         out.append({it.key(), it.value()});
@@ -92,11 +92,14 @@ FilterDialog::FilterDialog(QWidget *parent, const QueueFilter &current,
     const auto formats = formatsIn(tracks);
     int col = 0;
     for (const auto &pair : formats) {
-        auto *check = new QCheckBox(QStringLiteral("%1 (%2)").arg(pair.first).arg(pair.second),
+        auto *check = new QCheckBox(QStringLiteral("%1 (%2)")
+                                        .arg(pair.first.isEmpty() ? tr("unknown") : pair.first)
+                                        .arg(pair.second),
                                     formatBox);
         check->setProperty("format", pair.first);
         // "all formats selected" means no restriction (keeps unknown too)
-        check->setChecked(current.formats.isEmpty() || current.formats.contains(pair.first));
+        check->setChecked(current.formats.isEmpty() || current.formats.contains(pair.first)
+                          || (pair.first.isEmpty() && current.formats.contains(QLatin1String("unknown"))));
         connect(check, &QCheckBox::toggled, this, [this] { updatePreview(); });
         grid->addWidget(check, col / 3, col % 3);
         formatChecks_.append(check);
@@ -130,6 +133,7 @@ FilterDialog::FilterDialog(QWidget *parent, const QueueFilter &current,
     auto *clearBtn = buttons->addButton(tr("Clear filter"), QDialogButtonBox::ResetRole);
     buttons->addButton(tr("Cancel"), QDialogButtonBox::RejectRole);
     auto *applyBtn = buttons->addButton(tr("Apply"), QDialogButtonBox::AcceptRole);
+    applyBtn_ = applyBtn;
     connect(clearBtn, &QPushButton::clicked, this, &FilterDialog::clear);
     connect(applyBtn, &QPushButton::clicked, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
@@ -146,8 +150,12 @@ QueueFilter FilterDialog::criteria() const
                                  [](QCheckBox *c) { return c->isChecked(); });
     if (!all) {
         for (QCheckBox *check : formatChecks_) {
-            if (check->isChecked())
-                out.formats << check->property("format").toString();
+            if (check->isChecked()) {
+                // not-analyzed tracks are stored as "unknown" (the settings
+                // loader drops empty format names)
+                const QString f = check->property("format").toString();
+                out.formats << (f.isEmpty() ? QStringLiteral("unknown") : f);
+            }
         }
     }
     bool ok = true;
@@ -159,6 +167,16 @@ QueueFilter FilterDialog::criteria() const
 
 void FilterDialog::updatePreview()
 {
+    // nothing checked would be stored as "no restriction" and show everything
+    const bool none = !formatChecks_.isEmpty()
+                      && std::none_of(formatChecks_.begin(), formatChecks_.end(),
+                                      [](QCheckBox *c) { return c->isChecked(); });
+    if (applyBtn_)
+        applyBtn_->setEnabled(!none);
+    if (none) {
+        countLabel_->setText(tr("Check at least one format."));
+        return;
+    }
     const int kept = criteria().count(tracks_);
     QString text = tr("%1 of %2 tracks match").arg(kept).arg(tracks_.size());
     int unknown = 0;
@@ -186,7 +204,7 @@ void FilterDialog::clear()
 // ============================================================================
 PlaylistsDialog::PlaylistsDialog(QWidget *parent, PlaylistStore *store,
                                  std::function<QStringList()> queuePaths,
-                                 std::function<void(const QString &)> loadAsSource,
+                                 std::function<void(const QString &, bool)> loadAsSource,
                                  std::function<void(const QString &)> saveQueueAs,
                                  std::function<void(const QString &, const QString &)> onRenamed,
                                  std::function<void(const QString &)> onDeleted)
@@ -312,10 +330,12 @@ void PlaylistsDialog::createEmpty()
         noteLabel_->setText(err.isEmpty() ? tr("Give the playlist a name first.") : err);
         return;
     }
-    if (!store_->create(name, {}))
-        noteLabel_->setText(store_->error);
+    const bool ok = store_->create(name, {});
+    const QString message = store_->error;
     nameEdit_->clear();
     refresh(name);
+    if (!ok)
+        noteLabel_->setText(message);   // after refresh, which rewrites the note
 }
 
 void PlaylistsDialog::addSelectedSongs()
@@ -328,11 +348,11 @@ void PlaylistsDialog::addSelectedSongs()
         noteLabel_->setText(tr("The queue is empty."));
         return;
     }
-    if (!store_->addPaths(name, paths))
-        noteLabel_->setText(store_->error);
-    else
-        noteLabel_->setText(tr("Added %1 songs to \"%2\".").arg(paths.size()).arg(name));
+    const QString message = store_->addPaths(name, paths)
+                                ? tr("Added %1 songs to \"%2\".").arg(paths.size()).arg(name)
+                                : store_->error;
     refresh(name);
+    noteLabel_->setText(message);
 }
 
 void PlaylistsDialog::addFiles()
@@ -346,11 +366,11 @@ void PlaylistsDialog::addFiles()
            "All files (*)"));
     if (paths.isEmpty())
         return;
-    if (!store_->addPaths(name, paths))
-        noteLabel_->setText(store_->error);
-    else
-        noteLabel_->setText(tr("Added %1 files to \"%2\".").arg(paths.size()).arg(name));
+    const QString message = store_->addPaths(name, paths)
+                                ? tr("Added %1 files to \"%2\".").arg(paths.size()).arg(name)
+                                : store_->error;
     refresh(name);
+    noteLabel_->setText(message);
 }
 
 void PlaylistsDialog::saveAs()
@@ -431,7 +451,7 @@ void PlaylistsDialog::loadSelected()
     const QString name = selectedName();
     if (name.isEmpty())
         return;
-    loadAsSource_(name);
+    loadAsSource_(name, false);   // Load keeps the order choice (README)
     accept();
 }
 
@@ -447,8 +467,11 @@ void PlaylistsDialog::exportSelected()
     if (path.isEmpty())
         return;
     const int written = writeM3u(pl->paths, path);
-    noteLabel_->setText(tr("Exported %1 of %2 entries to %3")
-                            .arg(written).arg(pl->paths.size()).arg(QFileInfo(path).fileName()));
+    if (written < 0)
+        noteLabel_->setText(tr("Could not write %1").arg(QFileInfo(path).fileName()));
+    else
+        noteLabel_->setText(tr("Exported %1 of %2 entries to %3")
+                                .arg(written).arg(pl->paths.size()).arg(QFileInfo(path).fileName()));
 }
 
 void PlaylistsDialog::importM3u()
@@ -464,19 +487,17 @@ void PlaylistsDialog::importM3u()
         return;
     }
     const QString base = QFileInfo(path).completeBaseName();
-    QString err;
-    QString name = PlaylistStore::normalizeName(base, &err);
+    QString name = store_->uniqueName(base, QStringLiteral(" (%1)"));
     if (name.isEmpty())
-        name = QStringLiteral("Imported");
-    int suffix = 2;
-    while (store_->has(name))
-        name = QStringLiteral("%1 (%2)").arg(base).arg(suffix++);
-    if (!store_->create(name, entries, QFileInfo(path).absolutePath()))
-        noteLabel_->setText(store_->error);
-    else
-        noteLabel_->setText(tr("Imported %1 tracks (%2 missing skipped) as \"%3\"")
-                                .arg(entries.size()).arg(skipped).arg(name));
+        name = store_->uniqueName(QStringLiteral("Imported"), QStringLiteral(" (%1)"));
+    const bool ok = !name.isEmpty() && store_->create(name, entries, QFileInfo(path).absolutePath());
+    const QString message = ok ? tr("Imported %1 tracks (%2 missing skipped) as \"%3\"")
+                                     .arg(entries.size()).arg(skipped).arg(name)
+                               : store_->error;
     refresh(name);
+    noteLabel_->setText(message);
+    if (ok)
+        loadAsSource_(name, true);   // an imported M3U opens in Saved order (README)
 }
 
 // ============================================================================

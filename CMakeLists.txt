@@ -40,6 +40,9 @@ include(GNUInstallDirs)
 # Use the absolute installed icon path in the desktop entry. This avoids icon
 # theme cache/lookup differences in desktop environments such as Cinnamon.
 set(MODJUKE_ICON_PATH "${CMAKE_INSTALL_FULL_DATADIR}/icons/hicolor/256x256/apps/modjuke.png")
+# The same for the program: ~/.local/bin is only on the menu's PATH if it
+# existed when the session started, so a bare "modjuke" may not be found.
+set(MODJUKE_EXEC_PATH "${CMAKE_INSTALL_FULL_BINDIR}/modjuke")
 configure_file(resources/modjuke.desktop.in "${CMAKE_CURRENT_BINARY_DIR}/modjuke.desktop" @ONLY)
 
 install(TARGETS modjuke RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

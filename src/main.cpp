@@ -5,10 +5,12 @@
 // CLI:   modjuke --scan DIR [--order] [--analyze]     (prints the queue, exits)
 //        modjuke --check                               (diagnostics, exits)
 #include "analyzer.h"
+#include "casefold.h"
 #include "config.h"
 #include "library.h"
 #include "mainwindow.h"
 #include "openmptapi.h"
+#include "theme.h"
 
 #include <QApplication>
 #include <QIcon>
@@ -47,6 +49,12 @@ static int runScan(const QString &root, bool ordered, bool analyze)
     ScanResult result = scanLibrary(root, supportedExtensions());
     QVector<Track> tracks = result.tracks;
     if (analyze) {
+        QString loadError;
+        if (!OpenMPTLib::instance(&loadError)) {
+            // an unanalyzed listing with exit 0 looked like a successful run
+            QTextStream(stderr) << "libopenmpt: NOT FOUND (" << loadError << ")\n";
+            return 1;
+        }
         for (Track &track : tracks) {
             OpenMPTLib *lib = OpenMPTLib::instance();
             if (!lib)
@@ -111,12 +119,19 @@ int main(int argc, char **argv)
                 return true;
         return false;
     };
-    const bool headless = isArg("--scan") || isArg("--check") || isArg("--version");
+    auto hasPrefix = [argc, argv](const char *prefix) {
+        for (int i = 1; i < argc; ++i)
+            if (qstrncmp(argv[i], prefix, qstrlen(prefix)) == 0)
+                return true;
+        return false;
+    };
+    const bool headless = isArg("--scan") || hasPrefix("--scan=") || isArg("--check")
+                          || isArg("--version") || isArg("-v");
     if (headless) {
         QCoreApplication app(argc, argv);
         QCoreApplication::setApplicationName(QStringLiteral("modjuke"));
         QCoreApplication::setApplicationVersion(QStringLiteral("1.0-qt"));
-        if (isArg("--version")) {
+        if (isArg("--version") || isArg("-v")) {
             QTextStream(stdout) << QStringLiteral("modjuke %1\n").arg(QCoreApplication::applicationVersion());
             return 0;
         }
@@ -125,11 +140,29 @@ int main(int argc, char **argv)
             args << QString::fromLocal8Bit(argv[i]);
         if (isArg("--check"))
             return runCheck();
-        // --scan DIR [--order] [--analyze]
-        const int idx = args.indexOf(QStringLiteral("--scan"));
-        QString root = idx + 1 < args.size() && !args.at(idx + 1).startsWith(QLatin1Char('-'))
-            ? args.at(idx + 1)
-            : Settings::load().lastDirectory;
+        // --scan DIR [--order] [--analyze]   (also --scan=DIR)
+        QString root;
+        int idx = args.indexOf(QStringLiteral("--scan"));
+        for (int i = 0; i < args.size(); ++i) {
+            if (args.at(i).startsWith(QLatin1String("--scan="))) {
+                root = args.at(i).mid(7);
+                idx = i;
+            }
+        }
+        if (root.isEmpty() && idx + 1 < args.size() && !args.at(idx + 1).startsWith(QLatin1Char('-')))
+            root = args.at(idx + 1);
+        // a typo like --analyse silently skipped the analysis
+        for (int i = 0; i < args.size(); ++i) {
+            const QString &a = args.at(i);
+            if (i == idx || a == QLatin1String("--order") || a == QLatin1String("--analyze")
+                || (i == idx + 1 && a == root))
+                continue;
+            QTextStream(stderr) << "modjuke: unknown option for --scan: " << a << "\n"
+                                << "usage: modjuke --scan DIR [--order] [--analyze]\n";
+            return 2;
+        }
+        if (root.isEmpty())
+            root = Settings::load().lastDirectory;   // no DIR: the last library folder
         if (root.isEmpty()) {
             QTextStream(stderr) << "usage: modjuke --scan DIR [--order] [--analyze]\n";
             return 2;
@@ -163,24 +196,61 @@ int main(int argc, char **argv)
     parser.addPositionalArgument(QStringLiteral("dir"), QObject::tr("Library folder (positional)."));
     parser.process(app);
 
-    MainWindow window;
-
+    // Check every value before anything is applied or saved: "--volume 70%"
+    // used to become 0, "--backend pulse" or a mistyped theme were stored.
+    auto fail = [](const QString &message) {
+        QTextStream(stderr) << "modjuke: " << message << "\n";
+        return 2;
+    };
     QHash<QString, QString> overrides;
-    if (parser.isSet(volumeOption))
-        overrides.insert(QStringLiteral("volume"), parser.value(volumeOption));
-    if (parser.isSet(themeOption))
-        overrides.insert(QStringLiteral("theme"), parser.value(themeOption));
-    if (parser.isSet(speedOption))
-        overrides.insert(QStringLiteral("speed"), parser.value(speedOption));
-    if (parser.isSet(interpOption))
-        overrides.insert(QStringLiteral("interpolation"), parser.value(interpOption));
-    if (parser.isSet(backendOption))
-        overrides.insert(QStringLiteral("backend"), parser.value(backendOption));
-    window.applyCliOverrides(overrides);
-
+    if (parser.isSet(volumeOption)) {
+        bool ok = false;
+        const int volume = parser.value(volumeOption).trimmed().toInt(&ok);
+        if (!ok || volume < 0 || volume > 100)
+            return fail(QStringLiteral("--volume takes a number from 0 to 100"));
+        overrides.insert(QStringLiteral("volume"), QString::number(volume));
+    }
+    if (parser.isSet(themeOption)) {
+        const QString theme = parser.value(themeOption);
+        const QString folded = caseFold(theme.trimmed());
+        if (Palette::normalizeTheme(theme, Settings::load().customThemes) == QLatin1String("dark")
+            && folded != QLatin1String("dark") && folded != QLatin1String("default"))
+            return fail(QStringLiteral("unknown theme \"%1\" (built in: %2, or a custom theme's name)")
+                            .arg(theme, Palette::builtinThemes().join(QStringLiteral(", "))));
+        overrides.insert(QStringLiteral("theme"), theme);
+    }
+    if (parser.isSet(speedOption)) {
+        bool ok = false;
+        const double speed = parser.value(speedOption).trimmed().toDouble(&ok);
+        if (!ok || !(speed >= 0.05 && speed <= 20.0))
+            return fail(QStringLiteral("--speed takes a factor from 0.05 to 20"));
+        overrides.insert(QStringLiteral("speed"), parser.value(speedOption).trimmed());
+    }
+    if (parser.isSet(interpOption)) {
+        const QString mode = parser.value(interpOption).trimmed().toLower();
+        if (Engine::interpolationLength(mode) <= 0)
+            return fail(QStringLiteral("--interpolation takes off, linear, cubic or sinc"));
+        // stored by name ("8" would be reset to sinc by the settings loader anyway)
+        overrides.insert(QStringLiteral("interpolation"),
+                         Engine::interpolationName(Engine::interpolationLength(mode)));
+    }
+    if (parser.isSet(backendOption)) {
+        const QString backend = parser.value(backendOption).trimmed().toLower();
+        if (backend != QLatin1String("auto") && backend != QLatin1String("null"))
+            return fail(QStringLiteral("--backend takes auto or null"));
+        overrides.insert(QStringLiteral("backend"), backend);
+    }
     QString dir = parser.value(dirOption);
     if (dir.isEmpty() && !parser.positionalArguments().isEmpty())
         dir = parser.positionalArguments().first();
+    // a mistyped or file path would replace the remembered library folder
+    if (!dir.isEmpty() && !QFileInfo(dir).isDir())
+        return fail(QFileInfo(dir).exists()
+                        ? QStringLiteral("%1 is not a folder (use --track to play a file)").arg(dir)
+                        : QStringLiteral("folder not found: %1").arg(dir));
+
+    MainWindow window;
+    window.applyCliOverrides(overrides);
     if (!dir.isEmpty())
         window.openDirectory(dir);
 

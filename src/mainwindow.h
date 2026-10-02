@@ -110,6 +110,10 @@ private:
     bool typing() const;
 
     int queueIndexOf(const QString &path) const;
+    int nextQueueIndexAfter(const QString &path) const;   // -1: unknown position
+    void handleLoadResult();                               // skips files that fail to load
+    Settings persistedSettings(const Settings &s) const;   // command-line values stay session-only
+    bool saveSettings(const Settings &s) const { return persistedSettings(s).save(); }
     void status(const QString &text);
     void appendLog(const QString &level, const QString &text);
     void updateInfoPanel(const EngineSnapshot &snap);
@@ -129,6 +133,7 @@ private:
     QVector<Track> sourceTracks() const;                    // current collection, unfiltered
     QString shuffleSourceKey() const;
     void ensureShufflePlan(const QVector<Track> &source);   // restore; draw only if never drawn
+    void mergeNewIntoShufflePlan(const QVector<Track> &source);   // new songs -> random places
     void drawShufflePlan(quint32 newSeed = 0, const QString &firstPath = QString(),
                          const QString &avoidFirst = QString());
     void migrateShuffleOrder();                             // settings.shuffle_paths -> store
@@ -149,6 +154,14 @@ private:
     QVector<Track> libraryTracks_;                     // scanned library (all formats)
     QVector<Track> orderedSource_; // invalidated by every full rebuild, reused for search-only edits
     QVector<Track> queueTracks_;                       // currently visible queue
+    QHash<QString, int> queueIndex_;    // path -> index in queueTracks_ (incl. collapsed folders)
+    int playingQueueIndex_ = -1;        // last known queue index of the playing song
+    int pendingSkipDirection_ = 0;      // set before playPath: +1/-1 = skip on if it fails to load
+    int skipDirection_ = 0;             // ... for the load in flight (0: the user picked it)
+    quint64 skipGeneration_ = 0;        // song generation of that load
+    int skipRun_ = 0;                   // broken files skipped in a row
+    QHash<QString, QString> cliSaved_;  // option -> value saved before the command line overrode it
+    QHash<QString, QString> cliSession_; // option -> command-line value (this session only)
     QString libraryRoot_;
     int libraryDirs_ = 0;
     int analyzedTotal_ = 0;

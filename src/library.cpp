@@ -1,9 +1,13 @@
 #include "library.h"
 
 #include <sys/stat.h>
+#ifdef Q_OS_UNIX
+#include <dirent.h>
+#endif
 
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QFileInfoList>
 #include <QRegularExpression>
@@ -19,14 +23,43 @@ QString formatTime(double seconds)
         return QStringLiteral("--:--");
     if (seconds >= 1e18)
         return QStringLiteral("\u221e");
-    const int total = int(seconds);
-    const int h = total / 3600, m = (total / 60) % 60, s = total % 60;
+    // 64-bit and clamped: a damaged cache value (1e15) overflowed int
+    const qint64 total = qint64(std::min(seconds, 1e15));
+    const qint64 h = total / 3600, m = (total / 60) % 60, s = total % 60;
     if (h)
         return QStringLiteral("%1:%2:%3").arg(h).arg(m, 2, 10, QLatin1Char('0')).arg(s, 2, 10, QLatin1Char('0'));
     return QStringLiteral("%1:%2").arg(m).arg(s, 2, 10, QLatin1Char('0'));
 }
 
 namespace {
+
+// Names that aren't valid UTF-8 (old Latin-1/CP437 module archives) never
+// appear in QDir listings: Qt drops what it can't decode. Count them from the
+// raw directory so the scan can say why files are missing.
+int undecodableEntries(const QString &dirPath, const QSet<QString> &wanted)
+{
+#ifdef Q_OS_UNIX
+    DIR *d = opendir(QFile::encodeName(dirPath).constData());
+    if (!d)
+        return 0;
+    int count = 0;
+    while (const dirent *e = readdir(d)) {
+        const QByteArray raw(e->d_name);
+        if (raw == "." || raw == ".." || QFile::encodeName(QFile::decodeName(raw)) == raw)
+            continue;
+        const int dot = raw.lastIndexOf('.');
+        const QString ext = dot >= 0 ? QString::fromLatin1(raw.mid(dot + 1)).toLower() : QString();
+        if (e->d_type == DT_DIR || wanted.contains(ext))
+            ++count;
+    }
+    closedir(d);
+    return count;
+#else
+    Q_UNUSED(dirPath);
+    Q_UNUSED(wanted);
+    return 0;
+#endif
+}
 
 // Build once per field, not inside O(n log n) comparisons. Parts refer to
 // offsets in one folded string: no regex captures or per-comparison allocation.
@@ -164,6 +197,10 @@ ScanResult scanLibrary(const QString &root, const QStringList &extensionsIn,
             continue;
         }
         ++result.dirs;
+        if (const int bad = undecodableEntries(pending.path, wanted))
+            result.errors << QObject::tr("%1: %2 module file(s) or folder(s) skipped, their names "
+                                         "aren't valid UTF-8 (rename them to see them)")
+                                 .arg(pending.path).arg(bad);
         const QFileInfoList entries =
             dir.entryInfoList(QDir::AllEntries | QDir::Hidden | QDir::NoDotAndDotDot, QDir::NoSort);
         for (const QFileInfo &entry : entries) {
@@ -292,8 +329,11 @@ QVector<Track> searchFilter(const QVector<Track> &tracks, const QString &needleI
     const QStringList terms = needle.split(whitespace, Qt::SkipEmptyParts);
     QVector<Track> out;
     for (const Track &track : tracks) {
+        // all of it lowercased: folder and file names used to be compared
+        // as-is, so "axel" never found Axel_F.MOD
         const QString haystack = QStringLiteral("%1/%2 %3 %4")
-                                     .arg(track.relDir, track.name, track.fmt.toLower(), track.title.toLower());
+                                     .arg(track.relDir, track.name, track.fmt, track.title)
+                                     .toLower();
         bool all = true;
         for (const QString &term : terms) {
             if (!haystack.contains(term)) {
@@ -311,8 +351,12 @@ bool QueueFilter::matches(const Track &track) const
 {
     if (hideBroken && !track.broken.isEmpty())
         return false;
-    if (!formats.isEmpty() && !formats.contains(track.fmt.toLower().trimmed()))
-        return false;
+    if (!formats.isEmpty()) {
+        const QString fmt = track.fmt.toLower().trimmed();
+        // "" = not analyzed yet; older saved filters spelled it "unknown"
+        if (!formats.contains(fmt) && !(fmt.isEmpty() && formats.contains(QLatin1String("unknown"))))
+            return false;
+    }
     if (track.duration < 0.0)
         return true;                            // unknown: keep
     if (minSeconds > 0 && track.duration < minSeconds)
@@ -345,9 +389,14 @@ QString QueueFilter::describe() const
 {
     QStringList parts;
     if (!formats.isEmpty()) {
+        // a long list made the status line wider than the window
         QStringList sorted = formats;
         sorted.sort();
-        parts << sorted.join(QLatin1Char('/'));
+        for (QString &f : sorted)
+            if (f.isEmpty())
+                f = QObject::tr("unknown");
+        parts << (sorted.size() > 4 ? QObject::tr("%1 formats").arg(sorted.size())
+                                    : sorted.join(QLatin1Char('/')));
     }
     auto seconds = [](double value) {
         if (value >= 60.0) {

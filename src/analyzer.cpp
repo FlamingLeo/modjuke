@@ -74,6 +74,10 @@ public slots:
             cache.remember(info.absoluteFilePath(), entry);
             dirty = true;
             results.insert(path, entry);
+            // a long first run over a big library: a crash or kill keeps most
+            // of the work instead of none
+            if (useCache_ && done % 500 == 0 && cache.save())
+                dirty = false;
             if (done % 8 == 0 || done == total)
                 emit owner_->progress(done, total);
         }

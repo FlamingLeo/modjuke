@@ -3,6 +3,7 @@
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
+#include <QDateTime>
 #include <QMediaDevices>
 #include <QFileInfo>
 #include <QMetaObject>
@@ -134,6 +135,7 @@ public:
                 next->start(this);
                 if (next->error() == QAudio::NoError) {
                     engine_->sink_ = next;
+                    engine_->watchSink(next);
                     old->reset();
                     delete old;
                 } else {
@@ -150,10 +152,29 @@ public:
 
     void setSampleRate(int rate) { sampleRate_ = rate; }
     int sampleRate() const { return sampleRate_; }
+    // Devices without float output get stereo 16-bit, converted here.
+    void setInt16Output(bool on) { int16Out_ = on; }
 
 protected:
     qint64 readData(char *data, qint64 maxlen) override
     {
+        if (int16Out_) {
+            qint64 written = 0;
+            auto *out = reinterpret_cast<qint16 *>(data);
+            while (written < maxlen) {
+                const size_t wanted = std::min<qint64>((maxlen - written) / (2 * qint64(sizeof(qint16))),
+                                                       qint64(kChunkFrames));
+                if (wanted == 0)
+                    break;
+                conv_.resize(int(wanted * 2));
+                renderChunk(conv_.data(), wanted);
+                qint16 *dst = out + written / qint64(sizeof(qint16));
+                for (size_t i = 0; i < wanted * 2; ++i)
+                    dst[i] = qint16(std::lround(std::clamp(conv_[int(i)], -1.0f, 1.0f) * 32767.0f));
+                written += qint64(wanted) * 2 * qint64(sizeof(qint16));
+            }
+            return written;
+        }
         qint64 written = 0;
         auto *out = reinterpret_cast<float *>(data);
         while (written < maxlen) {
@@ -186,9 +207,13 @@ private:
         }
 
         // Fade in after a seek/load removes most clicks at chunk boundaries.
-        if (rampFrames_ > 0)
-            rampStep_ = float(1.0) / float(rampFrames_);
-        float ramp = rampFrames_ > 0 ? std::min(1.0f, 1.0f - float(rampFrames_) * rampStep_) : 1.0f;
+        // The ramp continues across pulls (a backend may pull fewer frames
+        // than the ramp is long), so its length is fixed when it starts.
+        if (rampTotal_ > 0)
+            rampStep_ = 1.0f / float(rampTotal_);
+        float ramp = rampFrames_ > 0 && rampTotal_ > 0
+                         ? std::clamp(1.0f - float(rampFrames_) / float(rampTotal_), 0.0f, 1.0f)
+                         : 1.0f;
 
         size_t got = 0;
         int transitions = 0;
@@ -196,6 +221,11 @@ private:
             const size_t count = module_.readFloatStereo(sampleRate_, frames-got, out+got*2);
             got += count;
             if (got == frames) break;
+            // A transport command (pause/play/seek) is still pending: let it
+            // apply first instead of ending the file here; the next pull
+            // traverses to the next subsong (or ends) as usual.
+            if (state.playAllSubsongs && state.numSubsongs > 1 && renderSerial_ != e->transportSerial_)
+                break;
             if (!advanceSubsong()) { handleEnd(); break; }
             // Bound work for pathological/empty subsongs; continue next pull.
             if (++transitions >= 8) break;
@@ -254,6 +284,7 @@ private:
     {
         const size_t frames = size_t(double(sampleRate_) * kSeekRampMs / 1000.0);
         rampFrames_ = frames;
+        rampTotal_ = frames;
         rampStep_ = frames ? 1.0f / float(frames) : 1.0f;
     }
 
@@ -273,6 +304,8 @@ private:
         if (next.isOpen() && command.loadEpoch == e->loadEpoch_.loadAcquire()) {
             next.setCtlText("play.at_end", QStringLiteral("stop"));
             next.setInterpolationLength(command.interpLen > 0 ? command.interpLen : 8);
+            if (tempoFactor_ != 1.0)
+                next.setTempoFactor(tempoFactor_);
             const int count = std::max(1, next.numSubsongs());
             validSubsong = command.index >= 0 && command.index < count;
             subsong = validSubsong ? command.index : 0;
@@ -390,6 +423,7 @@ private:
             }
             break;
         case Command::Tempo:
+            tempoFactor_ = command.factor;   // also applied to later loads
             if (module_.isOpen())
                 module_.setTempoFactor(command.factor);
             break;
@@ -461,8 +495,12 @@ private:
         state.orders.clear();
         state.songGeneration = generation;
         const auto previousRamp = rampFrames_;
+        const auto previousTotal = rampTotal_;
         applySeek(0.0);
-        if (!ramp) rampFrames_ = previousRamp;
+        if (!ramp) {
+            rampFrames_ = previousRamp;
+            rampTotal_ = previousTotal;
+        }
         return true;
     }
 
@@ -506,7 +544,11 @@ private:
     int nativeRepeat_ = 2;
     bool playAll_ = false;
     size_t rampFrames_ = 0;
+    size_t rampTotal_ = 0;
     float rampStep_ = 1.0f;
+    double tempoFactor_ = 1.0;
+    bool int16Out_ = false;
+    QVector<float> conv_;
     bool endReported_ = false;
     quint64 renderSerial_ = 0;
 };
@@ -709,73 +751,115 @@ bool Engine::startOutput()
     return ok;
 }
 
+bool Engine::startSilentOnAudioThread(const Settings &config, const QString &why)
+{
+    {
+        QMutexLocker lock(&stateMutex_);
+        silent_ = true;
+        outputName_ = QStringLiteral("null");
+        samplerate_ = config.samplerate > 0 ? config.samplerate : 44100;
+    }
+    device_->setInt16Output(false);
+    device_->setSampleRate(samplerate_);
+    // Null output uses the same dedicated thread, independent of the GUI.
+    if (!pumpTimer_) {
+        pumpTimer_ = new QTimer(audioContext_);
+        pumpTimer_->setTimerType(Qt::PreciseTimer);
+        connect(pumpTimer_, &QTimer::timeout, audioContext_, [this] {
+            const int frames = std::max(16, samplerate_ / 100);       // ~10 ms
+            scratch_.resize(frames * 2);
+            device_->read(reinterpret_cast<char *>(scratch_.data()), frames * 2 * int(sizeof(float)));
+        });
+    }
+    pumpTimer_->start(10);
+    emit logMessage(why.isEmpty() ? QStringLiteral("info") : QStringLiteral("warn"),
+                    (why.isEmpty() ? QString() : why + QStringLiteral(" "))
+                        + QStringLiteral("Silent output (%1 Hz) — no audio device in use").arg(samplerate_));
+    return true;
+}
+
+void Engine::watchSink(QAudioSink *sink)
+{
+    // A device that fails to open, or disappears mid-play on a backend that
+    // doesn't move the stream, stops the sink with an error and no further
+    // pulls: playback would freeze without ever reaching its end.
+    connect(sink, &QAudioSink::stateChanged, audioContext_, [this, sink](QAudio::State st) {
+        if (st != QAudio::StoppedState || sink != sink_ || sink->error() == QAudio::NoError)
+            return;
+        const QAudio::Error err = sink->error();
+        QMetaObject::invokeMethod(audioContext_, [this, sink, err] {
+            if (sink != sink_)
+                return;   // already replaced or stopped
+            sink_ = nullptr;
+            sink->deleteLater();
+            recoverOutput(err == QAudio::OpenError ? QStringLiteral("Audio device could not be opened.")
+                                                   : QStringLiteral("Audio device lost."));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void Engine::recoverOutput(const QString &why)
+{
+    // Retry on the current default device; after repeated failures within a
+    // short time, keep playing silently so the position and queue go on.
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - recoverWindowStart_ > 10000) {
+        recoverWindowStart_ = now;
+        recoverCount_ = 0;
+    }
+    if (++recoverCount_ > 3) {
+        startSilentOnAudioThread(outputConfig_, why);
+        return;
+    }
+    emit logMessage(QStringLiteral("warn"), why + QStringLiteral(" Reopening the audio output."));
+    startOutputOnAudioThread(outputConfig_);
+}
+
 bool Engine::startOutputOnAudioThread(const Settings &config)
 {
     if (sink_ || silent_)
         return sink_ != nullptr || silent_;
+    outputConfig_ = config;
 
     const bool wantNull = config.backend == QLatin1String("null");
     QAudioDevice audioDevice;
     if (!wantNull)
         audioDevice = QMediaDevices::defaultAudioOutput();
-    if (audioDevice.isNull()) {
-        {
-            QMutexLocker lock(&stateMutex_);
-            silent_ = true;
-            outputName_ = QStringLiteral("null");
-            samplerate_ = config.samplerate > 0 ? config.samplerate : 44100;
-        }
-        device_->setSampleRate(samplerate_);
-        // Null output uses the same dedicated thread, independent of the GUI.
-        if (!pumpTimer_) {
-            pumpTimer_ = new QTimer(audioContext_);
-            pumpTimer_->setTimerType(Qt::PreciseTimer);
-            connect(pumpTimer_, &QTimer::timeout, audioContext_, [this] {
-                const int frames = std::max(16, samplerate_ / 100);       // ~10 ms
-                scratch_.resize(frames * 2);
-                device_->read(reinterpret_cast<char *>(scratch_.data()), frames * 2 * int(sizeof(float)));
-            });
-        }
-        pumpTimer_->start(10);
-        emit logMessage(QStringLiteral("info"),
-                        QStringLiteral("Silent output (%1 Hz) — no audio device in use").arg(samplerate_));
-        return true;
-    }
+    if (audioDevice.isNull())
+        return startSilentOnAudioThread(config, QString());
 
-    QAudioFormat format;
-    format.setChannelCount(2);
-    format.setSampleFormat(QAudioFormat::Float);
-    const int preferred = audioDevice.preferredFormat().sampleRate();
-    int rate = config.samplerate > 0 ? config.samplerate : (preferred > 0 ? preferred : 44100);
-    format.setSampleRate(rate);
-    QAudioFormat chosen = format;
-    if (audioDevice.isFormatSupported(chosen)) {
-        // fine
-    } else {
-        chosen = audioDevice.preferredFormat();
-        chosen.setSampleFormat(QAudioFormat::Float);
-        if (!audioDevice.isFormatSupported(chosen))
-            chosen = audioDevice.preferredFormat();
-        rate = chosen.sampleRate();
-    }
-    if (config.samplerate > 0) {
-        QAudioFormat requested = chosen;
-        requested.setSampleRate(config.samplerate);
-        if (audioDevice.isFormatSupported(requested)) {
-            chosen = requested;
-            rate = config.samplerate;
-        } else {
-            emit logMessage(QStringLiteral("warn"),
-                            QStringLiteral("Output rate %1 Hz unavailable, using %2 Hz")
-                                .arg(config.samplerate).arg(rate));
-        }
-    }
+    // The renderer produces stereo float; 16-bit stereo is converted.
+    // Anything else (other channel counts, 32-bit int) would be noise.
+    const int preferredRate = audioDevice.preferredFormat().sampleRate() > 0
+                                  ? audioDevice.preferredFormat().sampleRate() : 44100;
+    const int wantRate = config.samplerate > 0 ? config.samplerate : preferredRate;
+    QAudioFormat chosen;
+    auto tryFormat = [&](int rate, QAudioFormat::SampleFormat sampleFormat) {
+        QAudioFormat f;
+        f.setChannelCount(2);
+        f.setSampleFormat(sampleFormat);
+        f.setSampleRate(rate);
+        if (!audioDevice.isFormatSupported(f))
+            return false;
+        chosen = f;
+        return true;
+    };
+    if (!tryFormat(wantRate, QAudioFormat::Float) && !tryFormat(preferredRate, QAudioFormat::Float)
+        && !tryFormat(wantRate, QAudioFormat::Int16) && !tryFormat(preferredRate, QAudioFormat::Int16))
+        return startSilentOnAudioThread(
+            config, QStringLiteral("%1 offers no stereo float or 16-bit format.").arg(audioDevice.description()));
+    const int rate = chosen.sampleRate();
+    if (config.samplerate > 0 && rate != config.samplerate)
+        emit logMessage(QStringLiteral("warn"),
+                        QStringLiteral("Output rate %1 Hz unavailable, using %2 Hz")
+                            .arg(config.samplerate).arg(rate));
+    const bool int16 = chosen.sampleFormat() == QAudioFormat::Int16;
 
     outputDevice_ = audioDevice;
     sink_ = new QAudioSink(audioDevice, chosen, audioContext_);
-    const int bytesPerSecond = rate * 2 * int(sizeof(float));
+    const qint64 bytesPerSecond = qint64(rate) * 2 * (int16 ? 2 : 4);
     outputBufferBytes_ = std::max<qint64>(bytesPerSecond * config.bufferMs / 1000,
-                                        qint64(rate * 2 * sizeof(float) * 25 / 1000));
+                                          bytesPerSecond * 25 / 1000);
     sink_->setBufferSize(outputBufferBytes_);
     {
         QMutexLocker lock(&stateMutex_);
@@ -783,12 +867,21 @@ bool Engine::startOutputOnAudioThread(const Settings &config)
         outputName_ = QStringLiteral("qtaudio");
         silent_ = false;
     }
+    device_->setInt16Output(int16);
     device_->setSampleRate(rate);
+    watchSink(sink_);
     sink_->start(device_);
+    if (sink_->error() != QAudio::NoError) {
+        delete sink_;
+        sink_ = nullptr;
+        return startSilentOnAudioThread(
+            config, QStringLiteral("Audio device %1 could not be opened.").arg(audioDevice.description()));
+    }
     if (pumpTimer_)
         pumpTimer_->stop();
     emit logMessage(QStringLiteral("info"),
-                    QStringLiteral("Audio: %1 @ %2 Hz").arg(audioDevice.description(), QString::number(rate)));
+                    QStringLiteral("Audio: %1 @ %2 Hz%3").arg(audioDevice.description(), QString::number(rate),
+                                                            int16 ? QStringLiteral(", 16-bit") : QString()));
     return true;
 }
 

@@ -8,9 +8,12 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QSaveFile>
+#include <QStringDecoder>
+#include <QUrl>
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 namespace {
 
@@ -47,7 +50,91 @@ bool atomicWrite(const QString &path, const QByteArray &data)
     return file.commit();
 }
 
+// double -> integer without undefined behavior for huge or odd JSON values
+int boundedInt(double v, int lo, int hi)
+{
+    if (!std::isfinite(v))
+        return lo;
+    return int(std::clamp(v, double(lo), double(hi)));
+}
+
 }  // namespace
+
+QByteArray jsonStringLiteral(const QString &text)
+{
+    const QByteArray array = QJsonDocument(QJsonArray{text}).toJson(QJsonDocument::Compact);
+    return array.mid(1, array.size() - 2);   // ["..."] -> "..."
+}
+
+QStringList jsonMemberKeyOrder(const QByteArray &json, const QString &member)
+{
+    // A small scanner over already-valid JSON (callers parse it first): it
+    // walks the top-level object, finds `member` and lists that object's keys.
+    QStringList keys;
+    const char *p = json.constData();
+    const char *end = p + json.size();
+    auto ws = [&] { while (p < end && (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) ++p; };
+    auto readString = [&]() -> QByteArray {   // at '"': returns the raw literal, quotes included
+        const char *start = p++;
+        while (p < end && *p != '"') {
+            if (*p == '\\' && p + 1 < end) ++p;
+            ++p;
+        }
+        if (p < end) ++p;
+        return QByteArray(start, int(p - start));
+    };
+    auto decode = [](const QByteArray &literal) {
+        const QJsonDocument doc = QJsonDocument::fromJson("[" + literal + "]");
+        return doc.isArray() ? doc.array().at(0).toString() : QString();
+    };
+    std::function<void()> skipValue = [&] {
+        ws();
+        if (p >= end) return;
+        if (*p == '"') { readString(); return; }
+        if (*p == '{' || *p == '[') {
+            int depth = 0;
+            while (p < end) {
+                if (*p == '"') { readString(); continue; }
+                if (*p == '{' || *p == '[') ++depth;
+                else if (*p == '}' || *p == ']') { --depth; if (depth == 0) { ++p; return; } }
+                ++p;
+            }
+            return;
+        }
+        while (p < end && *p != ',' && *p != '}' && *p != ']') ++p;   // number/true/false/null
+    };
+    ws();
+    if (p >= end || *p != '{') return keys;
+    ++p;
+    while (p < end) {
+        ws();
+        if (p >= end || *p != '"') break;
+        const QString name = decode(readString());
+        ws();
+        if (p >= end || *p != ':') break;
+        ++p;
+        ws();
+        if (name == member && p < end && *p == '{') {
+            ++p;
+            while (p < end) {
+                ws();
+                if (p >= end || *p != '"') break;
+                keys << decode(readString());
+                ws();
+                if (p >= end || *p != ':') break;
+                ++p;
+                skipValue();
+                ws();
+                if (p < end && *p == ',') ++p;
+            }
+            return keys;
+        }
+        skipValue();
+        ws();
+        if (p < end && *p == ',') ++p;
+    }
+    return keys;
+}
 
 QString analysisCachePath() { return AnalysisCache::pathFor(modjukeConfigDir()); }
 QString playlistsPath() { return QDir(modjukeConfigDir()).filePath(QStringLiteral("playlists.json")); }
@@ -68,34 +155,40 @@ AnalysisCache::AnalysisCache(const QString &path) : path_(path.isEmpty() ? analy
 int AnalysisCache::load()
 {
     entries_.clear();
-    order_.clear();
+    used_.clear();
+    clock_ = 0;
     QFile file(path_);
     if (!file.open(QIODevice::ReadOnly))
         return 0;
+    const QByteArray bytes = file.readAll();
     QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
     if (parseError.error != QJsonParseError::NoError || !doc.isObject())
         return 0;
     const QJsonObject entries = doc.object().value(QStringLiteral("entries")).toObject();
+    // recency = order in the file (least recent first), as Python writes it
+    for (const QString &key : jsonMemberKeyOrder(bytes, QStringLiteral("entries")))
+        used_.insert(key, ++clock_);
     for (auto it = entries.constBegin(); it != entries.constEnd(); ++it) {
         if (!it.value().isObject())
             continue;
         const QJsonObject raw = it.value().toObject();
         CachedModule entry;
-        entry.size = qint64(raw.value(QStringLiteral("size")).toDouble());
+        const double sizeValue = raw.value(QStringLiteral("size")).toDouble();
+        entry.size = std::isfinite(sizeValue) ? qint64(std::clamp(sizeValue, -1.0, 9.0e15)) : -1;
         entry.mtime = raw.value(QStringLiteral("mtime")).toDouble();
         const QJsonValue dur = raw.value(QStringLiteral("dur"));
         if (dur.isString() && dur.toString() == QLatin1String("inf"))
             entry.duration = 1e18;
         else if (dur.isDouble() && dur.toDouble() >= 0.0)
-            entry.duration = dur.toDouble();
+            entry.duration = std::min(dur.toDouble(), 1e18);   // beyond = endless
         else
             entry.duration = -1.0;
         entry.fmt = raw.value(QStringLiteral("fmt")).toString();
         entry.channels = raw.value(QStringLiteral("ch")).isDouble()
-                             ? int(raw.value(QStringLiteral("ch")).toDouble()) : -1;
+                             ? boundedInt(raw.value(QStringLiteral("ch")).toDouble(), -1, 4096) : -1;
         entry.subsongs = raw.value(QStringLiteral("sub")).isDouble()
-                             ? qMax(0, int(raw.value(QStringLiteral("sub")).toDouble())) : 1;
+                             ? boundedInt(raw.value(QStringLiteral("sub")).toDouble(), 0, 1 << 20) : 1;
         entry.title = raw.value(QStringLiteral("title")).toString();
         entry.broken = raw.value(QStringLiteral("broken")).toString();
         const QJsonValue chValue = raw.value(QStringLiteral("ch"));
@@ -108,7 +201,8 @@ int AnalysisCache::load()
         if (badCount || (dur.isDouble() && dur.toDouble() < 0.0))
             continue;   // unusable record: force a fresh analysis like the Tk app
         entries_.insert(it.key(), entry);
-        order_ << it.key();
+        if (!used_.contains(it.key()))
+            used_.insert(it.key(), ++clock_);
     }
     return entries_.size();
 }
@@ -123,9 +217,7 @@ bool AnalysisCache::apply(const QString &path, qint64 size, double mtime, Cached
         return false;
     if (out)
         *out = entry;
-    // touched: LRU move to end
-    order_.removeOne(path);
-    order_ << path;
+    touch(path);   // O(1): a rescan applies every track of the library
     return true;
 }
 
@@ -138,8 +230,7 @@ void AnalysisCache::remember(const QString &path, const CachedModule &entry)
         && it.value().subsongs == entry.subsongs && it.value().duration == entry.duration)
         return;
     entries_[path] = entry;
-    order_.removeOne(path);
-    order_ << path;
+    touch(path);
     dirty_ = true;
 }
 
@@ -147,13 +238,23 @@ bool AnalysisCache::save()
 {
     if (!dirty_)
         return false;
-    // prune cold entries beyond the cap
+    // least recently used first; prune cold entries beyond the cap
     static constexpr int kMaxEntries = 50000;
-    while (order_.size() > kMaxEntries) {
-        entries_.remove(order_.takeFirst());
+    QVector<QPair<quint64, QString>> order;
+    order.reserve(entries_.size());
+    for (auto it = entries_.constBegin(); it != entries_.constEnd(); ++it)
+        order.append({used_.value(it.key()), it.key()});
+    std::sort(order.begin(), order.end());
+    while (order.size() > kMaxEntries) {
+        entries_.remove(order.first().second);
+        used_.remove(order.first().second);
+        order.removeFirst();
     }
-    QJsonObject entries;
-    for (const QString &path : order_) {
+    // written in that order (QJsonObject would sort the keys alphabetically)
+    QByteArray body = "{\"entries\":{";
+    bool first = true;
+    for (const auto &item : std::as_const(order)) {
+        const QString &path = item.second;
         auto it = entries_.constFind(path);
         if (it == entries_.constEnd())
             continue;
@@ -178,12 +279,13 @@ bool AnalysisCache::save()
             raw.insert(QStringLiteral("broken"), QJsonValue::Null);
         else
             raw.insert(QStringLiteral("broken"), entry.broken);
-        entries.insert(path, raw);
+        if (!first)
+            body += ',';
+        first = false;
+        body += jsonStringLiteral(path) + ':' + QJsonDocument(raw).toJson(QJsonDocument::Compact);
     }
-    QJsonObject payload;
-    payload.insert(QStringLiteral("version"), 1);
-    payload.insert(QStringLiteral("entries"), entries);
-    if (atomicWrite(path_, compactJson(payload).toUtf8())) {
+    body += "},\"version\":1}";
+    if (atomicWrite(path_, body)) {
         dirty_ = false;
         return true;
     }
@@ -217,12 +319,25 @@ bool PlaylistStore::load()
     reindex();
 
     QFile file(path_);
-    if (!file.open(QIODevice::ReadOnly))
+    readError_ = false;
+    if (!file.exists())
+        return false;   // first run: nothing saved yet
+    // A file that exists but can't be read must survive: saving the
+    // Favorites stub over it would delete every playlist.
+    auto refuse = [this](const QString &reason) {
+        readError_ = true;
+        error = QObject::tr("Could not read playlists: %1. File kept unchanged, playlist "
+                            "changes are not saved until it is fixed: %2").arg(reason, path_);
         return false;
+    };
+    if (!file.open(QIODevice::ReadOnly))
+        return refuse(file.errorString());
     QJsonParseError parseError;
     const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
     if (parseError.error != QJsonParseError::NoError)
-        return false;
+        return refuse(parseError.errorString());
+    if (!doc.isObject() || !doc.object().value(QStringLiteral("playlists")).isArray())
+        return refuse(QObject::tr("unknown format"));
     const QJsonArray items = doc.object().value(QStringLiteral("playlists")).toArray();
     QStringList seen;   // the file's own Favorites entry replaces the stub below
     for (const QJsonValue &item : items) {
@@ -269,7 +384,7 @@ QString PlaylistStore::normalizeName(const QString &nameIn, QString *errorOut)
     };
     if (text.isEmpty())
         return fail(QObject::tr("A playlist needs a name"));
-    if (text.size() > 80)
+    if (text.toUcs4().size() > 80)   // code points, like Python's len()
         return fail(QObject::tr("A name is 80 characters at most"));
     if (text.contains(QLatin1Char('/')) || text.contains(QLatin1Char('\\')))
         return fail(QObject::tr("A playlist name cannot contain a slash"));
@@ -280,8 +395,31 @@ QString PlaylistStore::normalizeName(const QString &nameIn, QString *errorOut)
     return text;
 }
 
+QString PlaylistStore::uniqueName(const QString &baseIn, const QString &suffix, QString *errorOut) const
+{
+    const QString base = normalizeName(baseIn, errorOut);
+    if (base.isEmpty() || !has(base))
+        return base;
+    const QList<uint> points = base.toUcs4();
+    for (int n = 2; n < 100000; ++n) {
+        const QString tail = suffix.arg(n);
+        const int room = std::max(1, 80 - int(tail.toUcs4().size()));
+        const QString head = points.size() > room
+                                 ? QString::fromUcs4(reinterpret_cast<const char32_t *>(points.constData()), room).trimmed()
+                                 : base;
+        const QString candidate = head + tail;
+        if (!has(candidate) && normalizeName(candidate).size())
+            return candidate;
+    }
+    if (errorOut)
+        *errorOut = QObject::tr("No free playlist name");
+    return QString();
+}
+
 bool PlaylistStore::save() const
 {
+    if (readError_)
+        return false;   // the damaged file stays untouched (see load)
     QJsonArray items;
     for (const Playlist &playlist : playlists_) {
         // The Python version skips writing the bare Favorites stub? It always
@@ -443,7 +581,8 @@ bool PlaylistStore::rename(const QString &oldName, const QString &newNameIn)
         error = QObject::tr("No playlist called '%1'").arg(oldName);
         return false;
     }
-    if (has(newName)) {
+    // a case-only change ("rock" -> "Rock") finds the playlist itself
+    if (has(newName) && key(newName) != key(playlist->name)) {
         error = QObject::tr("A playlist called '%1' already exists").arg(newName);
         return false;
     }
@@ -524,11 +663,9 @@ int writeM3u(const QStringList &paths, const QString &path)
         lines << text;
         ++count;
     }
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        return 0;
-    file.write((lines.join(QStringLiteral("\r\n")) + QStringLiteral("\r\n")).toUtf8());
-    file.close();
+    // temp + rename: a full disk must not leave a truncated list behind
+    if (!atomicWrite(path, (lines.join(QStringLiteral("\r\n")) + QStringLiteral("\r\n")).toUtf8()))
+        return -1;
     return count;
 }
 
@@ -537,17 +674,22 @@ QStringList readM3u(const QString &path, int *skippedOut)
     QStringList out;
     int skipped = 0;
     QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) {
+    // a playlist is small; a huge file picked by mistake must not be read whole
+    if (QFileInfo(path).size() > (64 << 20) || !file.open(QIODevice::ReadOnly)) {
         if (skippedOut)
             *skippedOut = 0;
         return out;
     }
+    const QByteArray bytes = file.readAll();
+    // UTF-8, or (old Windows/DOS-era lists) Latin-1 when it isn't valid UTF-8
+    QStringDecoder utf8(QStringConverter::Utf8, QStringDecoder::Flag::Stateless);
+    QString text = utf8(bytes);
+    if (utf8.hasError())
+        text = QString::fromLatin1(bytes);
     const QString base = QFileInfo(path).absolutePath();
     QSet<QString> seen;
-    QTextStream stream(&file);
-    stream.setEncoding(QStringConverter::Utf8);
-    while (!stream.atEnd()) {
-        QString entry = stream.readLine().trimmed();
+    for (const QString &line : text.split(QLatin1Char('\n'))) {
+        QString entry = line.trimmed();
         if (entry.isEmpty() || entry.startsWith(QLatin1Char('#')))
             continue;
         if (entry.size() >= 2 && (entry.front() == QLatin1Char('"') && entry.back() == entry.front()
@@ -555,9 +697,17 @@ QStringList readM3u(const QString &path, int *skippedOut)
             entry = entry.mid(1, entry.size() - 2).trimmed();
         if (entry.isEmpty())
             continue;
+        if (entry.startsWith(QLatin1String("file://")))
+            entry = QUrl(entry).toLocalFile();
         if (!entry.startsWith(QLatin1Char('/')))
             entry = QDir(base).filePath(entry);
         entry = QDir::cleanPath(entry);
+        // relative entries written on Windows use backslashes
+        if (entry.contains(QLatin1Char('\\')) && !QFileInfo::exists(entry)) {
+            const QString slashed = QDir::cleanPath(QString(entry).replace(QLatin1Char('\\'), QLatin1Char('/')));
+            if (QFileInfo::exists(slashed))
+                entry = slashed;
+        }
         if (seen.contains(entry))
             continue;
         seen.insert(entry);
@@ -703,6 +853,7 @@ bool StatsStore::save()
         error.clear();
         return true;
     }
+    error = QObject::tr("Could not save listening stats: %1").arg(path_);
     return false;
 }
 
@@ -717,8 +868,8 @@ QVector<ModuleStats> StatsStore::mostPlayed(int limit) const
             return a.plays > b.plays;
         return a.seconds > b.seconds;
     });
-    while (rows.size() > limit)
-        rows.remove(limit);
+    if (limit >= 0 && rows.size() > limit)
+        rows.resize(limit);   // one step (removing one at a time was O(n^2))
     return rows;
 }
 
