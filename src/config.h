@@ -68,6 +68,8 @@ struct Settings {
     bool playAllSubsongs = false;    // Qt-only opt-in policy (qt-ui.json)
     QStringList hiddenQueueColumns;  // Qt-only optional column IDs; Module is never hidden
     bool confirmIgnore = true;        // Qt-only UI preference (qt-ui.json)
+    int filterMinChannels = 0;        // Qt-only queue filter (qt-ui.json); 0 = none
+    int filterMaxChannels = 0;
     QString lastPath;
     double lastPosition = 0.0;
 

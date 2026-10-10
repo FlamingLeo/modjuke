@@ -103,6 +103,23 @@ FilterDialog::FilterDialog(QWidget *parent, const QueueFilter &current,
     form->addRow(tr("Longest"), maxEdit_);
     root->addWidget(range);
 
+    // 0 shows the special text and means no limit
+    auto *channels = new QGroupBox(tr("Channels"), this);
+    auto *channelForm = new QFormLayout(channels);
+    minChannels_ = new QSpinBox(channels);
+    maxChannels_ = new QSpinBox(channels);
+    minChannels_->setSpecialValueText(tr("no minimum"));
+    maxChannels_->setSpecialValueText(tr("no maximum"));
+    minChannels_->setRange(0, 4096);
+    maxChannels_->setRange(0, 4096);
+    minChannels_->setValue(current.minChannels);
+    maxChannels_->setValue(current.maxChannels);
+    connect(minChannels_, &QSpinBox::valueChanged, this, [this] { updatePreview(); });
+    connect(maxChannels_, &QSpinBox::valueChanged, this, [this] { updatePreview(); });
+    channelForm->addRow(tr("Fewest"), minChannels_);
+    channelForm->addRow(tr("Most"), maxChannels_);
+    root->addWidget(channels);
+
     hideBroken_ = new QCheckBox(tr("Hide modules that cannot be played"), this);
     hideBroken_->setChecked(current.hideBroken);
     connect(hideBroken_, &QCheckBox::toggled, this, [this] { updatePreview(); });
@@ -144,6 +161,8 @@ QueueFilter FilterDialog::criteria() const
     bool ok = true;
     out.minSeconds = std::max(0.0, parseSeconds(minEdit_->text(), &ok));
     out.maxSeconds = std::max(0.0, parseSeconds(maxEdit_->text(), &ok));
+    out.minChannels = minChannels_->value();
+    out.maxChannels = maxChannels_->value();
     out.hideBroken = hideBroken_->isChecked();
     return out;
 }
@@ -178,6 +197,8 @@ void FilterDialog::clear()
         check->setChecked(true);
     minEdit_->clear();
     maxEdit_->clear();
+    minChannels_->setValue(0);
+    maxChannels_->setValue(0);
     hideBroken_->setChecked(false);
     updatePreview();
 }

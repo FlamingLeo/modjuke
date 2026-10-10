@@ -393,6 +393,12 @@ bool QueueFilter::matches(const Track &track) const
         if (!formats.contains(fmt) && !(fmt.isEmpty() && formats.contains(QLatin1String("unknown"))))
             return false;
     }
+    if (track.channels > 0) {                   // unknown: keep
+        if (minChannels > 0 && track.channels < minChannels)
+            return false;
+        if (maxChannels > 0 && track.channels > maxChannels)
+            return false;
+    }
     if (track.duration < 0.0)
         return true;                            // unknown: keep
     if (minSeconds > 0 && track.duration < minSeconds)
@@ -445,6 +451,14 @@ QString QueueFilter::describe() const
         parts << QStringLiteral("\u2265%1").arg(seconds(minSeconds));
     if (maxSeconds > 0)
         parts << QStringLiteral("\u2264%1").arg(seconds(maxSeconds));
+    if (minChannels > 0 && minChannels == maxChannels)
+        parts << (minChannels == 1 ? QObject::tr("1 channel") : QObject::tr("%1 channels").arg(minChannels));
+    else if (minChannels > 0 && maxChannels > 0)
+        parts << QObject::tr("%1-%2 channels").arg(minChannels).arg(maxChannels);
+    else if (minChannels > 0)
+        parts << QObject::tr("\u2265%1 channels").arg(minChannels);
+    else if (maxChannels > 0)
+        parts << QObject::tr("\u2264%1 channels").arg(maxChannels);
     if (hideBroken)
         parts << QObject::tr("playable only");
     return parts.isEmpty() ? QObject::tr("no filter") : parts.join(QStringLiteral(", "));

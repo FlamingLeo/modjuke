@@ -72,7 +72,7 @@ void QueuePanel::buildControlsRow(QWidget *window)
     auto *playlistsBtn = new QPushButton(tr("Playlists"), bar);
     playlistsBtn->setToolTip(tr("Save the queue as a playlist (Ctrl+P)"));
     auto *filterBtn = new QPushButton(tr("Filter"), bar);
-    filterBtn->setToolTip(tr("Filter formats, length, broken files (Ctrl+Shift+F)"));
+    filterBtn->setToolTip(tr("Filter formats, length, channels, broken files (Ctrl+Shift+F)"));
     auto *searchLabel = new QLabel(tr("Search:"), bar);
     searchEdit_ = new QLineEdit(bar);
     searchEdit_->setPlaceholderText(tr("title or file name"));

@@ -83,6 +83,8 @@ QueueFilter QueueBuilder::filter() const
     filter.formats = settings_.filterFormats;
     filter.minSeconds = settings_.filterMin;
     filter.maxSeconds = settings_.filterMax;
+    filter.minChannels = settings_.filterMinChannels;
+    filter.maxChannels = settings_.filterMaxChannels;
     filter.hideBroken = settings_.filterHideBroken;
     return filter;
 }
@@ -92,6 +94,8 @@ void QueueBuilder::setFilter(const QueueFilter &filter)
     settings_.filterFormats = filter.formats;
     settings_.filterMin = filter.minSeconds;
     settings_.filterMax = filter.maxSeconds;
+    settings_.filterMinChannels = filter.minChannels;
+    settings_.filterMaxChannels = filter.maxChannels;
     settings_.filterHideBroken = filter.hideBroken;
     emit settingsChanged();
 }

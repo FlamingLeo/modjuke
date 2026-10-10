@@ -136,6 +136,8 @@ Settings Settings::load(const QString &pathIn)
         s.playAllSubsongs = ui.value("play_all_subsongs").toBool();
     if (ui.value("confirm_ignore").isBool())
         s.confirmIgnore = ui.value("confirm_ignore").toBool();
+    s.filterMinChannels = clampedInt(jsonNumber(ui.value("filter_min_channels"), 0.0), 0, 4096);
+    s.filterMaxChannels = clampedInt(jsonNumber(ui.value("filter_max_channels"), 0.0), 0, 4096);
 
     const JsonRead file = readJsonObject(path);
     if (file.status == JsonRead::Missing)
@@ -304,6 +306,8 @@ bool Settings::save(const QString &pathIn) const
     }
     ui.insert("confirm_ignore", confirmIgnore);
     ui.insert("play_all_subsongs", playAllSubsongs);
+    ui.insert("filter_min_channels", filterMinChannels);
+    ui.insert("filter_max_channels", filterMaxChannels);
     ui.insert("hidden_queue_columns", QJsonArray::fromStringList(
         cleanHiddenQueueColumns(QJsonArray::fromStringList(hiddenQueueColumns))));
     QSaveFile uiFile(uiPath);

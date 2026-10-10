@@ -8,7 +8,7 @@ A Windows 9x version is available [here](https://github.com/FlamingLeo/modjuke95
 
 ## Features
 
-- Folder scanning, search, and filters for format, duration, and playable files.
+- Folder scanning, search, and filters for format, duration, channel count, and playable files.
 - Automatic background analysis of library modules for lengths, formats, channel counts, subsong counts, and titles.
 - Playlists with automatic saving, drag-to-reorder, and M3U import/export.
 - Favorites and ignore lists.
@@ -49,7 +49,15 @@ sudo apt install build-essential cmake ninja-build qt6-base-dev qt6-multimedia-d
 > [!IMPORTANT]
 > On older Debian/Ubuntu releases, use `libopenmpt0` if that is the available package. Other distributions use equivalent Qt and libopenmpt packages. Qt Multimedia uses the system audio service; on Linux, PulseAudio or PipeWire usually provides it.
 
-From the extracted repository directory:
+From the extracted repository directory, run the install script:
+
+```bash
+./install.sh
+```
+
+It configures, builds, and installs to `~/.local`, then runs `modjuke --check`. It also writes `build/compile_commands.json` for code editors. Use `./install.sh --prefix PREFIX` to install elsewhere.
+
+To build and install by hand instead:
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -74,7 +82,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### Updates and removal
 
-Close the player, extract the new source, and repeat the configure, build, and install commands with the same installation prefix. This replaces the installed executable and resources, not your settings or music. This CMake installation does not manage previous releases or automatic rollback.
+Close the player, extract the new source, and run `./install.sh` again. It updates the existing installation: it reuses the prefix from `build/install_manifest.txt` or from the `modjuke` found on `PATH`. By hand, repeat the configure, build, and install commands with the same installation prefix. This replaces the installed executable and resources, not your settings or music. This CMake installation does not manage previous releases or automatic rollback.
 
 Uninstall with the included script:
 
@@ -135,7 +143,7 @@ On every system, modjuke looks for libopenmpt next to itself first (`../lib/libo
 3. Double-click a queue entry, or select it and press **Enter**, to play.
 4. Switch between **Player** and **Tracker** with the tabs or **Ctrl+T**.
 
-Search narrows the displayed queue. The Filter dialog adds format, duration, and playable-only criteria. Use **Rescan** or **F5** to discover files added or changed outside the application.
+Search narrows the displayed queue. The Filter dialog adds format, duration, channel count, and playable-only criteria. Use **Rescan** or **F5** to discover files added or changed outside the application.
 
 ### Queue source and order
 
@@ -318,7 +326,7 @@ The data directory is `$XDG_CONFIG_HOME/modjuke`, or `~/.config/modjuke` when th
 | `listening-stats.json` | Local listening history |
 | `ignored.json` | Exact file paths hidden everywhere. Playlist membership is kept, so they can be restored |
 | `shuffles.json` | Saved shuffle order for each library folder and playlist |
-| `qt-ui.json` | Qt-only ignore confirmation, Play all subsongs, and hidden queue columns |
+| `qt-ui.json` | Qt-only ignore confirmation, Play all subsongs, hidden queue columns, and the channel filter |
 
 Back up this directory to retain preferences and history. The first six files contain shared preferences and data, including the custom-theme format. Qt-only preferences are kept separate. Run one application at a time against a shared data directory to avoid competing saves.
 
@@ -349,7 +357,7 @@ Use Rescan or F5. Automatic analysis processes discovered library files; it does
 Restart with `modjuke --theme dark` or `--theme light` (for that session), then edit the custom palette in Settings. Unsaved preview changes affect only the editor. A color in `config.json` that isn't a valid `#RRGGBB` value (or the short `#RGB`) falls back to the dark theme's color for that role; the rest of the theme is kept.
 
 **Settings cannot be saved**  
-Check permissions and free space in the configuration directory. An unreadable or malformed `qt-ui.json` is renamed to `qt-ui.json.bad` and a fresh one is written (it only holds the column, play-all-subsongs and ignore-confirmation choices). A damaged `config.json` is kept as `config.json.bad`, and the player starts with defaults and says so. A damaged `playlists.json` is never overwritten; playlist changes aren't saved until it is fixed or moved aside. The Settings dialog keeps its drafts open for retry after a failed save.
+Check permissions and free space in the configuration directory. An unreadable or malformed `qt-ui.json` is renamed to `qt-ui.json.bad` and a fresh one is written (it only holds the column, play-all-subsongs, ignore-confirmation and channel filter choices). A damaged `config.json` is kept as `config.json.bad`, and the player starts with defaults and says so. A damaged `playlists.json` is never overwritten; playlist changes aren't saved until it is fixed or moved aside. The Settings dialog keeps its drafts open for retry after a failed save.
 
 **A module is unreadable or behaves unexpectedly**  
 Check terminal diagnostics and try the file in another libopenmpt-based player. Format support and subsong detection depend on the installed library. Damaged files may not load, and the player cannot repair them.

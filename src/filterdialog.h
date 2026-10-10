@@ -8,6 +8,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSpinBox>
 
 class FilterDialog : public QDialog {
     Q_OBJECT
@@ -24,6 +25,8 @@ private:
     QList<QCheckBox *> formatChecks_;
     QLineEdit *minEdit_ = nullptr;
     QLineEdit *maxEdit_ = nullptr;
+    QSpinBox *minChannels_ = nullptr;
+    QSpinBox *maxChannels_ = nullptr;
     QCheckBox *hideBroken_ = nullptr;
     QLabel *countLabel_ = nullptr;
     QPushButton *applyBtn_ = nullptr;

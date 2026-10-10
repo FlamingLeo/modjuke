@@ -67,14 +67,20 @@ QVector<Track> applyPathOrder(const QVector<Track> &tracks, const QStringList &p
 // Search: all space-separated terms must occur in "reldir/name fmt title".
 QVector<Track> searchFilter(const QVector<Track> &tracks, const QString &needle);
 
-// Queue filter (filters.py): formats, duration bounds, hide broken.
+// Queue filter (filters.py): formats, duration and channel bounds, hide broken.
 struct QueueFilter {
     QStringList formats;         // lower case; empty = all
     double minSeconds = 0.0;     // 0 -> none
     double maxSeconds = 0.0;
+    int minChannels = 0;         // 0 -> none
+    int maxChannels = 0;
     bool hideBroken = false;
 
-    bool active() const { return !formats.isEmpty() || minSeconds > 0 || maxSeconds > 0 || hideBroken; }
+    bool active() const
+    {
+        return !formats.isEmpty() || minSeconds > 0 || maxSeconds > 0 || minChannels > 0 || maxChannels > 0
+               || hideBroken;
+    }
     bool matches(const Track &track) const;
     int count(const QVector<Track> &tracks) const;
     QVector<Track> select(const QVector<Track> &tracks) const;
