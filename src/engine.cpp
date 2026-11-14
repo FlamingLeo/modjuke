@@ -60,6 +60,18 @@ double clampSeekTarget(double seconds, bool bounded, double duration)
     return bounded && target >= duration ? std::max(0.0, duration - 0.05) : target;
 }
 
+// In subsongs after the first, a seek in seconds can make libopenmpt miss the
+// subsong's end and play on into later subsongs. Seeking again to the order
+// and row it landed on keeps the end. A row inside a pattern loop plays more
+// than once, so that second seek can land elsewhere; then the first one stays.
+void seekWithinSubsong(const OpenMPTModule &module, int subsong, double seconds)
+{
+    const double landed = module.seekSeconds(seconds);
+    if (subsong > 0
+        && std::abs(module.seekOrderRow(module.currentOrder(), module.currentRow()) - landed) > 0.01)
+        module.seekSeconds(seconds);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -293,6 +305,13 @@ private:
         }
     }
 
+    // libopenmpt's duration is at normal tempo; positions and seeks follow
+    // the tempo factor.
+    double playingDuration(double duration) const
+    {
+        return duration > 0.0 && duration < 1e18 ? duration / tempoFactor_ : duration;
+    }
+
     float currentGain() const
     {
         const int muted = engine_->muted_.loadRelaxed();
@@ -335,8 +354,9 @@ private:
                 // Read full metadata once, AFTER explicit subsong selection.
                 info = next.info(command.path);
                 const double initial = validSubsong ? command.position : 0.0;
-                if (initial > 0.0 || subsong > 0)
-                    next.seekSeconds(clampSeekTarget(initial, info.durationValid() && !info.endless(), info.duration));
+                if (initial > 0.0)
+                    seekWithinSubsong(next, subsong, clampSeekTarget(initial, info.durationValid() && !info.endless(),
+                                                                     playingDuration(info.duration)));
             }
         }
         if (command.loadEpoch != e->loadEpoch_.loadAcquire()) return false;
@@ -354,7 +374,7 @@ private:
         state.playing = state.loaded && !state.paused;
         state.info = std::move(info); state.channels = state.info.channels;
         state.numSubsongs = std::max(1, state.info.subsongs); state.subsong = subsong;
-        state.numOrders = state.info.orders; state.duration = state.info.duration;
+        state.numOrders = state.info.orders; state.duration = playingDuration(state.info.duration);
         state.durationValid = state.info.durationValid() || state.info.endless();
         state.interpolation = command.interpLen > 0 ? command.interpLen : 8;
         nativeRepeat_ = 2; syncRepeat(); endReported_ = false; resetSilence();
@@ -435,8 +455,10 @@ private:
             break;
         case Command::Tempo:
             tempoFactor_ = command.factor;   // also applied to later loads
-            if (module_.isOpen())
+            if (module_.isOpen()) {
                 module_.setTempoFactor(command.factor);
+                state.duration = playingDuration(state.info.duration);
+            }
             break;
         case Command::SkipSilence:
             skipSilence(command);
@@ -466,7 +488,8 @@ private:
         const EngineSnapshot &state = engine_->state_;
         if (!module_.isOpen())
             return;
-        module_.seekSeconds(clampSeekTarget(seconds, state.durationValid && !state.info.endless(), state.duration));
+        seekWithinSubsong(module_, state.subsong,
+                          clampSeekTarget(seconds, state.durationValid && !state.info.endless(), state.duration));
         playheadMoved(ramp);
     }
 
@@ -506,10 +529,11 @@ private:
         }
         state.subsong = index;
         state.numOrders = state.info.orders = module_.numOrders();
-        state.duration = state.info.duration = module_.durationSeconds();
+        state.info.duration = module_.durationSeconds();
+        state.duration = playingDuration(state.info.duration);
         state.durationValid = state.info.durationValid() || state.info.endless();
         state.songGeneration = generation;
-        seekTo(0.0, ramp);
+        playheadMoved(ramp);   // selecting starts the subsong at its beginning
         return true;
     }
 
