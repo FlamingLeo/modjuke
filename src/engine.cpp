@@ -18,7 +18,7 @@ namespace {
 
 struct Command {
     enum Kind { Load, Pause, Seek, SeekOrderRow, Subsong, AllSubsongs, Interpolation, Tempo,
-                Unload } kind = Unload;
+                SkipSilence, Unload } kind = Unload;
     quint64 transportSerial = 0;    // 0: not a transport request
     quint64 generation = 0;
     quint64 loadEpoch = 0;          // 0: the current epoch when posted
@@ -31,12 +31,27 @@ struct Command {
     bool paused = false;            // Load, Pause
     bool enabled = false;           // AllSubsongs
     bool preserveBufferedTail = false; // Load
+    quint64 silenceRun = 0;         // SkipSilence
+    double silence = 0.0;           // SkipSilence: seconds of silence left in the song
 };
 
 // Render at most this many frames per lock acquisition (~23 ms at 44.1 kHz)
 // so the GUI thread never waits long for the state lock.
 constexpr size_t kChunkFrames = 1024;
 constexpr int kSeekRampMs = 6;
+
+// Output below this peak (-60 dBFS, before volume) counts as silence.
+constexpr float kSilenceLevel = 0.001f;
+// After this much silence, check whether the rest of the song is silent.
+constexpr double kSilenceCheckSeconds = 2.0;
+
+float peakOf(const float *stereo, size_t frames)
+{
+    float peak = 0.f;
+    for (size_t i = 0; i < frames * 2; ++i)
+        peak = std::max(peak, std::abs(stereo[i]));
+    return peak;
+}
 
 // Seeking to or past the end would end the song at once; land just before it.
 double clampSeekTarget(double seconds, bool bounded, double duration)
@@ -184,6 +199,7 @@ private:
             // Bound work for pathological/empty subsongs; continue next pull.
             if (++transitions >= 8) break;
         }
+        const float sourcePeak = peakOf(out, got);
         float peakL = 0.f, peakR = 0.f;
         const float gain = currentGain();
         for (size_t i = 0; i < got * 2; i += 2) {
@@ -214,6 +230,66 @@ private:
         } else {
             state.vu.fill(0.f, state.channels);
             state.levelL = state.levelR = 0.f;
+        }
+        trackSilence(sourcePeak, got);
+    }
+
+    // Counts silent frames; after kSilenceCheckSeconds of them, asks the
+    // engine once per silent stretch to check the rest of the song.
+    void trackSilence(float peak, size_t frames)
+    {
+        const EngineSnapshot &state = engine_->state_;
+        if (peak >= kSilenceLevel) {
+            if (silentFrames_ > 0)
+                resetSilence();
+            return;
+        }
+        silentFrames_ += frames;
+        if (silenceChecked_ || state.ended
+            || double(silentFrames_) < kSilenceCheckSeconds * sampleRate_)
+            return;
+        silenceChecked_ = true;
+        Engine::SilenceCheck check;
+        check.path = state.path;
+        check.subsong = state.subsong;
+        check.position = state.position;
+        check.sampleRate = sampleRate_;
+        check.interpLen = state.interpolation;
+        check.tempoFactor = tempoFactor_;
+        check.loadEpoch = engine_->loadEpoch_.loadAcquire();
+        check.silenceRun = silenceRun_;
+        Engine *e = engine_;
+        QMetaObject::invokeMethod(e, [e, check] { e->checkSilence(check); }, Qt::QueuedConnection);
+    }
+
+    // A new silent stretch starts: after sound, a jump or another file.
+    void resetSilence()
+    {
+        silentFrames_ = 0;
+        ++silenceRun_;
+        silenceChecked_ = false;
+    }
+
+    // The rest of the song is silent: go on as at its end.
+    void skipSilence(const Command &command)
+    {
+        auto &state = engine_->state_;
+        if (!module_.isOpen() || state.ended || command.silenceRun != silenceRun_)
+            return;
+        // let a pause or a pending transport command settle; check again later
+        if (state.paused || renderSerial_ != engine_->transportSerial_) {
+            silenceChecked_ = false;
+            return;
+        }
+        engine_->postLog(QStringLiteral("info"), QStringLiteral("%1: skipped %2 of silence at the end")
+            .arg(QFileInfo(state.path).fileName(), formatTime(command.silence)));
+        if (state.playAllSubsongs && state.numSubsongs > 1) {
+            if (!advanceSubsong())
+                handleEnd();
+        } else if (state.loop) {
+            seekTo(0.0, true);
+        } else {
+            handleEnd();
         }
     }
 
@@ -281,7 +357,7 @@ private:
         state.numOrders = state.info.orders; state.duration = state.info.duration;
         state.durationValid = state.info.durationValid() || state.info.endless();
         state.interpolation = command.interpLen > 0 ? command.interpLen : 8;
-        nativeRepeat_ = 2; syncRepeat(); endReported_ = false;
+        nativeRepeat_ = 2; syncRepeat(); endReported_ = false; resetSilence();
         if (!state.loaded) {
             state.loadError = error.isEmpty() ? QStringLiteral("Cannot open module") : error;
             e->postLog(QStringLiteral("error"), QStringLiteral("%1: %2").arg(QFileInfo(command.path).fileName(), state.loadError));
@@ -362,10 +438,14 @@ private:
             if (module_.isOpen())
                 module_.setTempoFactor(command.factor);
             break;
+        case Command::SkipSilence:
+            skipSilence(command);
+            break;
         case Command::Unload:
             module_.close();
             state = EngineSnapshot{};
             syncRepeat();
+            resetSilence();
             break;
         }
     }
@@ -397,6 +477,7 @@ private:
         publishPosition();
         state.ended = false;
         endReported_ = false;
+        resetSilence();
         if (!state.paused)
             state.playing = true;
         if (ramp)
@@ -476,6 +557,9 @@ private:
     double tempoFactor_ = 1.0;
     bool endReported_ = false;
     quint64 renderSerial_ = 0;
+    size_t silentFrames_ = 0;            // of the current silent stretch
+    quint64 silenceRun_ = 0;             // id of the current silent stretch
+    bool silenceChecked_ = false;        // its check was requested
 };
 
 // ---------------------------------------------------------------------------
@@ -515,10 +599,16 @@ Engine::Engine(QObject *parent) : QObject(parent)
     metadata_->moveToThread(metadataThread_);
     connect(metadataThread_, &QThread::finished, metadata_, &QObject::deleteLater);
     metadataThread_->start();
+
+    silencePool_.setMaxThreadCount(1);
 }
 
 Engine::~Engine()
 {
+    // stop a running silence check before the renderer goes away
+    loadEpoch_.fetchAndAddOrdered(1);
+    silencePool_.clear();
+    silencePool_.waitForDone();
     QMetaObject::invokeMethod(output_, [this] { output_->stop(); }, Qt::BlockingQueuedConnection);
     metadataToken_.fetchAndAddRelaxed(1);
     metadataThread_->quit();
@@ -828,6 +918,53 @@ QString Engine::outputDescription() const
 void Engine::postLog(const QString &level, const QString &text)
 {
     emit logMessage(level, text);
+}
+
+void Engine::checkSilence(const SilenceCheck &check)
+{
+    silencePool_.start([this, check] {
+        // another file, or the engine is shutting down
+        const auto stale = [this, &check] { return check.loadEpoch != loadEpoch_.loadAcquire(); };
+        const OpenMPTLib *lib = OpenMPTLib::instance();
+        if (!lib || stale())
+            return;
+        // a second decoder, set up like the playing one
+        OpenMPTModule module = lib->openFile(check.path);
+        if (!module.isOpen())
+            return;
+        module.setCtlText("play.at_end", QStringLiteral("stop"));
+        module.setInterpolationLength(check.interpLen);
+        if (check.tempoFactor != 1.0)
+            module.setTempoFactor(check.tempoFactor);
+        if (!module.selectSubsong(check.subsong))
+            return;
+        // play from the start; sound from the silent stretch on keeps the song going
+        const double from = check.position - kSilenceCheckSeconds;
+        QVector<float> pcm(int(kChunkFrames * 2));
+        size_t after = 0;
+        for (;;) {
+            const double start = module.positionSeconds();
+            const size_t got = module.readFloatStereo(check.sampleRate, kChunkFrames, pcm.data());
+            if (got == 0)
+                break;
+            if (stale() || (start >= from && peakOf(pcm.constData(), got) >= kSilenceLevel))
+                return;
+            if (start >= check.position)
+                after += got;
+        }
+        // ended before reaching the playback position: it played differently
+        if (after == 0)
+            return;
+        const double silence = double(after) / check.sampleRate;
+        QMetaObject::invokeMethod(this, [this, check, silence] {
+            Command command;
+            command.kind = Command::SkipSilence;
+            command.loadEpoch = check.loadEpoch;
+            command.silenceRun = check.silenceRun;
+            command.silence = silence;
+            device_->post(command);
+        }, Qt::QueuedConnection);
+    });
 }
 
 void Engine::handleFinished(quint64 transportSerial)

@@ -12,6 +12,7 @@
 #include <QAtomicInt>
 #include <QHash>
 #include <QMutex>
+#include <QThreadPool>
 #include <QVector>
 #include <memory>
 
@@ -103,11 +104,30 @@ private:
     friend class RenderDevice;
     void handleFinished(quint64 transportSerial);
 
+    // A silent stretch of the playing song, to check whether the rest of it
+    // is silent too.
+    struct SilenceCheck {
+        QString path;
+        int subsong = 0;
+        double position = 0.0;       // where playback has rendered to
+        int sampleRate = 44100;
+        int interpLen = 8;
+        double tempoFactor = 1.0;
+        quint64 loadEpoch = 0;
+        quint64 silenceRun = 0;      // the renderer's id of the silent stretch
+    };
+    // Plays the song again on silencePool_, from its start (a seek does not
+    // restore every sample that a later note or volume change can make
+    // audible), and if nothing from the silent stretch on is audible, asks
+    // the renderer to end the song now.
+    void checkSilence(const SilenceCheck &check);
+
     QThread *audioThread_ = nullptr;
     AudioOutput *output_ = nullptr;          // lives on audioThread_, also its invokeMethod context
     RenderDevice *device_ = nullptr;         // child of output_
     QThread *metadataThread_ = nullptr;
     MetadataWorker *metadata_ = nullptr;
+    QThreadPool silencePool_;
     QAtomicInt metadataToken_{0};
     QAtomicInteger<quint64> loadEpoch_{0}; // invalidate superseded native opens without taking the snapshot lock
 
