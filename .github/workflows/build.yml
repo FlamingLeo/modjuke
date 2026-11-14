@@ -81,7 +81,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       MACOSX_DEPLOYMENT_TARGET: '12.0'   # Qt 6.8's minimum
     steps:
