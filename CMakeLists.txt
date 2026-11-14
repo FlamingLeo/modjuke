@@ -22,6 +22,7 @@ add_library(modjuke_core STATIC
     src/config.cpp
     src/jsonfile.cpp
     src/analysiscache.cpp
+    src/songkeys.cpp
     src/playliststore.cpp
     src/statsstore.cpp
     src/ignorestore.cpp

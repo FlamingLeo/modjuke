@@ -11,6 +11,7 @@
 #include "library.h"
 #include "theme.h"
 
+#include <QHash>
 #include <QStringList>
 #include <QVector>
 #include <QWidget>
@@ -55,6 +56,7 @@ public:
                    bool reorderable);
     void setFilterText(const QString &text);
     void setPlayingPath(const QString &path);
+    void setCopies(const QHash<QString, QStringList> &copies);   // marked in the table
     // Scrolls to the playing row; it becomes the current row only when
     // nothing is selected (actions like Remove from playlist use the selection).
     void showPlaying(const QString &path);

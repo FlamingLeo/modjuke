@@ -87,6 +87,7 @@ public:
 
     enum CommandType { Note = 0, Instrument = 1, VolColEffect = 2, Effect = 3, Volume = 4, Parameter = 5 };
     QString formatCommand(int pattern, int row, int channel, CommandType type) const;
+    int patternCommand(int pattern, int row, int channel, CommandType type) const;   // the raw value
 
     ModuleInfo info(const QString &path = QString()) const;
     // info() without the name lists and the message (the library analyzer's needs)

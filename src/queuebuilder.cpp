@@ -5,7 +5,6 @@
 #include "shuffles.h"
 #include "stores.h"
 
-#include <QFileInfo>
 #include <QRandomGenerator>
 
 namespace {
@@ -43,18 +42,7 @@ QVector<Track> QueueBuilder::sourceTracks() const
                 base.append(*known);
                 continue;
             }
-            Track track;                                // external playlist entry
-            track.path = path;
-            const QFileInfo info(path);
-            track.name = info.fileName();
-            track.relDir =
-                info.absolutePath() == library_.root() ? QString() : info.absolutePath();
-            track.ext = info.suffix().toLower();
-            track.fmt = track.ext;
-            track.size = info.size();
-            if (!info.exists())
-                track.broken = QStringLiteral("missing");
-            base.append(track);
+            base.append(outsideTrack(path, library_.root()));
         }
         return base;
     }

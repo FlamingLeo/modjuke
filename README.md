@@ -169,7 +169,7 @@ Use **Columns** to show or hide Folder, Length, Format, Channels, and Subsongs. 
 
 Turn the setting off and save to prevent future automatic batches. An existing batch can be canceled using the analysis button. **Analyze** remains available for manual library analysis. After re-enabling automatic analysis, rescan to pick up missing details. **Keep duration/title details (analysis cache)** controls whether newly analyzed metadata is saved for later runs.
 
-Automatic analysis covers the open library; songs that are only in playlists are not analyzed automatically. Analysis does not watch the filesystem either, so use Rescan to discover external changes. The headless `--scan` command has a separate explicit `--analyze` option.
+Analysis, automatic or with **Analyze**, covers the open library and the songs in your playlists, including those outside the library folder. Adding a song to a playlist starts automatic analysis when it isn't analyzed yet. Analysis does not watch the filesystem either, so use Rescan to discover external changes. The headless `--scan` command has a separate explicit `--analyze` option.
 
 ### Playlists
 
@@ -183,11 +183,21 @@ While a playlist is loaded:
 ### Favorites
 
 - Click **☆** in the Player's song-info panel to add the loaded song to Favorites. **★** means it is saved; click again to remove it.
-- Select queue songs, then **right-click → Add to Favorites**. Duplicate entries are skipped. Favorites is also available under **Add to playlist**.
-- Choose **Source → Playlist: Favorites** to browse it. Use **Shuffle** to shuffle Favorites or **Saved order** to edit its sequence.
+- Right-click a queue song and choose **Toggle favorite** to add it to Favorites, or to remove it if it is already there. To add several songs at once, select them and choose **Favorites** from the queue's **Add to playlist…** button. A file already in Favorites is not added again.
+- Choose **Favorites** under **Source** to browse it. Use **Shuffle** to shuffle Favorites or **Saved order** to edit its sequence.
 - Favorites cannot be renamed or deleted. **Clear Favorites** removes its entries after confirmation, but keeps the playlist and your music files.
 
 Favorites is stored in `playlists.json`. An existing playlist named Favorites, case-insensitively, is reused with its contents and spelling preserved. Importing `Favorites.m3u` creates a separately named playlist instead of overwriting Favorites.
+
+### Duplicate songs
+
+The same song can exist as several files, for example renamed, in another folder, or converted from MOD to XM. modjuke treats two files as the same song when their patterns hold the same notes and effects in the same places; titles, sample names and comments don't count. Modules with almost no notes, and files libopenmpt can't open, only match an identical file.
+
+- Adding a song that a playlist already has as another file asks first. **Skip copies** (the default) leaves those songs out; **Add anyway** adds them.
+- When the queue shows a playlist, songs that are in it more than once have a warning icon. Hover over the row to see the other files.
+- **Playlists → Remove duplicates** removes the later copies from the selected playlist and keeps the first entry of each song.
+
+Songs are checked in the background when the app starts, after a scan and when playlists change; the whole library is included only with automatic analysis on. The results are kept in `song-keys.json`. Copies that differ in a few notes are not detected.
 
 ### Tracker and song information
 
@@ -332,6 +342,7 @@ The data directory is `$XDG_CONFIG_HOME/modjuke`, or `~/.config/modjuke` when th
 | `ignored.json` | Exact file paths hidden everywhere. Playlist membership is kept, so they can be restored |
 | `shuffles.json` | Saved shuffle order for each library folder and playlist |
 | `qt-ui.json` | Qt-only ignore confirmation, Play all subsongs, hidden queue columns, and the channel filter |
+| `song-keys.json` | Qt-only cache for finding duplicate songs; safe to delete |
 
 Back up this directory to retain preferences and history. The first six files contain shared preferences and data, including the custom-theme format. Qt-only preferences are kept separate. Run one application at a time against a shared data directory to avoid competing saves.
 

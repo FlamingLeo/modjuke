@@ -21,6 +21,7 @@
 #include "settingskeeper.h"
 #include "shuffles.h"
 #include "songactions.h"
+#include "songkeys.h"
 #include "theme.h"
 
 #include <QElapsedTimer>
@@ -112,6 +113,13 @@ private:
 #endif
     void moveSelectedRow(int delta);
     void applyQueueFilters();
+    void refreshCopies();       // marks songs with a copy in the playlist the queue shows
+    void prepareSongKeys();     // playlists, and the library with automatic analysis
+    QStringList playlistPaths() const;   // of all playlists
+    // after playlists changed: their songs outside the library get analyzed,
+    // and keys for the duplicate check
+    void updatePlaylistSongs();
+    void autoAnalyze();         // starts analysis when on and something is pending
 
     Settings settings_;
     SettingsKeeper keeper_{settings_};  // saves settings_ (command-line values stay session-only)
@@ -121,12 +129,13 @@ private:
     PlaylistStore playlists_;
     IgnoreStore ignored_;
     ListeningStats stats_;
+    SongKeys songKeys_;                 // duplicate songs in playlists
     Palette palette_;
 
     PlaybackQueue queue_;               // the visible queue and its unfiltered order
     QueueBuilder builder_{settings_, library_, playlists_, ignored_, shuffles_};   // its source in play order
     QueuePlayer player_{engine_, queue_, stats_, ignored_, settings_};   // what plays next
-    SongActions songActions_{this, settings_, playlists_, ignored_, library_, builder_};
+    SongActions songActions_{this, settings_, playlists_, ignored_, library_, builder_, songKeys_};
     bool statusShowsLoading_ = false;   // the status bar shows "Loading ..."
 
     QueuePanel *queuePanel_ = nullptr;  // folder row, queue controls, queue table

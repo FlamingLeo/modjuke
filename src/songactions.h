@@ -14,15 +14,23 @@ class PlaylistStore;
 class QPoint;
 class QueueBuilder;
 class QWidget;
+class SongKeys;
 struct Settings;
+
+// Before adding `adding` to the playlist `listName` (which holds `existing`):
+// songs that would be in it twice, as different files, are left out of
+// `adding` unless the user adds them anyway. Returns how many were left out.
+int askAboutCopies(QWidget *parent, SongKeys &keys, const QString &listName,
+                   const QStringList &existing, QStringList *adding);
 
 class SongActions : public QObject {
     Q_OBJECT
 public:
     SongActions(QWidget *window, const Settings &settings, PlaylistStore &playlists,
-                const IgnoreStore &ignored, const MusicLibrary &library, QueueBuilder &builder);
+                const IgnoreStore &ignored, const MusicLibrary &library, QueueBuilder &builder,
+                SongKeys &keys);
 
-    bool toggleFavorite(const QString &path);           // true: now a favorite
+    bool toggleFavorite(const QString &path);           // true: a favorite afterwards
     void showAddMenu(const QStringList &paths);         // the "Add to playlist..." button
     void createPlaylist(const QStringList &paths);      // asks for the name
     void removeFromSource(const QStringList &paths);    // from the playlist the queue shows
@@ -39,10 +47,12 @@ signals:
     void ignoreToggled(const QString &path);            // context menu: (un-)ignore
 
 private:
+    QStringList pathsOf(const QString &playlist) const;
     QWidget *window_;
     const Settings &settings_;
     PlaylistStore &playlists_;
     const IgnoreStore &ignored_;
     const MusicLibrary &library_;
     QueueBuilder &builder_;
+    SongKeys &keys_;
 };

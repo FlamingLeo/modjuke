@@ -6,25 +6,87 @@
 #include "playliststore.h"
 #include "queuebuilder.h"
 #include "reveal.h"
+#include "songkeys.h"
 
 #include <QApplication>
 #include <QClipboard>
 #include <QCursor>
+#include <QFileInfo>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPushButton>
 #include <QSet>
 
-SongActions::SongActions(QWidget *window, const Settings &settings, PlaylistStore &playlists,
-                         const IgnoreStore &ignored, const MusicLibrary &library, QueueBuilder &builder)
-    : window_(window), settings_(settings), playlists_(playlists), ignored_(ignored),
-      library_(library), builder_(builder)
+int askAboutCopies(QWidget *parent, SongKeys &keys, const QString &listName,
+                   const QStringList &existing, QStringList *adding)
 {
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    keys.prepareNow(existing + *adding);
+    QApplication::restoreOverrideCursor();
+    const QVector<QPair<QString, QString>> copies = copiesOf(existing, *adding, keys.keyOf());
+    if (copies.isEmpty())
+        return 0;
+    const auto name = [](const QString &path) { return QFileInfo(path).fileName(); };
+    QMessageBox box(QMessageBox::Question, QObject::tr("Duplicate songs"), QString(),
+                    QMessageBox::NoButton, parent);
+    if (adding->size() == 1) {
+        box.setText(QObject::tr("\"%1\" is already in \"%2\" as \"%3\".")
+                        .arg(name(copies[0].first), listName, name(copies[0].second)));
+    } else {
+        box.setText(QObject::tr("%n of these songs would be in \"%1\" twice, as different files.",
+                                nullptr, int(copies.size()))
+                        .arg(listName));
+        QStringList lines, details;
+        for (const auto &[path, copy] : copies) {
+            if (lines.size() < 10)
+                lines << QObject::tr("%1 (copy of %2)").arg(name(path), name(copy));
+            details << QObject::tr("%1\n    copy of %2").arg(path, copy);
+        }
+        if (copies.size() > lines.size())
+            lines << QObject::tr("and %n more", nullptr, int(copies.size() - lines.size()));
+        box.setInformativeText(lines.join('\n'));
+        box.setDetailedText(details.join('\n'));
+    }
+    QPushButton *add = box.addButton(QObject::tr("Add anyway"), QMessageBox::AcceptRole);
+    QPushButton *skip = box.addButton(adding->size() == 1 ? QObject::tr("Don't add")
+                                                          : QObject::tr("Skip copies"),
+                                      QMessageBox::RejectRole);
+    box.setDefaultButton(skip);
+    box.setEscapeButton(skip);
+    box.exec();
+    if (box.clickedButton() == add)
+        return 0;
+    QSet<QString> left;
+    for (const auto &pair : copies)
+        left.insert(pair.first);
+    adding->removeIf([&left](const QString &path) { return left.contains(path); });
+    return int(left.size());
+}
+
+SongActions::SongActions(QWidget *window, const Settings &settings, PlaylistStore &playlists,
+                         const IgnoreStore &ignored, const MusicLibrary &library, QueueBuilder &builder,
+                         SongKeys &keys)
+    : window_(window), settings_(settings), playlists_(playlists), ignored_(ignored),
+      library_(library), builder_(builder), keys_(keys)
+{
+}
+
+QStringList SongActions::pathsOf(const QString &playlist) const
+{
+    const Playlist *found = playlists_.get(playlist);
+    return found ? found->paths : QStringList();
 }
 
 bool SongActions::toggleFavorite(const QString &path)
 {
+    if (!playlists_.isFavorite(path)) {
+        const QString favorites = QString::fromLatin1(PlaylistStore::kFavoritesName);
+        QStringList adding{path};
+        if (askAboutCopies(window_, keys_, favorites, pathsOf(favorites), &adding) > 0)
+            return false;
+    }
     const bool on = playlists_.toggleFavorite(path);
     emit playlistsChanged();
     if (PlaylistStore::isFavorites(settings_.queueSource))
@@ -41,9 +103,13 @@ void SongActions::showAddMenu(const QStringList &paths)
     QMenu menu(window_);
     for (const QString &name : playlists_.names()) {
         menu.addAction(name, [this, name, paths] {
-            playlists_.addPaths(name, paths);
+            QStringList adding = paths;
+            const int left = askAboutCopies(window_, keys_, name, pathsOf(name), &adding);
+            playlists_.addPaths(name, adding);
             emit playlistsChanged();
-            emit status(tr("Added %1 songs to \"%2\"").arg(paths.size()).arg(name));
+            emit status(left > 0 ? tr("Added %1 songs to \"%2\", left out %3 copies")
+                                       .arg(adding.size()).arg(name).arg(left)
+                                 : tr("Added %1 songs to \"%2\"").arg(adding.size()).arg(name));
         });
     }
     menu.addSeparator();
@@ -64,12 +130,14 @@ void SongActions::createPlaylist(const QStringList &paths)
         emit status(err.isEmpty() ? tr("Invalid playlist name") : err);
         return;
     }
-    if (!playlists_.create(name, paths, library_.root())) {
+    QStringList adding = paths;
+    askAboutCopies(window_, keys_, name, {}, &adding);
+    if (!playlists_.create(name, adding, library_.root())) {
         emit status(playlists_.error);
         return;
     }
     emit playlistsChanged();
-    emit status(tr("Created \"%1\" with %2 songs").arg(name).arg(paths.size()));
+    emit status(tr("Created \"%1\" with %2 songs").arg(name).arg(adding.size()));
 }
 
 void SongActions::removeFromSource(const QStringList &paths)
@@ -126,7 +194,9 @@ void SongActions::showContextMenu(const QPoint &globalPos, const QString &path,
         if (PlaylistStore::isFavorites(name))
             continue;
         addTo->addAction(name, [this, name, paths] {
-            playlists_.addPaths(name, paths);
+            QStringList adding = paths;
+            askAboutCopies(window_, keys_, name, pathsOf(name), &adding);
+            playlists_.addPaths(name, adding);
             emit playlistsChanged();
         });
     }

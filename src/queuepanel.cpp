@@ -290,6 +290,11 @@ void QueuePanel::setPlayingPath(const QString &path)
     model_->setPlayingPath(path);
 }
 
+void QueuePanel::setCopies(const QHash<QString, QStringList> &copies)
+{
+    model_->setCopies(copies);
+}
+
 void QueuePanel::showPlaying(const QString &path)
 {
     model_->setPlayingPath(path);

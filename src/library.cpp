@@ -172,6 +172,21 @@ QString Track::durationText() const
 }
 
 // ---------------------------------------------------------------------------
+Track outsideTrack(const QString &path, const QString &root)
+{
+    Track track;
+    track.path = path;
+    const QFileInfo info(path);
+    track.name = info.fileName();
+    track.relDir = info.absolutePath() == root ? QString() : info.absolutePath();
+    track.ext = info.suffix().toLower();
+    track.fmt = track.ext;
+    track.size = info.size();
+    if (!info.exists())
+        track.broken = QStringLiteral("missing");
+    return track;
+}
+
 ScanResult scanLibrary(const QString &root, const QStringList &extensionsIn,
                        const std::function<bool()> &cancel)
 {

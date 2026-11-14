@@ -54,6 +54,7 @@ struct OpenMPTLib::Api {
 
     int32_t (*get_order_pattern)(void *, int32_t) = nullptr;
     int32_t (*get_pattern_num_rows)(void *, int32_t) = nullptr;
+    uint8_t (*get_pattern_row_channel_command)(void *, int32_t, int32_t, int32_t, int) = nullptr;
     char *(*format_pattern_row_channel_command)(void *, int32_t, int32_t, int32_t, int) = nullptr;
 
     int (*set_repeat_count)(void *, int32_t) = nullptr;
@@ -168,6 +169,7 @@ OpenMPTLib::OpenMPTLib()
     bind(api->get_subsong_name, "openmpt_module_get_subsong_name");
     bind(api->get_order_pattern, "openmpt_module_get_order_pattern");
     bind(api->get_pattern_num_rows, "openmpt_module_get_pattern_num_rows");
+    bind(api->get_pattern_row_channel_command, "openmpt_module_get_pattern_row_channel_command");
     bind(api->format_pattern_row_channel_command, "openmpt_module_format_pattern_row_channel_command");
     bind(api->set_repeat_count, "openmpt_module_set_repeat_count");
     bind(api->ctl_set_text, "openmpt_module_ctl_set_text");
@@ -491,6 +493,12 @@ QStringList OpenMPTModule::subsongNameList() const
     for (int i = 0; i < numSubsongs(); ++i)
         names << text<&Api::get_subsong_name>(int32_t(i));
     return names; // preserve empty slots: names must retain native indices
+}
+
+int OpenMPTModule::patternCommand(int pattern, int row, int channel, CommandType type) const
+{
+    return call<&Api::get_pattern_row_channel_command>(uint8_t(0), int32_t(pattern), int32_t(row),
+                                                       int32_t(channel), int(type));
 }
 
 QString OpenMPTModule::formatCommand(int pattern, int row, int channel, CommandType type) const

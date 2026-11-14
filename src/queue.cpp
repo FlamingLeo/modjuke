@@ -175,10 +175,15 @@ QVariant QueueModel::data(const QModelIndex &index, int role) const
             return int(Qt::AlignRight | Qt::AlignVCenter);
         return int(Qt::AlignLeft | Qt::AlignVCenter);
     }
-    if (role == Qt::ToolTipRole)
-        return track.path;
+    if (role == Qt::ToolTipRole) {
+        const QStringList copies = copies_.value(track.path);
+        return copies.isEmpty() ? track.path
+                                : tr("%1\n\nAlso in this playlist as:\n%2").arg(track.path, copies.join('\n'));
+    }
     if (role == PathRole)
         return track.path;
+    if (role == Qt::DecorationRole && index.column() == Module && copies_.contains(track.path))
+        return QApplication::style()->standardIcon(QStyle::SP_MessageBoxWarning);
     const bool playing = !playingPath_.isEmpty() && track.path == playingPath_;
     if (playing) {
         if (role == Qt::BackgroundRole)
@@ -293,6 +298,15 @@ void QueueModel::setMissingPaths(const QSet<QString> &missing)
     if (missing_ == missing)
         return;
     missing_ = missing;
+    if (!rows_.isEmpty())
+        emit dataChanged(index(0, 0), index(rows_.size() - 1, COLUMN_COUNT - 1));
+}
+
+void QueueModel::setCopies(const QHash<QString, QStringList> &copies)
+{
+    if (copies_ == copies)
+        return;
+    copies_ = copies;
     if (!rows_.isEmpty())
         emit dataChanged(index(0, 0), index(rows_.size() - 1, COLUMN_COUNT - 1));
 }

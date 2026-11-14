@@ -50,6 +50,8 @@ public:
 
     void setPlayingPath(const QString &path);
     void setMissingPaths(const QSet<QString> &missing);
+    // songs with a copy in the same playlist: path -> the other copies
+    void setCopies(const QHash<QString, QStringList> &copies);
     // the playing row: its own colors, so it stays distinct from the selection
     void setPlayingColors(const QColor &background, const QColor &foreground);
     void setColors(const QColor &dim, const QColor &red);
@@ -72,6 +74,7 @@ private:
     QSet<QString> collapsedDirs_;   // relative directory paths, only used in directory order
     QVector<Track> queue_;
     QSet<QString> missing_;
+    QHash<QString, QStringList> copies_;
     QString playingPath_;
     QColor playingBg_, playingFg_, dim_, red_, directoryColor_;
     bool reorderFlags_ = false;   // drops accepted (saved playlist order)

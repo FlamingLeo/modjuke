@@ -1,16 +1,21 @@
 #include "playlistsdialog.h"
 
+#include "songactions.h"
+#include "songkeys.h"
+
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QApplication>
 #include <QInputDialog>
 #include <QMessageBox>
+#include <QSet>
 #include <QVBoxLayout>
 
-PlaylistsDialog::PlaylistsDialog(QWidget *parent, PlaylistStore *store,
+PlaylistsDialog::PlaylistsDialog(QWidget *parent, PlaylistStore *store, SongKeys *keys,
                                  std::function<QStringList()> queuePaths)
-    : QDialog(parent), store_(store), queuePaths_(std::move(queuePaths))
+    : QDialog(parent), store_(store), keys_(keys), queuePaths_(std::move(queuePaths))
 {
     setWindowTitle(tr("Playlists"));
     auto *root = new QVBoxLayout(this);
@@ -51,7 +56,9 @@ PlaylistsDialog::PlaylistsDialog(QWidget *parent, PlaylistStore *store,
     connect(deleteBtn_, &QPushButton::clicked, this, &PlaylistsDialog::deleteSelected);
     exportBtn_ = new QPushButton(tr("Export M3U\u2026"), this);
     connect(exportBtn_, &QPushButton::clicked, this, &PlaylistsDialog::exportSelected);
-    for (QPushButton *b : {loadBtn_, renameBtn_, deleteBtn_, exportBtn_})
+    dupBtn_ = new QPushButton(tr("Remove duplicates"), this);
+    connect(dupBtn_, &QPushButton::clicked, this, &PlaylistsDialog::removeDuplicates);
+    for (QPushButton *b : {loadBtn_, renameBtn_, deleteBtn_, exportBtn_, dupBtn_})
         row1->addWidget(b);
     row1->addStretch();
     root->addLayout(row1);
@@ -98,12 +105,18 @@ QString PlaylistsDialog::selectedName() const
     return items.isEmpty() ? QString() : items.first()->data(0, Qt::UserRole).toString();
 }
 
+QStringList PlaylistsDialog::existingPaths(const QString &name) const
+{
+    const Playlist *playlist = store_->get(name);
+    return playlist ? playlist->paths : QStringList();
+}
+
 void PlaylistsDialog::updateButtons()
 {
     const QString name = selectedName();
     const bool has = !name.isEmpty();
     const bool fav = PlaylistStore::isFavorites(name);
-    for (QPushButton *b : {loadBtn_, renameBtn_, deleteBtn_, exportBtn_, addSelBtn_})
+    for (QPushButton *b : {loadBtn_, renameBtn_, deleteBtn_, exportBtn_, dupBtn_, addSelBtn_})
         b->setEnabled(has);
     renameBtn_->setEnabled(has && !fav);
     deleteBtn_->setText(fav ? tr("Clear Favorites") : tr("Delete"));
@@ -149,14 +162,17 @@ void PlaylistsDialog::addSelectedSongs()
     const QString name = selectedName();
     if (name.isEmpty())
         return;
-    const QStringList paths = queuePaths_();
+    QStringList paths = queuePaths_();
     if (paths.isEmpty()) {
         noteLabel_->setText(tr("The queue is empty."));
         return;
     }
-    const QString message = store_->addPaths(name, paths)
-                                ? tr("Added %1 songs to \"%2\".").arg(paths.size()).arg(name)
-                                : store_->error;
+    const int left = askAboutCopies(this, *keys_, name, existingPaths(name), &paths);
+    QString message = store_->addPaths(name, paths)
+                          ? tr("Added %1 songs to \"%2\".").arg(paths.size()).arg(name)
+                          : store_->error;
+    if (left > 0)
+        message += tr(" Left out %1 copies.").arg(left);
     refresh(name);
     noteLabel_->setText(message);
 }
@@ -166,14 +182,53 @@ void PlaylistsDialog::addFiles()
     const QString name = selectedName();
     if (name.isEmpty())
         return;
-    const QStringList paths = QFileDialog::getOpenFileNames(
+    QStringList paths = QFileDialog::getOpenFileNames(
         this, tr("Add files to %1").arg(name), QString(),
         tr("Module files (*.mod *.xm *.it *.s3m *.mtm *.669 *.ult *.stm *.far *.gdm *.med);;"
            "All files (*)"));
     if (paths.isEmpty())
         return;
-    const QString message = store_->addPaths(name, paths)
-                                ? tr("Added %1 files to \"%2\".").arg(paths.size()).arg(name)
+    const int left = askAboutCopies(this, *keys_, name, existingPaths(name), &paths);
+    QString message = store_->addPaths(name, paths)
+                          ? tr("Added %1 files to \"%2\".").arg(paths.size()).arg(name)
+                          : store_->error;
+    if (left > 0)
+        message += tr(" Left out %1 copies.").arg(left);
+    refresh(name);
+    noteLabel_->setText(message);
+}
+
+void PlaylistsDialog::removeDuplicates()
+{
+    const QString name = selectedName();
+    const Playlist *playlist = store_->get(name);
+    if (!playlist)
+        return;
+    const QStringList paths = playlist->paths;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    keys_->prepareNow(paths);
+    QApplication::restoreOverrideCursor();
+    const QVector<QPair<QString, QString>> copies = copiesOf({}, paths, keys_->keyOf());
+    if (copies.isEmpty()) {
+        noteLabel_->setText(tr("\"%1\" has no duplicates.").arg(name));
+        return;
+    }
+    QStringList details;
+    QSet<QString> later;
+    for (const auto &[path, first] : copies) {
+        details << tr("%1\n    copy of %2").arg(path, first);
+        later.insert(path);
+    }
+    QMessageBox box(QMessageBox::Question, tr("Remove duplicates"),
+                    tr("Remove %n later copies from \"%1\"? The first entry of each song stays.",
+                       nullptr, int(copies.size()))
+                        .arg(name),
+                    QMessageBox::Yes | QMessageBox::No, this);
+    box.setDetailedText(details.join('\n'));
+    if (box.exec() != QMessageBox::Yes)
+        return;
+    const QString message = store_->removePaths(name, later)
+                                ? tr("Removed %1 copies from \"%2\".").arg(later.size()).arg(name)
                                 : store_->error;
     refresh(name);
     noteLabel_->setText(message);

@@ -43,6 +43,10 @@ struct ScanResult {
     bool canceled = false;
 };
 
+// A file outside the library folder `root` (a playlist entry), not analyzed;
+// broken is "missing" when the file doesn't exist.
+Track outsideTrack(const QString &path, const QString &root);
+
 // Recursive scan for module files (skip hidden dirs, symlink-loop guard,
 // SKIP_DIRS); progress callback receives (files so far, dir).
 ScanResult scanLibrary(const QString &root, const QStringList &extensions,

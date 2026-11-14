@@ -65,7 +65,12 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
     });
     connect(&player_, &QueuePlayer::status, this, &MainWindow::status);
     connect(&player_, &QueuePlayer::logMessage, this, &MainWindow::appendLog);
-    connect(&songActions_, &SongActions::playlistsChanged, this, &MainWindow::refreshSourceCombo);
+    connect(&songActions_, &SongActions::playlistsChanged, this, [this] {
+        refreshSourceCombo();
+        updatePlaylistSongs();
+        refreshCopies();
+    });
+    connect(&songKeys_, &SongKeys::keysChanged, this, &MainWindow::refreshCopies);
     connect(&songActions_, &SongActions::queueChanged, this, &MainWindow::rebuildQueue);
     connect(&songActions_, &SongActions::status, this, &MainWindow::status);
     connect(&songActions_, &SongActions::playRequested, this, [this](const QString &path) { player_.play(path); });
@@ -136,6 +141,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         resize(1180, 720);
     setMinimumSize(760, 460);
 
+    library_.setPlaylistPaths(playlistPaths());
     if (!settings_.lastDirectory.isEmpty() && QFileInfo(settings_.lastDirectory).isDir())
         openDirectory(settings_.lastDirectory);
     else {
@@ -144,6 +150,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent)
         rebuildQueue();
         status(settings_.queueSource.isEmpty() ? tr("Open a folder to start (Ctrl+O)")
                                               : tr("Source: %1").arg(settings_.queueSource));
+        autoAnalyze();
+        prepareSongKeys();
     }
 
 #ifdef MODJUKE_SHOT_DRIVER
@@ -453,6 +461,12 @@ void MainWindow::scanFolder(const QString &root)
         status(tr("Scanned %1 tracks in %2").arg(library_.tracks().size()).arg(root));
     }
     rebuildQueue();
+    autoAnalyze();
+    prepareSongKeys();
+}
+
+void MainWindow::autoAnalyze()
+{
     if (library_.pendingCount() > 0 && settings_.autoAnalyze && !library_.analyzing())
         analyzeNow();
 }
@@ -491,6 +505,7 @@ void MainWindow::applyQueueFilters()
     queuePanel_->showQueue(queue_.tracks(), builder_.mode() == OrderMode::ByDirectory, currentPath(),
                            builder_.reorderable());
     queuePanel_->setFilterText(filter.active() ? filter.describe() : QString());
+    refreshCopies();
 
     refreshQueueControls();
     const QStringList context{library_.root(), settings_.queueSource, settings_.queueMode};
@@ -498,6 +513,39 @@ void MainWindow::applyQueueFilters()
         queueViewContext_ = context;
         queuePanel_->revealPath(currentPath());
     }
+}
+
+void MainWindow::refreshCopies()
+{
+    const Playlist *playlist =
+        settings_.queueSource.isEmpty() ? nullptr : playlists_.get(settings_.queueSource);
+    queuePanel_->setCopies(playlist ? copiesWithin(playlist->paths, songKeys_.keyOf())
+                                    : QHash<QString, QStringList>());
+}
+
+QStringList MainWindow::playlistPaths() const
+{
+    QStringList paths;
+    for (const QString &name : playlists_.names())
+        paths += playlists_.get(name)->paths;
+    return paths;
+}
+
+void MainWindow::updatePlaylistSongs()
+{
+    library_.setPlaylistPaths(playlistPaths());
+    autoAnalyze();
+    prepareSongKeys();
+}
+
+void MainWindow::prepareSongKeys()
+{
+    QStringList paths = playlistPaths();
+    if (settings_.autoAnalyze) {
+        for (const Track &track : library_.tracks())
+            paths << track.path;
+    }
+    songKeys_.prepare(paths);
 }
 
 void MainWindow::refreshQueueControls()
@@ -582,9 +630,11 @@ void MainWindow::addCurrentFavorite()
     const QString path = currentPath();
     if (path.isEmpty())
         return;
+    const bool was = playlists_.isFavorite(path);
     const bool on = songActions_.toggleFavorite(path);
     infoPanel_->setFavorite(on);
-    status(on ? tr("Added to Favorites") : tr("Removed from Favorites"));
+    if (on != was)
+        status(on ? tr("Added to Favorites") : tr("Removed from Favorites"));
 }
 
 bool MainWindow::confirmIgnorePath(const QString &path)
@@ -684,7 +734,7 @@ void MainWindow::openFilterDialog()
 
 void MainWindow::openPlaylistsDialog()
 {
-    PlaylistsDialog dialog(this, &playlists_, [this] {
+    PlaylistsDialog dialog(this, &playlists_, &songKeys_, [this] {
         QStringList paths = queuePanel_->selectedPaths();
         return paths.isEmpty() ? queue_.paths() : paths;
     });
@@ -711,6 +761,7 @@ void MainWindow::openPlaylistsDialog()
     });
     dialog.exec();
     refreshSourceCombo();
+    updatePlaylistSongs();
     rebuildQueue();
 }
 

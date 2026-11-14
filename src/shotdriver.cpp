@@ -60,7 +60,7 @@ void MainWindow::startShotDriver()
                           QStringLiteral("filter"));
             captureDialog(new SettingsDialog(nullptr, settings_, &ignored_, {}),
                           QStringLiteral("settings"));
-            captureDialog(new PlaylistsDialog(nullptr, &playlists_, [this] { return queuePanel_->selectedPaths(); }),
+            captureDialog(new PlaylistsDialog(nullptr, &playlists_, &songKeys_, [this] { return queuePanel_->selectedPaths(); }),
                           QStringLiteral("playlists"));
             captureDialog(new AboutDialog(nullptr, lib ? lib->versionString() : QString(),
                                           lib != nullptr),
