@@ -118,8 +118,9 @@ private:
     };
     // Plays the song again on silencePool_, from its start (a seek does not
     // restore every sample that a later note or volume change can make
-    // audible), and if nothing from the silent stretch on is audible, asks
-    // the renderer to end the song now.
+    // audible). If nothing from the silent stretch on is audible, asks the
+    // renderer to end the song now; if the music comes back after a long
+    // silence, to go on from there.
     void checkSilence(const SilenceCheck &check);
 
     QThread *audioThread_ = nullptr;

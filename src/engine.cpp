@@ -25,7 +25,7 @@ struct Command {
     QString path;                   // Load
     double position = 0.0;          // Load, Seek
     double factor = 1.0;            // Tempo
-    int order = 0, row = 0;         // SeekOrderRow
+    int order = 0, row = 0;         // SeekOrderRow; SkipSilence: where the music comes back
     int subsong = 0;                // Load, Subsong
     int interpLen = 0;              // Load, Interpolation
     bool paused = false;            // Load, Pause
@@ -33,6 +33,7 @@ struct Command {
     bool preserveBufferedTail = false; // Load
     quint64 silenceRun = 0;         // SkipSilence
     double silence = 0.0;           // SkipSilence: seconds of silence left in the song
+    double resumeAt = -1.0;         // SkipSilence: when the music comes back (-1: it doesn't)
 };
 
 // Render at most this many frames per lock acquisition (~23 ms at 44.1 kHz)
@@ -44,6 +45,8 @@ constexpr int kSeekRampMs = 6;
 constexpr float kSilenceLevel = 0.001f;
 // After this much silence, check whether the rest of the song is silent.
 constexpr double kSilenceCheckSeconds = 2.0;
+// A silence this long before more music is skipped as well.
+constexpr double kSkipGapSeconds = 10.0;
 
 float peakOf(const float *stereo, size_t frames)
 {
@@ -282,7 +285,8 @@ private:
         silenceChecked_ = false;
     }
 
-    // The rest of the song is silent: go on as at its end.
+    // The rest of the song is silent: go on as at its end. Or the music
+    // comes back after a long silence: go on from there.
     void skipSilence(const Command &command)
     {
         auto &state = engine_->state_;
@@ -291,6 +295,19 @@ private:
         // let a pause or a pending transport command settle; check again later
         if (state.paused || renderSerial_ != engine_->transportSerial_) {
             silenceChecked_ = false;
+            return;
+        }
+        if (command.resumeAt >= 0.0) {
+            const double from = state.position;
+            if (command.resumeAt <= from)
+                return;
+            engine_->postLog(QStringLiteral("info"), QStringLiteral("%1: skipped %2 of silence")
+                .arg(QFileInfo(state.path).fileName(), formatTime(command.resumeAt - from)));
+            module_.seekOrderRow(command.order, command.row);
+            // a row in a pattern loop plays more than once: go by time
+            if (module_.positionSeconds() <= from)
+                seekWithinSubsong(module_, state.subsong, command.resumeAt);
+            playheadMoved(true);
             return;
         }
         engine_->postLog(QStringLiteral("info"), QStringLiteral("%1: skipped %2 of silence at the end")
@@ -962,32 +979,38 @@ void Engine::checkSilence(const SilenceCheck &check)
             module.setTempoFactor(check.tempoFactor);
         if (!module.selectSubsong(check.subsong))
             return;
-        // play from the start; sound from the silent stretch on keeps the song going
+        // play from the start up to the first sound after the silent stretch starts
         const double from = check.position - kSilenceCheckSeconds;
         QVector<float> pcm(int(kChunkFrames * 2));
         size_t after = 0;
+        Command command;
         for (;;) {
             const double start = module.positionSeconds();
             const size_t got = module.readFloatStereo(check.sampleRate, kChunkFrames, pcm.data());
             if (got == 0)
                 break;
-            if (stale() || (start >= from && peakOf(pcm.constData(), got) >= kSilenceLevel))
+            if (stale())
                 return;
+            if (start >= from && peakOf(pcm.constData(), got) >= kSilenceLevel) {
+                // the sound comes with the row that started in these frames,
+                // or else with the row they started in
+                command.resumeAt = start;
+                command.order = module.currentOrder();
+                command.row = module.currentRow();
+                break;
+            }
             if (start >= check.position)
                 after += got;
         }
-        // ended before reaching the playback position: it played differently
-        if (after == 0)
+        // sound before the playback position, or the song ended before it:
+        // it played differently; a short silence before more music stays
+        if (after == 0 || (command.resumeAt >= 0.0 && command.resumeAt - from < kSkipGapSeconds))
             return;
-        const double silence = double(after) / check.sampleRate;
-        QMetaObject::invokeMethod(this, [this, check, silence] {
-            Command command;
-            command.kind = Command::SkipSilence;
-            command.loadEpoch = check.loadEpoch;
-            command.silenceRun = check.silenceRun;
-            command.silence = silence;
-            device_->post(command);
-        }, Qt::QueuedConnection);
+        command.kind = Command::SkipSilence;
+        command.loadEpoch = check.loadEpoch;
+        command.silenceRun = check.silenceRun;
+        command.silence = double(after) / check.sampleRate;
+        QMetaObject::invokeMethod(this, [this, command] { device_->post(command); }, Qt::QueuedConnection);
     });
 }
 

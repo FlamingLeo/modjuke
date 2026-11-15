@@ -15,7 +15,7 @@ A Windows 9x version is available [here](https://github.com/FlamingLeo/modjuke95
 - A tracker view with centered playback following and optional smooth scrolling.
 - Song information, sample/instrument names, and module comments.
 - Track looping, queue repeat, persistent shuffle orders, and subsong selection.
-- Skips silence at the end of a song.
+- Skips silence at the end of a song and long silences within it.
 - Configurable output sample rate, interpolation, buffering, and silent playback.
 - Five built-in themes plus custom themes with a visual color editor.
 - Optional session restoration and local listening history.
@@ -217,9 +217,15 @@ Some files contain multiple songs or independent sequences recognized by libopen
 
 Subsong detection depends on libopenmpt and can include alternate starting positions. A module that never ends naturally cannot advance automatically.
 
-### Silence at the end of a song
+### Silence
 
-Some modules end with a long silence, for example empty rows at a very slow tempo. After 2 seconds of silence, the player checks the rest of the song. If nothing audible is left, playback moves on as if the song had ended: to the next subsong with **Play all subsongs**, back to the start with **Loop**, or otherwise to the next song in the queue. Pauses followed by more music are played in full. Volume and mute do not affect the check. The displayed length still includes the skipped silence.
+Some modules end with a long silence, or have one between two parts, for example empty rows at a very slow tempo. After 2 seconds of silence, the player checks the rest of the song:
+
+- If nothing audible is left, playback moves on as if the song had ended: to the next subsong with **Play all subsongs**, back to the start with **Loop**, or otherwise to the next song in the queue.
+- If the music comes back after a silence of 10 seconds or more, playback jumps to where it does.
+- Shorter pauses are played in full.
+
+Volume and mute do not affect the check. At another speed (`--speed`), the 10 seconds are playing time. The displayed length still includes the skipped silence.
 
 ## Settings and audio
 
